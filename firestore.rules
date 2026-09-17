@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Colección de persistencia maestra y sincronización global CAMARCA
+    match /camarca_system/{docId} {
+      allow read, write: if true;
+    }
+
+    // Catálogo maestro de expendios postales
+    match /expendios/{expendioId} {
+      allow read, write: if true;
+    }
+
+    // Historial contable de cuentas de cobro
+    match /historial/{historialId} {
+      allow read, write: if true;
+    }
+
+    // Trazabilidad y auditoría de novedades
+    match /trazabilidad/{trazabilidadId} {
+      allow read, write: if true;
+    }
+
+    // Parámetros y configuración del sistema
+    match /config/{configId} {
+      allow read, write: if true;
+    }
+
+    // Cuentas firmadas cargadas por los puntos
+    match /cuentasCargadas/{cuentaId} {
+      allow read, write: if true;
+    }
+
+    // Relación de pagos bancarios
+    match /relacionPagos/{pagoId} {
+      allow read, write: if true;
+    }
+
+    // Registros de acceso
+    match /registrosAcceso/{accesoId} {
+      allow read, write: if true;
+    }
+
+    // Evidencias fotográficas georreferenciadas de expendios (7 fotos por punto)
+    match /camarca_photos/{photoId} {
+      allow read, write: if true;
+    }
+
+    match /expendio_photos/{photoId} {
+      allow read, write: if true;
+    }
+
+    // Copias de seguridad en la nube
+    match /backups/{backupId} {
+      allow read, write: if true;
+    }
+
+    // Denegación por defecto para cualquier otra ruta no especificada
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

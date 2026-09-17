@@ -1,0 +1,143 @@
+{
+  "entities": {
+    "Expendio": {
+      "title": "Expendio",
+      "description": "Información maestra de un expendio postal",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "municipio": { "type": "string" },
+        "localidad": { "type": "string" },
+        "encargado": { "type": "string" },
+        "cedula": { "type": "string" },
+        "telefonoPunto": { "type": "string" },
+        "direccionPunto": { "type": "string" },
+        "cuentaBancaria": { "type": "string" },
+        "banco": { "type": "string" },
+        "tipoCuenta": { "type": "string" },
+        "valorMensual": { "type": "number" },
+        "admisionSipost": { "type": "number" },
+        "estado": { "type": "string" },
+        "correo": { "type": "string" },
+        "fechaUltimaActualizacion": { "type": "string" }
+      },
+      "required": ["id", "municipio", "encargado", "cedula"]
+    },
+    "HistorialItem": {
+      "title": "HistorialItem",
+      "description": "Cuenta de cobro oficial registrada en la contabilidad",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "periodo": { "type": "string" },
+        "tipo": { "type": "string" },
+        "encargado": { "type": "string" },
+        "cedula": { "type": "string" },
+        "expendio": { "type": "string" },
+        "monto": { "type": "number" },
+        "fecha": { "type": "string" },
+        "estado": { "type": "string" },
+        "detalles": { "type": "string" },
+        "cuentaData": { "type": "object" },
+        "soporteFirmadoUrl": { "type": "string" },
+        "cuentaFirmadaCargada": { "type": "boolean" }
+      },
+      "required": ["id", "periodo", "encargado", "cedula", "monto", "fecha"]
+    },
+    "TrazabilidadItem": {
+      "title": "TrazabilidadItem",
+      "description": "Registro de auditoría y novedades de expendios",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "municipio": { "type": "string" },
+        "localidad": { "type": "string" },
+        "novedad": { "type": "string" },
+        "encargadoAnterior": { "type": "string" },
+        "cedulaAnterior": { "type": "string" },
+        "encargadoNuevo": { "type": "string" },
+        "cedulaNuevo": { "type": "string" },
+        "telefonoNuevo": { "type": "string" },
+        "direccionNueva": { "type": "string" },
+        "estadoPunto": { "type": "string" },
+        "motivo": { "type": "string" },
+        "observaciones": { "type": "string" },
+        "fechaRegistro": { "type": "string" },
+        "registradoPor": { "type": "string" }
+      },
+      "required": ["id", "municipio", "fechaRegistro"]
+    },
+    "SystemConfig": {
+      "title": "SystemConfig",
+      "description": "Configuración global de la plataforma CAMARCA",
+      "type": "object",
+      "properties": {
+        "periodoPublicado": { "type": "string" },
+        "valorBaseUnificado": { "type": "number" },
+        "porcentajeRetencion": { "type": "number" },
+        "cuentaCobroHabilitada": { "type": "boolean" },
+        "lastSyncTimestamp": { "type": "string" }
+      }
+    },
+    "DatabaseSnapshot": {
+      "title": "DatabaseSnapshot",
+      "description": "Copia de seguridad persistente y sincronización en la nube",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "ambiente": { "type": "string" },
+        "totalExpendios": { "type": "number" },
+        "totalHistorial": { "type": "number" },
+        "data": { "type": "object" }
+      },
+      "required": ["id", "timestamp", "ambiente"]
+    },
+    "ExpendioPhoto": {
+      "title": "ExpendioPhoto",
+      "description": "Registro de evidencia fotográfica georreferenciada de expendio",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "cedula": { "type": "string" },
+        "slotKey": { "type": "string" },
+        "dataUrl": { "type": "string" },
+        "fileName": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "municipio": { "type": "string" },
+        "encargado": { "type": "string" }
+      },
+      "required": ["id", "cedula", "slotKey", "dataUrl"]
+    }
+  },
+  "firestore": {
+    "/expendios/{expendioId}": {
+      "schema": "Expendio",
+      "description": "Catálogo maestro de expendios postales"
+    },
+    "/camarca_photos/{photoId}": {
+      "schema": "ExpendioPhoto",
+      "description": "Evidencias fotográficas georreferenciadas individuales de cada expendio"
+    },
+    "/historial/{historialId}": {
+      "schema": "HistorialItem",
+      "description": "Contabilidad y cuentas de cobro emitidas"
+    },
+    "/trazabilidad/{trazabilidadId}": {
+      "schema": "TrazabilidadItem",
+      "description": "Novedades, relevos y auditoría de expendios"
+    },
+    "/config/{configId}": {
+      "schema": "SystemConfig",
+      "description": "Configuración del sistema y periodos publicados"
+    },
+    "/camarca_system/{docId}": {
+      "schema": "DatabaseSnapshot",
+      "description": "Estado maestro persistente de la base de datos CAMARCA"
+    },
+    "/backups/{backupId}": {
+      "schema": "DatabaseSnapshot",
+      "description": "Copias de respaldo periódicas en la nube"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Control de Personal y Expendios",
+  "description": "Sistema de gestión y control de personal, expendios, cuentas de cobro, reportes fotográficos y panel cliente 4-72.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

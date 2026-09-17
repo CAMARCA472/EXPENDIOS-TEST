@@ -1,0 +1,224 @@
+{
+  "1094270223_fotoContratistaUrl": {
+    "slotKey": "fotoContratistaUrl",
+    "cedula": "1094270223",
+    "webContentLink": "https://drive.google.com/uc?id=1G6WTcVDOXXcP7EQjR4xhF0ObXJLbnHhr&export=download",
+    "folderName": "Pamplona",
+    "webViewLink": "https://drive.google.com/file/d/1G6WTcVDOXXcP7EQjR4xhF0ObXJLbnHhr/view?usp=drivesdk",
+    "fileName": "1094270223_fotoContratistaUrl.jpg",
+    "savedAt": "2026-09-17T16:13:13.001Z",
+    "driveFileId": "1G6WTcVDOXXcP7EQjR4xhF0ObXJLbnHhr"
+  },
+  "1094270223_fotoBasculaUrl": {
+    "slotKey": "fotoBasculaUrl",
+    "webContentLink": "https://drive.google.com/uc?id=1tAxFCrcKM5Kl7o30Z93Hl35xXK2pkWP-&export=download",
+    "fileName": "1094270223_fotoBasculaUrl.jpg",
+    "folderName": "Pamplona",
+    "savedAt": "2026-09-17T16:13:13.001Z",
+    "webViewLink": "https://drive.google.com/file/d/1tAxFCrcKM5Kl7o30Z93Hl35xXK2pkWP-/view?usp=drivesdk",
+    "cedula": "1094270223",
+    "driveFileId": "1tAxFCrcKM5Kl7o30Z93Hl35xXK2pkWP-"
+  },
+  "1094272656_fotoTarifasUrl": {
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "folderName": "Herran",
+    "fileName": "1094272656_fotoTarifasUrl.jpg",
+    "slotKey": "fotoTarifasUrl",
+    "cedula": "1094272656",
+    "driveFileId": "149TWVw8WkSJm5jkQzDfYmvcLqJA8F9hN",
+    "webContentLink": "https://drive.google.com/uc?id=149TWVw8WkSJm5jkQzDfYmvcLqJA8F9hN&export=download",
+    "webViewLink": "https://drive.google.com/file/d/149TWVw8WkSJm5jkQzDfYmvcLqJA8F9hN/view?usp=drivesdk"
+  },
+  "1094272656_fotoHorarioUrl": {
+    "cedula": "1094272656",
+    "webContentLink": "https://drive.google.com/uc?id=1cEUJ-YFFjdI1iXRsO37nboF4EaKr9cqq&export=download",
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "folderName": "Herran",
+    "fileName": "1094272656_fotoHorarioUrl.jpg",
+    "driveFileId": "1cEUJ-YFFjdI1iXRsO37nboF4EaKr9cqq",
+    "webViewLink": "https://drive.google.com/file/d/1cEUJ-YFFjdI1iXRsO37nboF4EaKr9cqq/view?usp=drivesdk",
+    "slotKey": "fotoHorarioUrl"
+  },
+  "1094269932_fotoMataselloUrl": {
+    "webViewLink": "https://drive.google.com/file/d/1_4MuOSepch0oNcibjqN4l0silUUREzzT/view?usp=drivesdk",
+    "localMtime": 1788807327756.565,
+    "savedAt": "2026-09-07T18:55:31.114Z",
+    "driveFileId": "1_4MuOSepch0oNcibjqN4l0silUUREzzT",
+    "webContentLink": "https://drive.google.com/uc?id=1_4MuOSepch0oNcibjqN4l0silUUREzzT&export=download",
+    "slotKey": "fotoMataselloUrl",
+    "municipio": "Giron",
+    "cedula": "1094269932",
+    "folderName": "Giron",
+    "fileName": "foto_matasello_giron_2026-09-07.jpg"
+  },
+  "1094270223_fotoMataselloUrl": {
+    "webViewLink": "https://drive.google.com/file/d/147iVX8-aFHdbgryOkOh1kca30D_lXKbS/view?usp=drivesdk",
+    "slotKey": "fotoMataselloUrl",
+    "webContentLink": "https://drive.google.com/uc?id=147iVX8-aFHdbgryOkOh1kca30D_lXKbS&export=download",
+    "driveFileId": "147iVX8-aFHdbgryOkOh1kca30D_lXKbS",
+    "savedAt": "2026-09-17T16:13:13.001Z",
+    "fileName": "1094270223_fotoMataselloUrl.jpg",
+    "cedula": "1094270223",
+    "folderName": "Pamplona"
+  },
+  "1094269932_fotoContratistaUrl": {
+    "municipio": "Giron",
+    "folderName": "Giron",
+    "driveFileId": "10rMhhpH3ecjkeSxB7JqV1prlHKQG9_i0",
+    "webViewLink": "https://drive.google.com/file/d/10rMhhpH3ecjkeSxB7JqV1prlHKQG9_i0/view?usp=drivesdk",
+    "cedula": "1094269932",
+    "slotKey": "fotoContratistaUrl",
+    "fileName": "foto_contratista_giron_2026-09-07.jpg",
+    "localMtime": 1788806928428.3354,
+    "savedAt": "2026-09-07T18:48:50.744Z",
+    "webContentLink": "https://drive.google.com/uc?id=10rMhhpH3ecjkeSxB7JqV1prlHKQG9_i0&export=download"
+  },
+  "1094272656_fotoPanoramicaUrl": {
+    "webContentLink": "https://drive.google.com/uc?id=1JBWGHVl2uDnjguOk1tAeviw3JWuMxB6_&export=download",
+    "webViewLink": "https://drive.google.com/file/d/1JBWGHVl2uDnjguOk1tAeviw3JWuMxB6_/view?usp=drivesdk",
+    "fileName": "1094272656_fotoPanoramicaUrl.jpg",
+    "slotKey": "fotoPanoramicaUrl",
+    "folderName": "Herran",
+    "cedula": "1094272656",
+    "driveFileId": "1JBWGHVl2uDnjguOk1tAeviw3JWuMxB6_",
+    "savedAt": "2026-09-17T16:13:13.106Z"
+  },
+  "1094272656_fotoBasculaUrl": {
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "webViewLink": "https://drive.google.com/file/d/1Z5fmZodbU_7fPSSbhBYpZbFqxTj3O9mm/view?usp=drivesdk",
+    "folderName": "Herran",
+    "driveFileId": "1Z5fmZodbU_7fPSSbhBYpZbFqxTj3O9mm",
+    "webContentLink": "https://drive.google.com/uc?id=1Z5fmZodbU_7fPSSbhBYpZbFqxTj3O9mm&export=download",
+    "fileName": "1094272656_fotoBasculaUrl.jpg",
+    "slotKey": "fotoBasculaUrl",
+    "cedula": "1094272656"
+  },
+  "1094270223_fotoPanoramicaUrl": {
+    "folderName": "Pamplona",
+    "webViewLink": "https://drive.google.com/file/d/1HWTPe9ygRuH4luHt0RH2q22mBkjP3hiK/view?usp=drivesdk",
+    "savedAt": "2026-09-17T16:13:13.001Z",
+    "driveFileId": "1HWTPe9ygRuH4luHt0RH2q22mBkjP3hiK",
+    "webContentLink": "https://drive.google.com/uc?id=1HWTPe9ygRuH4luHt0RH2q22mBkjP3hiK&export=download",
+    "slotKey": "fotoPanoramicaUrl",
+    "cedula": "1094270223",
+    "fileName": "1094270223_fotoPanoramicaUrl.jpg"
+  },
+  "1094269932_fotoHorarioUrl": {
+    "cedula": "1094269932",
+    "localMtime": 1788806948916.0083,
+    "slotKey": "fotoHorarioUrl",
+    "savedAt": "2026-09-07T18:49:11.283Z",
+    "webContentLink": "https://drive.google.com/uc?id=1N6Put6Vle27MhVAmZ-wWq3teQpF3fl6B&export=download",
+    "webViewLink": "https://drive.google.com/file/d/1N6Put6Vle27MhVAmZ-wWq3teQpF3fl6B/view?usp=drivesdk",
+    "folderName": "Giron",
+    "municipio": "Giron",
+    "fileName": "foto_horario_giron_2026-09-07.jpg",
+    "driveFileId": "1N6Put6Vle27MhVAmZ-wWq3teQpF3fl6B"
+  },
+  "1094269932_fotoTarifasUrl": {
+    "savedAt": "2026-09-07T18:49:40.754Z",
+    "municipio": "Giron",
+    "slotKey": "fotoTarifasUrl",
+    "localMtime": 1788806968634.9453,
+    "webContentLink": "https://drive.google.com/uc?id=1k24rErQa4X-M5s2Kq4E8D-Mx81tSXrzB&export=download",
+    "folderName": "Giron",
+    "driveFileId": "1k24rErQa4X-M5s2Kq4E8D-Mx81tSXrzB",
+    "webViewLink": "https://drive.google.com/file/d/1k24rErQa4X-M5s2Kq4E8D-Mx81tSXrzB/view?usp=drivesdk",
+    "cedula": "1094269932",
+    "fileName": "foto_tarifas_giron_2026-09-07.jpg"
+  },
+  "1094269932_fotoBasculaUrl": {
+    "savedAt": "2026-09-07T18:50:23.498Z",
+    "webContentLink": "https://drive.google.com/uc?id=1M6786Ma5Bo2PSkvX5pW4xCBcKNH36hQc&export=download",
+    "fileName": "foto_bascula_giron_2026-09-07.jpg",
+    "folderName": "Giron",
+    "slotKey": "fotoBasculaUrl",
+    "localMtime": 1788807021323,
+    "municipio": "Giron",
+    "webViewLink": "https://drive.google.com/file/d/1M6786Ma5Bo2PSkvX5pW4xCBcKNH36hQc/view?usp=drivesdk",
+    "driveFileId": "1M6786Ma5Bo2PSkvX5pW4xCBcKNH36hQc",
+    "cedula": "1094269932"
+  },
+  "1094270223_fotoHorarioUrl": {
+    "webContentLink": "https://drive.google.com/uc?id=1Txgcl6B_6udgDF8V7IOwxvGoda_HRgTy&export=download",
+    "cedula": "1094270223",
+    "savedAt": "2026-09-17T16:13:13.001Z",
+    "fileName": "1094270223_fotoHorarioUrl.jpg",
+    "webViewLink": "https://drive.google.com/file/d/1Txgcl6B_6udgDF8V7IOwxvGoda_HRgTy/view?usp=drivesdk",
+    "folderName": "Pamplona",
+    "driveFileId": "1Txgcl6B_6udgDF8V7IOwxvGoda_HRgTy",
+    "slotKey": "fotoHorarioUrl"
+  },
+  "1094270223_fotoTarifasUrl": {
+    "webViewLink": "https://drive.google.com/file/d/1iFdFiqIgLf5GjsLtrhK7tMp_TDU7DuiM/view?usp=drivesdk",
+    "cedula": "1094270223",
+    "savedAt": "2026-09-07T18:56:31.277Z",
+    "driveFileId": "1iFdFiqIgLf5GjsLtrhK7tMp_TDU7DuiM",
+    "webContentLink": "https://drive.google.com/uc?id=1iFdFiqIgLf5GjsLtrhK7tMp_TDU7DuiM&export=download",
+    "fileName": "1094270223_fotoTarifasUrl.jpg",
+    "folderName": "Pamplona",
+    "slotKey": "fotoTarifasUrl"
+  },
+  "1094269932_fotoAvisoUrl": {
+    "cedula": "1094269932",
+    "webViewLink": "https://drive.google.com/file/d/1v-joGp8HCcuAX8r1mcFq25i6l6E9l9uh/view?usp=drivesdk",
+    "driveFileId": "1v-joGp8HCcuAX8r1mcFq25i6l6E9l9uh",
+    "slotKey": "fotoAvisoUrl",
+    "fileName": "1094269932_fotoAvisoUrl.jpg",
+    "folderName": "Giron",
+    "webContentLink": "https://drive.google.com/uc?id=1v-joGp8HCcuAX8r1mcFq25i6l6E9l9uh&export=download",
+    "savedAt": "2026-09-17T16:13:13.210Z"
+  },
+  "1094269932_fotoPanoramicaUrl": {
+    "webContentLink": "https://drive.google.com/uc?id=136msbNYA-cSVmLPgFyMOm-Z22HRms-IS&export=download",
+    "folderName": "Giron",
+    "municipio": "Giron",
+    "cedula": "1094269932",
+    "webViewLink": "https://drive.google.com/file/d/136msbNYA-cSVmLPgFyMOm-Z22HRms-IS/view?usp=drivesdk",
+    "driveFileId": "136msbNYA-cSVmLPgFyMOm-Z22HRms-IS",
+    "slotKey": "fotoPanoramicaUrl",
+    "fileName": "foto_panoramica_giron_2026-09-07.jpg",
+    "localMtime": 1788806901040.1895,
+    "savedAt": "2026-09-07T18:48:23.228Z"
+  },
+  "1094272656_fotoMataselloUrl": {
+    "driveFileId": "1yOYGacd4QIZ0F29M4zesRWqkfWaZScGP",
+    "slotKey": "fotoMataselloUrl",
+    "webContentLink": "https://drive.google.com/uc?id=1yOYGacd4QIZ0F29M4zesRWqkfWaZScGP&export=download",
+    "webViewLink": "https://drive.google.com/file/d/1yOYGacd4QIZ0F29M4zesRWqkfWaZScGP/view?usp=drivesdk",
+    "folderName": "Herran",
+    "cedula": "1094272656",
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "fileName": "1094272656_fotoMataselloUrl.jpg"
+  },
+  "1094272656_fotoContratistaUrl": {
+    "folderName": "Herran",
+    "webContentLink": "https://drive.google.com/uc?id=1_DrdY1hTECA3qVdEkZIAzHyKUpuxu_OL&export=download",
+    "fileName": "1094272656_fotoContratistaUrl.jpg",
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "driveFileId": "1_DrdY1hTECA3qVdEkZIAzHyKUpuxu_OL",
+    "slotKey": "fotoContratistaUrl",
+    "cedula": "1094272656",
+    "webViewLink": "https://drive.google.com/file/d/1_DrdY1hTECA3qVdEkZIAzHyKUpuxu_OL/view?usp=drivesdk"
+  },
+  "1094272656_fotoAvisoUrl": {
+    "webViewLink": "https://drive.google.com/file/d/1jqjsxK5jqFBfV5nTlTLzAkyZ5y6sYWAW/view?usp=drivesdk",
+    "webContentLink": "https://drive.google.com/uc?id=1jqjsxK5jqFBfV5nTlTLzAkyZ5y6sYWAW&export=download",
+    "slotKey": "fotoAvisoUrl",
+    "driveFileId": "1jqjsxK5jqFBfV5nTlTLzAkyZ5y6sYWAW",
+    "savedAt": "2026-09-17T16:13:13.106Z",
+    "cedula": "1094272656",
+    "fileName": "1094272656_fotoAvisoUrl.jpg",
+    "folderName": "Herran"
+  },
+  "1094270223_fotoAvisoUrl": {
+    "webContentLink": "https://drive.google.com/uc?id=1qPMYWyTYP3d4DFHrTGGfdVdf8sFeg3NV&export=download",
+    "cedula": "1094270223",
+    "savedAt": "2026-09-17T16:13:13.002Z",
+    "folderName": "Pamplona",
+    "driveFileId": "1qPMYWyTYP3d4DFHrTGGfdVdf8sFeg3NV",
+    "fileName": "1094270223_fotoAvisoUrl.jpg",
+    "webViewLink": "https://drive.google.com/file/d/1qPMYWyTYP3d4DFHrTGGfdVdf8sFeg3NV/view?usp=drivesdk",
+    "slotKey": "fotoAvisoUrl"
+  }
+}
