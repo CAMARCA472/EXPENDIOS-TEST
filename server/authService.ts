@@ -5,6 +5,9 @@ import { getDatabase, DatabaseSchema } from './dbStore.js';
 export const ADMIN_CEDULA = '1094269932';
 export const CLEAN_ADMIN_CEDULA = '9005042417';
 export const ADMIN_CEDULAS = [ADMIN_CEDULA, CLEAN_ADMIN_CEDULA];
+export const CLIENTE_472_NIT = '9000629179';
+export const CLIENTE_472_NIT_SIN_DV = '900062917';
+export const CLIENTE_472_NIT_DISPLAY = '900.062.917-9';
 export const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || 'Camarca.2026*';
 const TOKEN_SECRET =
   process.env.AUTH_SECRET || process.env.JWT_SECRET || 'camarca_secure_jwt_token_secret_2026_x9932';
@@ -51,6 +54,14 @@ export function resolveAuthorizedAdminCedula(cedula: string | number | undefined
 
 export function isAuthorizedAdminCedula(cedula: string | number | undefined | null): boolean {
   return resolveAuthorizedAdminCedula(cedula) !== null;
+}
+
+/**
+ * Verifica si un número corresponde al NIT autorizado del Cliente 4-72 (900.062.917-9 / 9000629179 / 900062917)
+ */
+export function isCliente472Nit(cedula: string | number | undefined | null): boolean {
+  const norm = normalizeCedula(cedula);
+  return norm === CLIENTE_472_NIT || norm === CLIENTE_472_NIT_SIN_DV;
 }
 
 /**
@@ -129,6 +140,12 @@ export function verifySessionToken(token: string): AuthenticatedUser | null {
         if (!user.roles.includes('cliente')) user.roles.push('cliente');
         user.isMultiRoleAdmin = false;
         user.isCleanAdmin = true;
+      } else if (isCliente472Nit(user.cedula)) {
+        user.cedula = CLIENTE_472_NIT;
+        user.roles = ['cliente'];
+        user.role = 'cliente';
+        user.isMultiRoleAdmin = false;
+        user.isCleanAdmin = false;
       }
 
       // Regla estricta de seguridad: Si tiene rol admin, su cédula DEBE ser autorizada (1094269932 o 9005042417)

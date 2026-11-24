@@ -132,9 +132,12 @@ async function saveAccessLogsToCloud(_logs: RegistroAcceso[]): Promise<void> {
 import {
   ADMIN_CEDULA,
   CLEAN_ADMIN_CEDULA,
+  CLIENTE_472_NIT,
+  CLIENTE_472_NIT_DISPLAY,
   ADMIN_ACCESS_PASSWORD,
   resolveAuthorizedAdminCedula,
   isAuthorizedAdminCedula,
+  isCliente472Nit,
   generateSessionToken,
   verifySessionToken,
   extractAuthenticatedUser,
@@ -776,9 +779,10 @@ function registrarIngresoUsuario(
   cedulaOrNit: string,
   rol: 'admin' | 'expendio' | 'cliente' | 'desconocido',
   municipio?: string,
-  tipoAcceso: 'login' | 'visita' = 'login',
+  tipoAcceso: 'login' | 'visita' | 'descarga_excel' = 'login',
   exitoso: boolean = true,
-  detalles?: string
+  detalles?: string,
+  extraMeta?: { archivoDescargado?: string; registrosExportados?: number }
 ) {
   // Filtrar palabras clave de prueba o simulación
   const rawSearchStr = `${usuario} ${cedulaOrNit} ${rol} ${municipio || ''} ${tipoAcceso} ${detalles || ''}`.toLowerCase();
@@ -790,7 +794,7 @@ function registrarIngresoUsuario(
     }
   }
 
-  // Validar existencia real del usuario / expendio en PostgreSQL (db maestro)
+  // Validar existencia real del usuario / expendio / cliente 4-72
   const db = loadDatabase();
   const cleanCed = String(cedulaOrNit || '').replace(/\D/g, '');
   if (!cleanCed) {
@@ -803,6 +807,8 @@ function registrarIngresoUsuario(
   if (cleanCed === ADMIN_CEDULA) {
     userExists = true;
     matchedExpendio = (db.expendios || []).find((e) => String(e.cedula || '').replace(/\D/g, '') === ADMIN_CEDULA) || null;
+  } else if (cleanCed === CLEAN_ADMIN_CEDULA || isCliente472Nit(cleanCed)) {
+    userExists = true;
   } else {
     // Buscar en el catálogo de expendios de la base de datos
     const foundExp = (db.expendios || []).find((e) => String(e.cedula || '').replace(/\D/g, '') === cleanCed);
@@ -813,13 +819,13 @@ function registrarIngresoUsuario(
   }
 
   if (!userExists) {
-    console.warn(`[AccessLog] Rechazado: Intento de registro para usuario con cédula "${cedulaOrNit}" inexistente o inhabilitado en PostgreSQL.`);
+    console.warn(`[AccessLog] Rechazado: Intento de registro para usuario con cédula "${cedulaOrNit}" inexistente o inhabilitado.`);
     return null;
   }
 
   // Si corresponde a un expendio, el expendioId debe existir y la cédula corresponder
   if (rol === 'expendio' && !matchedExpendio) {
-    console.warn(`[AccessLog] Rechazado: El rol 'expendio' requiere un expendio real asociado en PostgreSQL.`);
+    console.warn(`[AccessLog] Rechazado: El rol 'expendio' requiere un expendio real asociado.`);
     return null;
   }
 
@@ -858,7 +864,7 @@ function registrarIngresoUsuario(
     second: '2-digit',
     hour12: true,
   });
-  const fechaCorta = now.toISOString().split('T')[0];
+  const fechaCorta = now.toLocaleDateString('en-CA', { timeZone: 'America/Bogota' });
 
   const cachedLoc = ipLocationCache.get(ip);
   const resolvedMuni = matchedExpendio?.municipio || matchedExpendio?.localidad || municipio || '';
@@ -870,8 +876,12 @@ function registrarIngresoUsuario(
     timestamp: now.toISOString(),
     fechaFormateada,
     fechaCorta,
-    usuario: matchedExpendio?.encargado || usuario,
-    cedulaOrNit: matchedExpendio?.cedula || cedulaOrNit,
+    usuario: isCliente472Nit(cleanCed)
+      ? usuario || 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)'
+      : matchedExpendio?.encargado || usuario,
+    cedulaOrNit: isCliente472Nit(cleanCed)
+      ? CLIENTE_472_NIT_DISPLAY
+      : matchedExpendio?.cedula || cedulaOrNit,
     rol,
     municipio: resolvedMuni,
     ip,
@@ -882,6 +892,10 @@ function registrarIngresoUsuario(
     tipoAcceso,
     exitoso,
     detalles,
+    ...(extraMeta?.archivoDescargado ? { archivoDescargado: extraMeta.archivoDescargado } : {}),
+    ...(typeof extraMeta?.registrosExportados === 'number'
+      ? { registrosExportados: extraMeta.registrosExportados }
+      : {}),
   };
 
   // 1. Guardado en store aislado en disco (registros_acceso.json) sin tocar el JSON maestro
@@ -988,24 +1002,41 @@ async function calcularMetricasAccesoAsync(dbData: DatabaseSchema): Promise<Metr
     return true;
   });
 
-  const totalIngresos = registros.length;
-  const uniqueCedulas = new Set(registros.map((r) => normalizeCedula(r.cedulaOrNit)).filter(Boolean));
+  const registrosIngresosOnly = registros.filter((r) => r.tipoAcceso !== 'descarga_excel');
+  const registrosDescargasExcel = registros.filter((r) => r.tipoAcceso === 'descarga_excel');
+
+  const totalIngresos = registrosIngresosOnly.length;
+  const uniqueCedulas = new Set(registrosIngresosOnly.map((r) => normalizeCedula(r.cedulaOrNit)).filter(Boolean));
   const totalUsuariosUnicos = uniqueCedulas.size;
 
   const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
+  const todayStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Bogota' });
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const currentMonth = todayStr.substring(0, 7);
 
-  const ingresosHoy = registros.filter((r) => r.fechaCorta === todayStr).length;
-  const ingresosUltimos7Dias = registros.filter((r) => r.timestamp >= sevenDaysAgo).length;
-  const ingresosEsteMes = registros.filter((r) => (r.fechaCorta || '').startsWith(currentMonth)).length;
+  const ingresosHoy = registrosIngresosOnly.filter((r) => r.fechaCorta === todayStr).length;
+  const ingresosUltimos7Dias = registrosIngresosOnly.filter((r) => r.timestamp >= sevenDaysAgo).length;
+  const ingresosEsteMes = registrosIngresosOnly.filter((r) => (r.fechaCorta || '').startsWith(currentMonth)).length;
 
   const desglosePorRol = {
-    expendio: registros.filter((r) => r.rol === 'expendio').length,
-    admin: registros.filter((r) => r.rol === 'admin').length,
-    cliente: registros.filter((r) => r.rol === 'cliente').length,
+    expendio: registrosIngresosOnly.filter((r) => r.rol === 'expendio').length,
+    admin: registrosIngresosOnly.filter((r) => r.rol === 'admin').length,
+    cliente: registrosIngresosOnly.filter((r) => r.rol === 'cliente' || isCliente472Nit(r.cedulaOrNit)).length,
   };
+
+  const logsCliente472 = registros
+    .filter((r) => r.rol === 'cliente' || isCliente472Nit(r.cedulaOrNit) || r.tipoAcceso === 'descarga_excel')
+    .slice(0, 250);
+  const descargasExcelCliente = registrosDescargasExcel.filter(
+    (r) => r.rol === 'cliente' || isCliente472Nit(r.cedulaOrNit)
+  );
+  const ingresosCliente = registrosIngresosOnly.filter(
+    (r) => r.rol === 'cliente' || isCliente472Nit(r.cedulaOrNit)
+  );
+  const descargasExcelClienteCount = descargasExcelCliente.length;
+  const descargasExcelTotalCount = registrosDescargasExcel.length;
+  const ultimoIngresoCliente = ingresosCliente[0]?.fechaFormateada || null;
+  const ultimaDescargaExcelCliente = descargasExcelCliente[0]?.fechaFormateada || null;
 
   const desgloseDispositivo = {
     movil: registros.filter(
@@ -1179,10 +1210,15 @@ async function calcularMetricasAccesoAsync(dbData: DatabaseSchema): Promise<Metr
     desgloseDispositivo,
     expendiosQueHanIngresado,
     expendiosPendientesPorIngresar,
-    ultimosAccesos: registros.slice(0, 150),
+    ultimosAccesos: registros.slice(0, 200),
     usuariosEnLineaCount: activeList.length,
     desgloseEnLinea,
     listaUsuariosEnLinea: activeList,
+    descargasExcelClienteCount,
+    descargasExcelTotalCount,
+    ultimoIngresoCliente,
+    ultimaDescargaExcelCliente,
+    logsCliente472,
   };
 }
 
@@ -4077,6 +4113,61 @@ app.post('/api/auth/login', loginRateLimiter, (req, res) => {
     }
   }
 
+  // Verificar si corresponde al Cliente 4-72 (NIT 900.062.917-9 / 9000629179 / 900062917)
+  if (isCliente472Nit(searchVal)) {
+    const authUser: AuthenticatedUser = {
+      cedula: CLIENTE_472_NIT,
+      roles: ['cliente'],
+      role: 'cliente',
+      expendioId: '',
+      name: 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)',
+      municipio: 'SEDE NACIONAL 4-72',
+      isMultiRoleAdmin: false,
+      isCleanAdmin: false,
+      issuedAt: Date.now(),
+    };
+
+    const token = generateSessionToken(authUser);
+
+    res.cookie('camarca_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
+    registrarIngresoUsuario(
+      db,
+      req,
+      'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)',
+      CLIENTE_472_NIT_DISPLAY,
+      'cliente',
+      'SEDE NACIONAL 4-72',
+      'login',
+      true,
+      `Ingreso exitoso del Cliente 4-72 (NIT ${CLIENTE_472_NIT_DISPLAY}) al Módulo de Consulta de Expendios`
+    );
+
+    return res.json({
+      success: true,
+      token,
+      isMultiRoleAdmin: false,
+      canSelectRole: false,
+      isCleanAdmin: false,
+      availableRoles: ['cliente'],
+      user: {
+        role: 'cliente',
+        roles: ['cliente'],
+        cedulaOrNit: CLIENTE_472_NIT_DISPLAY,
+        name: 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)',
+        isMultiRoleAdmin: false,
+        isCleanAdmin: false,
+        token,
+      },
+    });
+  }
+
   // 1. Filtrar expendios asociados a la cédula proporcionada (excluyendo inhabilitados)
   const matchingExpendios = (db.expendios || []).filter(
     (exp) => normalizeCedula(exp.cedula) === searchVal && exp.estado !== 'Inhabilitado'
@@ -4199,17 +4290,19 @@ app.get('/api/auth/me', requireAuthenticatedUser, (req: AuthRequest, res) => {
       ? 'DIEGO ALEJANDRO BECERRA'
       : normCed === CLEAN_ADMIN_CEDULA
       ? 'ADMINISTRADOR CAMARCA S.A.S.'
+      : isCliente472Nit(normCed)
+      ? 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)'
       : ownExpendio?.encargado || user.name;
 
   res.json({
     success: true,
     user: {
-      cedula: user.cedula,
+      cedula: isCliente472Nit(normCed) ? CLIENTE_472_NIT_DISPLAY : user.cedula,
       roles: user.roles,
       role: user.role || user.roles[0],
       expendioId: user.expendioId,
       name: resolvedName,
-      municipio: normCed === ADMIN_CEDULA ? 'GIRON' : user.municipio,
+      municipio: normCed === ADMIN_CEDULA ? 'GIRON' : isCliente472Nit(normCed) ? 'SEDE NACIONAL 4-72' : user.municipio,
       isMultiRoleAdmin: user.isMultiRoleAdmin,
       expendioData: ownExpendio,
     },
@@ -4393,9 +4486,9 @@ app.get('/api/admin/metrics/accesos', async (req, res) => {
 app.get('/api/admin/metrics/exportar-csv', (req, res) => {
   const registros = getRegistrosAcceso();
 
-  let csv = '\uFEFFFECHA_HORA,USUARIO_ENCARGADO,CEDULA_NIT,ROL,MUNICIPIO,DISPOSITIVO,NAVEGADOR,IP,UBICACION_IP,PROVEEDOR_INTERNET_ISP,TIPO_ACCESO,ESTADO,DETALLES';
+  let csv = '\uFEFFFECHA_HORA,USUARIO_ENCARGADO,CEDULA_NIT,ROL,MUNICIPIO,DISPOSITIVO,NAVEGADOR,IP,UBICACION_IP,PROVEEDOR_INTERNET_ISP,TIPO_ACCESO,ARCHIVO_DESCARGADO,REGISTROS_EXPORTADOS,ESTADO,DETALLES\n';
   registros.forEach((r) => {
-    const clean = (val?: string) => `"${String(val || '').replace(/"/g, '""')}"`;
+    const clean = (val?: string | number) => `"${String(val ?? '').replace(/"/g, '""')}"`;
     csv +=
       [
         clean(r.fechaFormateada || r.timestamp),
@@ -4408,7 +4501,9 @@ app.get('/api/admin/metrics/exportar-csv', (req, res) => {
         clean(r.ip),
         clean(r.ubicacionIp || (r.municipio ? `${r.municipio}, Colombia` : 'Colombia')),
         clean(r.isp || 'Operador de Red'),
-        clean(r.tipoAcceso),
+        clean(r.tipoAcceso === 'descarga_excel' ? 'DESCARGA_EXCEL' : r.tipoAcceso),
+        clean(r.archivoDescargado || ''),
+        clean(r.registrosExportados ?? ''),
         clean(r.exitoso ? 'EXITOSO' : 'FALLIDO'),
         clean(r.detalles || ''),
       ].join(',') + '\n';
@@ -7775,34 +7870,85 @@ const handleDeleteSingleTrazabilidad = async (req: any, res: any) => {
 app.delete('/api/admin/trazabilidad/:id', handleDeleteSingleTrazabilidad);
 app.post('/api/admin/trazabilidad/:id/delete', handleDeleteSingleTrazabilidad);
 
-// 8. Cliente 4-72 & Admin: Export Exact 16 Columns to Excel (.xlsx)
+// 8. Cliente 4-72 & Admin: Export Exact Columns to Excel (.xlsx) with Detailed Audit Log
 app.get(['/api/cliente/export-excel', '/api/admin/export-excel'], requireAuthenticatedUser, (req: AuthRequest, res) => {
   const db = loadDatabase();
   const listToExport = db.expendios || [];
+  const isClienteRoute = req.path.includes('/api/cliente/') || req.user?.role === 'cliente' || isCliente472Nit(req.user?.cedula);
+  const fileName = 'Consolidado_Expendios_472.xlsx';
 
-  // Map strictly to the required 16 columns in exact required order
-  const mappedData = listToExport.map((e) => ({
-    'CENTRO OPERATIVO': e.centroOperativo || '',
-    'CENTRO DE ACOPIO': e.centroAcopio || '',
-    LOCALIDAD: e.localidad || '',
-    ENCARGADO: e.encargado || '',
-    CEDULA: e.cedula || '',
-    'DIRECCION PUNTO': e.direccionPunto || '',
-    'TELEFONO PUNTO': e.telefonoPunto || '',
-    LETRERO: e.tieneAviso === 'NO' ? 'NO' : (e.tieneAviso === 'SI' || e.letreroUrl || e.fotoAvisoUrl) ? 'SI' : 'NO',
-    BASCULA: e.tieneBascula === 'NO' ? 'NO' : (e.tieneBascula === 'SI' || e.basculaUrl || e.fotoBasculaUrl) ? 'SI' : 'NO',
-    MATASELLO: e.tieneMatasello === 'NO' ? 'NO' : (e.tieneMatasello === 'SI' || e.mataselloUrl || e.fotoMataselloUrl) ? 'SI' : 'NO',
-    'USUARIO DE SIPOST': e.usuarioSipost || '',
-    COMPUTADOR: e.computadorUrl ? 'SI' : 'NO',
-    INTERNET: e.internet || '',
-    NIT: e.nit || '',
-    'Correo Electronico': e.correoElectronico || '',
-    OBSERVACION: e.observaciones || e.observacion || '',
-  }));
+  // Map strictly to the required columns (Cliente 4-72 omits COMPUTADOR and includes ULTIMA ACTUALIZACION)
+  const mappedData = listToExport.map((e) => {
+    const base: Record<string, any> = {
+      'CENTRO OPERATIVO': e.centroOperativo || '',
+      'CENTRO DE ACOPIO': e.centroAcopio || '',
+      LOCALIDAD: e.localidad || '',
+      ENCARGADO: e.encargado || '',
+      CEDULA: e.cedula || '',
+      'DIRECCION PUNTO': e.direccionPunto || '',
+      'TELEFONO PUNTO': e.telefonoPunto || '',
+      LETRERO: e.tieneAviso === 'NO' ? 'NO' : (e.tieneAviso === 'SI' || e.letreroUrl || e.fotoAvisoUrl) ? 'SI' : 'NO',
+      BASCULA: e.tieneBascula === 'NO' ? 'NO' : (e.tieneBascula === 'SI' || e.basculaUrl || e.fotoBasculaUrl) ? 'SI' : 'NO',
+      MATASELLO: e.tieneMatasello === 'NO' ? 'NO' : (e.tieneMatasello === 'SI' || e.mataselloUrl || e.fotoMataselloUrl) ? 'SI' : 'NO',
+      'USUARIO DE SIPOST': e.usuarioSipost || '',
+    };
+    if (!isClienteRoute) {
+      base.COMPUTADOR = e.computadorUrl ? 'SI' : 'NO';
+    }
+    base.INTERNET = e.internet || '';
+    base.NIT = e.nit || '';
+    base['Correo Electronico'] = e.correoElectronico || '';
+    base.OBSERVACION = e.observaciones || e.observacion || '';
+    if (isClienteRoute) {
+      base['ULTIMA ACTUALIZACION'] =
+        e.fechaUltimaActualizacion && e.fechaUltimaActualizacion !== '2026-07-31'
+          ? e.fechaUltimaActualizacion
+          : 'Sin actualizar';
+    }
+    return base;
+  });
 
   const worksheet = XLSX.utils.json_to_sheet(mappedData);
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, 'Consolidado Expendios 4-72');
+
+  // Registrar auditoría detallada de la descarga del Excel en las métricas de acceso
+  try {
+    const actor = req.user!;
+    const isCliente472 = isCliente472Nit(actor.cedula);
+    const filtrosParam = String(req.query.filtros || '').trim();
+    const actorRol: 'admin' | 'expendio' | 'cliente' = isCliente472
+      ? 'cliente'
+      : req.path.includes('/api/cliente/') && actor.role === 'cliente'
+      ? 'cliente'
+      : (actor.role || 'cliente');
+    const actorCed = isCliente472 ? CLIENTE_472_NIT_DISPLAY : actor.cedula;
+    const actorName = isCliente472
+      ? 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)'
+      : actor.name || 'Usuario';
+    const actorMuni = isCliente472 ? 'SEDE NACIONAL 4-72' : actor.municipio || 'COLOMBIA';
+    const detalleDescarga = `Descarga de Excel (${fileName}) • ${listToExport.length} expendios exportados${
+      filtrosParam ? ` • Vista filtrada: ${filtrosParam}` : ' • Base consolidada completa'
+    }`;
+
+    registrarIngresoUsuario(
+      db,
+      req,
+      actorName,
+      actorCed,
+      actorRol,
+      actorMuni,
+      'descarga_excel',
+      true,
+      detalleDescarga,
+      {
+        archivoDescargado: fileName,
+        registrosExportados: listToExport.length,
+      }
+    );
+  } catch (logErr: any) {
+    console.warn('[Audit Export Excel Warn]:', logErr?.message || logErr);
+  }
 
   // Buffer generation
   const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
@@ -7811,7 +7957,7 @@ app.get(['/api/cliente/export-excel', '/api/admin/export-excel'], requireAuthent
     'Content-Type',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   );
-  res.setHeader('Content-Disposition', 'attachment; filename="Consolidado_Expendios_472.xlsx"');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');

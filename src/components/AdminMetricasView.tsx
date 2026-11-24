@@ -37,7 +37,8 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
   const [loading, setLoading] = useState<boolean>(true);
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [filtroRol, setFiltroRol] = useState<string>('todos');
-  const [subTab, setSubTab] = useState<'activos' | 'ultimos' | 'ingresaron' | 'pendientes'>('activos');
+  const [subTab, setSubTab] = useState<'activos' | 'ultimos' | 'cliente472' | 'ingresaron' | 'pendientes'>('activos');
+  const [filtroEventoCliente472, setFiltroEventoCliente472] = useState<'todos' | 'login' | 'descarga_excel'>('todos');
   const [modalLimpiar, setModalLimpiar] = useState<boolean>(false);
   const [passwordLimpiar, setPasswordLimpiar] = useState<string>('');
   const [errorLimpiar, setErrorLimpiar] = useState<string>('');
@@ -190,7 +191,30 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
       (item.dispositivo || '').toLowerCase().includes(term) ||
       (item.ip || '').includes(term) ||
       (item.ubicacionIp || '').toLowerCase().includes(term) ||
-      (item.isp || '').toLowerCase().includes(term)
+      (item.isp || '').toLowerCase().includes(term) ||
+      (item.detalles || '').toLowerCase().includes(term) ||
+      (item.archivoDescargado || '').toLowerCase().includes(term)
+    );
+  });
+
+  // Filtrado del log detallado exclusivo del Cliente 4-72 (Ingresos + Descargas Excel)
+  const logsCliente472Base = metricas?.logsCliente472 || [];
+  const logsCliente472Filtrados = logsCliente472Base.filter((item: RegistroAcceso) => {
+    if (filtroEventoCliente472 === 'descarga_excel' && item.tipoAcceso !== 'descarga_excel') return false;
+    if (filtroEventoCliente472 === 'login' && item.tipoAcceso === 'descarga_excel') return false;
+    if (!searchTerm.trim()) return true;
+    const term = searchTerm.toLowerCase();
+    return (
+      (item.fechaFormateada || '').toLowerCase().includes(term) ||
+      (item.usuario || '').toLowerCase().includes(term) ||
+      (item.cedulaOrNit || '').toLowerCase().includes(term) ||
+      (item.archivoDescargado || '').toLowerCase().includes(term) ||
+      (item.detalles || '').toLowerCase().includes(term) ||
+      (item.ip || '').includes(term) ||
+      (item.ubicacionIp || '').toLowerCase().includes(term) ||
+      (item.isp || '').toLowerCase().includes(term) ||
+      (item.dispositivo || '').toLowerCase().includes(term) ||
+      (item.navegador || '').toLowerCase().includes(term)
     );
   });
 
@@ -606,23 +630,38 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
             </div>
 
             {/* Cliente 4-72 */}
-            <div className="p-3 bg-slate-800/60 border border-slate-700/60 rounded-xl flex items-center justify-between">
+            <div
+              onClick={() => setSubTab('cliente472')}
+              className="p-3 bg-emerald-950/30 hover:bg-emerald-950/50 border border-emerald-500/35 hover:border-emerald-400/70 rounded-xl flex items-center justify-between cursor-pointer transition-all group"
+              title="Haz clic para abrir el Log detallado de ingresos y descargas Excel del Cliente 4-72"
+            >
               <div className="flex items-center space-x-3">
                 <div className="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs">
                   472
                 </div>
                 <div>
-                  <div className="text-xs font-bold text-slate-200">Cliente 4-72 (Servicios Postales)</div>
+                  <div className="text-xs font-bold text-slate-100 flex items-center space-x-1.5">
+                    <span>Cliente 4-72 (Servicios Postales)</span>
+                    <ArrowUpRight className="w-3.5 h-3.5 text-emerald-400 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                  </div>
                   <div className="text-[11px] text-slate-400">
-                    Consultas con NIT 900062917
+                    NIT <span className="font-mono text-emerald-300 font-semibold">900.062.917-9</span> •{' '}
+                    <span className="text-sky-300 font-semibold">
+                      {metricas?.descargasExcelClienteCount ?? 0} descargas Excel
+                    </span>
                   </div>
                 </div>
               </div>
               <div className="text-right">
-                <span className="text-base font-extrabold text-emerald-400">
-                  {metricas?.desglosePorRol.cliente ?? 0}
-                </span>
-                <span className="text-xs text-slate-400 ml-1">ingresos</span>
+                <div>
+                  <span className="text-base font-extrabold text-emerald-400">
+                    {metricas?.desglosePorRol.cliente ?? 0}
+                  </span>
+                  <span className="text-xs text-slate-400 ml-1">ingresos</span>
+                </div>
+                <div className="text-[10px] text-emerald-400 font-bold group-hover:underline">
+                  Ver Log 4-72 →
+                </div>
               </div>
             </div>
           </div>
@@ -708,6 +747,20 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
               }`}
             >
               Últimos Ingresos ({accesosFiltrados.length})
+            </button>
+
+            <button
+              onClick={() => setSubTab('cliente472')}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 ${
+                subTab === 'cliente472'
+                  ? 'bg-sky-500 text-slate-950 shadow'
+                  : 'text-sky-300/90 hover:text-sky-200 hover:bg-sky-500/10'
+              }`}
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>
+                Log Cliente 4-72 y Descargas Excel ({logsCliente472Base.length})
+              </span>
             </button>
 
             <button
@@ -853,7 +906,7 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
           </div>
         )}
 
-        {/* CONTENIDO 1: Últimos Ingresos */}
+        {/* CONTENIDO 1: Últimos Ingresos y Eventos */}
         {subTab === 'ultimos' && (
           <div className="overflow-x-auto">
             {accesosFiltrados.length === 0 ? (
@@ -865,94 +918,394 @@ export const AdminMetricasView: React.FC<AdminMetricasViewProps> = ({ onGoToExpe
                 <thead>
                   <tr className="border-b border-slate-800 text-slate-400 uppercase text-[11px] font-semibold bg-slate-800/40">
                     <th className="py-3 px-3">Fecha y Hora</th>
+                    <th className="py-3 px-3">Evento</th>
                     <th className="py-3 px-3">Usuario / Encargado</th>
                     <th className="py-3 px-3">Cédula / NIT</th>
                     <th className="py-3 px-3">Rol</th>
-                    <th className="py-3 px-3">Municipio / Punto</th>
+                    <th className="py-3 px-3">Municipio / Detalle</th>
                     <th className="py-3 px-3">Dirección IP y Ubicación</th>
                     <th className="py-3 px-3">Dispositivo / Navegador</th>
                     <th className="py-3 px-3">Estado</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {accesosFiltrados.map((item, idx) => (
-                    <tr key={`${item.id || 'acc'}-${idx}`} className="hover:bg-slate-800/30 transition-colors">
-                      <td className="py-3 px-3 whitespace-nowrap text-slate-300 font-mono text-[11px]">
-                        {item.fechaFormateada || item.timestamp}
-                      </td>
-                      <td className="py-3 px-3 font-semibold text-slate-100">
-                        {item.usuario || 'Usuario'}
-                      </td>
-                      <td className="py-3 px-3 font-mono text-amber-400/90 whitespace-nowrap">
-                        {item.cedulaOrNit}
-                      </td>
-                      <td className="py-3 px-3 whitespace-nowrap">
-                        <span
-                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                            item.rol === 'admin'
-                              ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
-                              : item.rol === 'expendio'
-                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                              : item.rol === 'cliente'
-                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                              : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                          }`}
-                        >
-                          {item.rol?.toUpperCase()}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 text-slate-300">
-                        {item.municipio ? (
-                          <span className="font-medium text-slate-200">{item.municipio}</span>
-                        ) : (
-                          <span className="text-slate-500 italic">No especificado</span>
-                        )}
-                      </td>
-                      <td className="py-3 px-3 text-slate-300">
-                        <div className="flex items-center space-x-1.5 font-mono text-emerald-400 font-semibold text-[11px]">
-                          <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                          <span>{item.ip || '127.0.0.1'}</span>
-                        </div>
-                        <div className="text-[11px] text-slate-300 flex items-center space-x-1 mt-0.5">
-                          <MapPin className="w-3 h-3 text-amber-400 shrink-0" />
-                          <span className="truncate max-w-[190px]">{item.ubicacionIp || (item.municipio ? `${item.municipio}, Colombia` : 'Colombia')}</span>
-                        </div>
-                        {item.isp && (
-                          <div className="text-[10px] text-slate-400 flex items-center space-x-1 mt-0.5">
-                            <Wifi className="w-2.5 h-2.5 text-sky-400 shrink-0" />
-                            <span className="truncate max-w-[190px]">{item.isp}</span>
-                          </div>
-                        )}
-                      </td>
-                      <td className="py-3 px-3 text-slate-300">
-                        <div className="flex items-center space-x-1.5">
-                          {item.dispositivo?.includes('Móvil') || item.dispositivo?.includes('iPhone') ? (
-                            <Smartphone className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  {accesosFiltrados.map((item, idx) => {
+                    const esDescarga = item.tipoAcceso === 'descarga_excel';
+                    return (
+                      <tr
+                        key={`${item.id || 'acc'}-${idx}`}
+                        className={`transition-colors ${
+                          esDescarga ? 'bg-sky-950/20 hover:bg-sky-950/35' : 'hover:bg-slate-800/30'
+                        }`}
+                      >
+                        <td className="py-3 px-3 whitespace-nowrap text-slate-300 font-mono text-[11px]">
+                          {item.fechaFormateada || item.timestamp}
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap">
+                          {esDescarga ? (
+                            <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40">
+                              <FileSpreadsheet className="w-3 h-3" />
+                              <span>Descarga Excel</span>
+                            </span>
                           ) : (
-                            <Laptop className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                            <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                              <UserCheck className="w-3 h-3" />
+                              <span>Ingreso</span>
+                            </span>
                           )}
-                          <span className="text-slate-200">{item.dispositivo}</span>
-                        </div>
-                        <div className="text-[10px] text-slate-500">{item.navegador}</div>
-                      </td>
-                      <td className="py-3 px-3 whitespace-nowrap">
-                        {item.exitoso ? (
-                          <span className="inline-flex items-center text-emerald-400 text-[11px] font-semibold space-x-1">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>Exitoso</span>
+                        </td>
+                        <td className="py-3 px-3 font-semibold text-slate-100">
+                          {item.usuario || 'Usuario'}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-amber-400/90 whitespace-nowrap">
+                          {item.cedulaOrNit}
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap">
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              item.rol === 'admin'
+                                ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                                : item.rol === 'expendio'
+                                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                : item.rol === 'cliente'
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                            }`}
+                          >
+                            {item.rol?.toUpperCase()}
                           </span>
-                        ) : (
-                          <span className="inline-flex items-center text-rose-400 text-[11px] font-semibold space-x-1">
-                            <AlertCircle className="w-3.5 h-3.5" />
-                            <span>Fallido</span>
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td className="py-3 px-3 text-slate-300 max-w-[260px]">
+                          {esDescarga ? (
+                            <div className="space-y-0.5">
+                              <div className="text-sky-300 font-semibold text-[11px] flex items-center space-x-1">
+                                <Download className="w-3 h-3 shrink-0" />
+                                <span className="truncate">{item.archivoDescargado || 'Consolidado_Expendios_472.xlsx'}</span>
+                              </div>
+                              {typeof item.registrosExportados === 'number' && (
+                                <div className="text-[10px] text-emerald-300 font-mono">
+                                  {item.registrosExportados} registros exportados
+                                </div>
+                              )}
+                              {item.detalles && (
+                                <div className="text-[10px] text-slate-400 leading-snug">{item.detalles}</div>
+                              )}
+                            </div>
+                          ) : item.municipio ? (
+                            <div>
+                              <span className="font-medium text-slate-200">{item.municipio}</span>
+                              {item.detalles && (
+                                <div className="text-[10px] text-slate-400 truncate max-w-[240px]">{item.detalles}</div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-slate-500 italic">{item.detalles || 'No especificado'}</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-slate-300">
+                          <div className="flex items-center space-x-1.5 font-mono text-emerald-400 font-semibold text-[11px]">
+                            <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span>{item.ip || '127.0.0.1'}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-300 flex items-center space-x-1 mt-0.5">
+                            <MapPin className="w-3 h-3 text-amber-400 shrink-0" />
+                            <span className="truncate max-w-[190px]">{item.ubicacionIp || (item.municipio ? `${item.municipio}, Colombia` : 'Colombia')}</span>
+                          </div>
+                          {item.isp && (
+                            <div className="text-[10px] text-slate-400 flex items-center space-x-1 mt-0.5">
+                              <Wifi className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                              <span className="truncate max-w-[190px]">{item.isp}</span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-slate-300">
+                          <div className="flex items-center space-x-1.5">
+                            {item.dispositivo?.includes('Móvil') || item.dispositivo?.includes('iPhone') ? (
+                              <Smartphone className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            ) : (
+                              <Laptop className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                            )}
+                            <span className="text-slate-200">{item.dispositivo}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-500">{item.navegador}</div>
+                        </td>
+                        <td className="py-3 px-3 whitespace-nowrap">
+                          {item.exitoso ? (
+                            <span className="inline-flex items-center text-emerald-400 text-[11px] font-semibold space-x-1">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Exitoso</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center text-rose-400 text-[11px] font-semibold space-x-1">
+                              <AlertCircle className="w-3.5 h-3.5" />
+                              <span>Fallido</span>
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}
+          </div>
+        )}
+
+        {/* CONTENIDO 1B: Log Detallado del Cliente 4-72 (NIT 900.062.917-9) y Descargas de Excel */}
+        {subTab === 'cliente472' && (
+          <div className="space-y-4 animate-fadeIn">
+            {/* Banner informativo de auditoría Cliente 4-72 */}
+            <div className="p-4 bg-sky-950/30 border border-sky-500/35 rounded-xl flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+              <div className="flex items-start space-x-3">
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 flex items-center justify-center font-black text-xs shrink-0">
+                  4-72
+                </div>
+                <div>
+                  <h5 className="text-sm font-bold text-slate-100 flex items-center flex-wrap gap-2">
+                    <span>Auditoría Detallada • Cliente 4-72 (Servicios Postales Nacionales S.A.S.)</span>
+                    <span className="font-mono text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                      NIT 900.062.917-9
+                    </span>
+                  </h5>
+                  <p className="text-xs text-slate-300 mt-1">
+                    Registro histórico completo en hora oficial de Colombia de cada inicio de sesión del usuario Cliente 4-72 y cada descarga del archivo Excel consolidado, con nombre de archivo, total de registros exportados, filtros activos, IP, ubicación y equipo.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleExportarCSV}
+                className="bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-bold py-2 px-3.5 rounded-xl flex items-center space-x-1.5 cursor-pointer transition-colors shadow shrink-0"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Exportar Log Completo (CSV)</span>
+              </button>
+            </div>
+
+            {/* 4 Tarjetas Resumen del Cliente 4-72 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="bg-slate-800/60 border border-slate-700/70 rounded-xl p-4">
+                <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                  <span>Total Ingresos 4-72</span>
+                  <UserCheck className="w-4 h-4 text-emerald-400" />
+                </div>
+                <div className="mt-2 flex items-baseline space-x-2">
+                  <span className="text-2xl font-black text-emerald-400">
+                    {metricas?.desglosePorRol.cliente ?? 0}
+                  </span>
+                  <span className="text-xs text-slate-400">sesiones</span>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-400">
+                  Accesos autenticados con NIT 900.062.917-9
+                </div>
+              </div>
+
+              <div className="bg-slate-800/60 border border-sky-500/40 rounded-xl p-4">
+                <div className="text-[11px] font-bold text-sky-300 uppercase tracking-wider flex items-center justify-between">
+                  <span>Descargas Excel (.xlsx)</span>
+                  <FileSpreadsheet className="w-4 h-4 text-sky-400" />
+                </div>
+                <div className="mt-2 flex items-baseline space-x-2">
+                  <span className="text-2xl font-black text-sky-400">
+                    {metricas?.descargasExcelClienteCount ?? 0}
+                  </span>
+                  <span className="text-xs text-slate-400">descargas</span>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-400">
+                  Exportaciones del consolidado realizadas por 4-72
+                </div>
+              </div>
+
+              <div className="bg-slate-800/60 border border-slate-700/70 rounded-xl p-4">
+                <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                  <span>Último Ingreso 4-72</span>
+                  <Clock className="w-4 h-4 text-amber-400" />
+                </div>
+                <div className="mt-2 text-sm font-bold font-mono text-slate-100">
+                  {metricas?.ultimoIngresoCliente || 'Sin ingresos registrados'}
+                </div>
+                <div className="mt-1 text-[11px] text-slate-400">
+                  Fecha y hora exacta (Colombia)
+                </div>
+              </div>
+
+              <div className="bg-slate-800/60 border border-slate-700/70 rounded-xl p-4">
+                <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                  <span>Última Descarga Excel</span>
+                  <Calendar className="w-4 h-4 text-sky-400" />
+                </div>
+                <div className="mt-2 text-sm font-bold font-mono text-sky-300">
+                  {metricas?.ultimaDescargaExcelCliente || 'Sin descargas registradas'}
+                </div>
+                <div className="mt-1 text-[11px] text-slate-400">
+                  Fecha y hora exacta de exportación (.xlsx)
+                </div>
+              </div>
+            </div>
+
+            {/* Filtros por tipo de evento */}
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-800/50 border border-slate-800 rounded-xl p-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-bold text-slate-400 uppercase px-1.5 flex items-center space-x-1">
+                  <Filter className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Filtrar actividad:</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setFiltroEventoCliente472('todos')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                    filtroEventoCliente472 === 'todos'
+                      ? 'bg-sky-500 text-slate-950'
+                      : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+                  }`}
+                >
+                  Todos ({logsCliente472Base.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFiltroEventoCliente472('login')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                    filtroEventoCliente472 === 'login'
+                      ? 'bg-emerald-500 text-slate-950'
+                      : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+                  }`}
+                >
+                  Solo Ingresos ({logsCliente472Base.filter((l) => l.tipoAcceso !== 'descarga_excel').length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFiltroEventoCliente472('descarga_excel')}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                    filtroEventoCliente472 === 'descarga_excel'
+                      ? 'bg-amber-500 text-slate-950'
+                      : 'bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700'
+                  }`}
+                >
+                  Solo Descargas Excel ({logsCliente472Base.filter((l) => l.tipoAcceso === 'descarga_excel').length})
+                </button>
+              </div>
+              <span className="text-[11px] text-slate-400 px-1.5">
+                Mostrando <strong className="text-slate-200">{logsCliente472Filtrados.length}</strong> evento(s)
+              </span>
+            </div>
+
+            {/* Tabla detallada del log Cliente 4-72 */}
+            <div className="overflow-x-auto">
+              {logsCliente472Filtrados.length === 0 ? (
+                <div className="text-center py-12 text-slate-400 text-xs bg-slate-800/20 rounded-xl border border-slate-800">
+                  Aún no hay eventos registrados para el Cliente 4-72 (NIT 900.062.917-9) con el filtro seleccionado. Cuando el cliente ingrese o descargue el Excel, el registro aparecerá aquí en tiempo real.
+                </div>
+              ) : (
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400 uppercase text-[11px] font-semibold bg-slate-800/40">
+                      <th className="py-3 px-3">Fecha y Hora Exacta (CO)</th>
+                      <th className="py-3 px-3">Tipo de Evento</th>
+                      <th className="py-3 px-3">Usuario / NIT</th>
+                      <th className="py-3 px-3">Archivo y Detalle Completo</th>
+                      <th className="py-3 px-3">IP, Ubicación y Proveedor (ISP)</th>
+                      <th className="py-3 px-3">Dispositivo y Navegador</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {logsCliente472Filtrados.map((item, idx) => {
+                      const esDescarga = item.tipoAcceso === 'descarga_excel';
+                      return (
+                        <tr
+                          key={`${item.id || 'c472'}-${idx}`}
+                          className={`transition-colors ${
+                            esDescarga
+                              ? 'bg-sky-950/25 hover:bg-sky-950/40'
+                              : 'hover:bg-slate-800/35'
+                          }`}
+                        >
+                          <td className="py-3.5 px-3 whitespace-nowrap">
+                            <div className="font-mono font-bold text-slate-100 text-[12px]">
+                              {item.fechaFormateada || item.timestamp}
+                            </div>
+                            {item.fechaCorta && (
+                              <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                                Fecha: {item.fechaCorta}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-3 whitespace-nowrap">
+                            {esDescarga ? (
+                              <span className="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-sky-500/20 text-sky-300 border border-sky-400/50">
+                                <FileSpreadsheet className="w-3.5 h-3.5" />
+                                <span>Descarga Excel (.xlsx)</span>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                                <UserCheck className="w-3.5 h-3.5" />
+                                <span>Ingreso al Portal</span>
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-3">
+                            <div className="font-bold text-slate-100">
+                              {item.usuario || 'CLIENTE 4-72 (SERVICIOS POSTALES NACIONALES)'}
+                            </div>
+                            <div className="text-[11px] font-mono text-emerald-400 mt-0.5">
+                              NIT: {item.cedulaOrNit || '900.062.917-9'}
+                            </div>
+                          </td>
+                          <td className="py-3.5 px-3 max-w-[320px]">
+                            {esDescarga ? (
+                              <div className="space-y-1">
+                                <div className="inline-flex items-center space-x-1.5 text-sky-300 font-bold text-[11px] bg-sky-500/10 border border-sky-500/30 px-2 py-0.5 rounded-md">
+                                  <Download className="w-3 h-3 shrink-0" />
+                                  <span>{item.archivoDescargado || 'Consolidado_Expendios_472.xlsx'}</span>
+                                </div>
+                                {typeof item.registrosExportados === 'number' && (
+                                  <div className="text-[11px] text-emerald-300 font-semibold">
+                                    Registros exportados: <span className="font-mono font-bold">{item.registrosExportados}</span>
+                                  </div>
+                                )}
+                                <div className="text-[11px] text-slate-300 leading-snug">
+                                  {item.detalles || 'Descarga de base consolidada en Excel'}
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-slate-300 leading-snug">
+                                {item.detalles || 'Inicio de sesión exitoso en el Módulo Cliente 4-72'}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-3 text-slate-300">
+                            <div className="flex items-center space-x-1.5 font-mono text-emerald-400 font-semibold text-[11px]">
+                              <Globe className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              <span>{item.ip || '127.0.0.1'}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-300 flex items-center space-x-1 mt-0.5">
+                              <MapPin className="w-3 h-3 text-amber-400 shrink-0" />
+                              <span>{item.ubicacionIp || 'Colombia'}</span>
+                            </div>
+                            {item.isp && (
+                              <div className="text-[10px] text-slate-400 flex items-center space-x-1 mt-0.5">
+                                <Wifi className="w-2.5 h-2.5 text-sky-400 shrink-0" />
+                                <span>{item.isp}</span>
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-3 text-slate-300">
+                            <div className="flex items-center space-x-1.5">
+                              {item.dispositivo?.includes('Móvil') || item.dispositivo?.includes('iPhone') ? (
+                                <Smartphone className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                              ) : (
+                                <Laptop className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                              )}
+                              <span className="text-slate-200 font-medium">{item.dispositivo}</span>
+                            </div>
+                            <div className="text-[11px] text-slate-400 mt-0.5">{item.navegador}</div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         )}
 

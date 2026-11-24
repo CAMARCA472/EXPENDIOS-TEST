@@ -532,9 +532,11 @@ export interface RegistroAcceso {
   isp?: string;
   dispositivo?: string;
   navegador?: string;
-  tipoAcceso: 'login' | 'visita';
+  tipoAcceso: 'login' | 'visita' | 'descarga_excel';
   exitoso: boolean;
   detalles?: string;
+  archivoDescargado?: string;
+  registrosExportados?: number;
 }
 
 export interface ResumenExpendioAcceso {
@@ -600,6 +602,11 @@ export interface MetricasAccesoResumen {
     cliente: number;
   };
   listaUsuariosEnLinea?: UsuarioActivoEnLinea[];
+  descargasExcelClienteCount?: number;
+  descargasExcelTotalCount?: number;
+  ultimoIngresoCliente?: string | null;
+  ultimaDescargaExcelCliente?: string | null;
+  logsCliente472?: RegistroAcceso[];
 }
 
 export interface DatabaseSchema {

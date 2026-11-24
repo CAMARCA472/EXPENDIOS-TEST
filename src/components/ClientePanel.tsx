@@ -330,9 +330,16 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
 
   const [descargandoExcel, setDescargandoExcel] = useState<boolean>(false);
 
-  // Client-side or Server-side Excel Download trigger
+  // Client-side or Server-side Excel Download trigger (con registro de auditoría en servidor)
   const handleExportExcel = async () => {
-    await downloadAuthenticatedFile('/api/cliente/export-excel', 'Consolidado_Expendios_472.xlsx', {
+    const activeFilters: string[] = [];
+    if (filterCentroOperativo !== 'TODOS') activeFilters.push(`CO:${filterCentroOperativo}`);
+    if (filterCentroAcopio !== 'TODOS') activeFilters.push(`CA:${filterCentroAcopio}`);
+    if (filterLocalidad !== 'TODOS') activeFilters.push(`Loc:${filterLocalidad}`);
+    if (searchTerm.trim()) activeFilters.push(`Busq:${searchTerm.trim()}`);
+    const query = activeFilters.length > 0 ? `?filtros=${encodeURIComponent(activeFilters.join(' | '))}` : '';
+
+    await downloadAuthenticatedFile(`/api/cliente/export-excel${query}`, 'Consolidado_Expendios_472.xlsx', {
       onStart: () => setDescargandoExcel(true),
       onSuccess: () => setDescargandoExcel(false),
       onError: () => setDescargandoExcel(false),
@@ -350,7 +357,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
         <div>
           <div className="flex items-center space-x-2 text-sky-600 dark:text-sky-400 font-semibold text-xs tracking-wider uppercase mb-1">
             <Building2 className="w-4 h-4" />
-            <span>CLIENTE OFICIAL 4-72 | NIT 900062917</span>
+            <span>CLIENTE OFICIAL 4-72 | NIT 900.062.917-9</span>
           </div>
           <h2 className={`text-2xl font-black tracking-tight ${isLight ? 'text-slate-900' : 'text-slate-100'}`}>
             Consolidado Regional de Expendios 4-72
@@ -529,12 +536,11 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                 <option value="bascula">9. Báscula</option>
                 <option value="matasello">10. Matasello</option>
                 <option value="usuarioSipost">11. Usuario Sipost</option>
-                <option value="computador">12. Computador</option>
-                <option value="internet">13. Internet</option>
-                <option value="nit">14. NIT</option>
-                <option value="correoElectronico">15. Correo Electrónico</option>
-                <option value="observacion">16. Observación</option>
-                <option value="fechaUltimaActualizacion">17. Última Actualización</option>
+                <option value="internet">12. Internet</option>
+                <option value="nit">13. NIT</option>
+                <option value="correoElectronico">14. Correo Electrónico</option>
+                <option value="observacion">15. Observación</option>
+                <option value="fechaUltimaActualizacion">16. Última Actualización</option>
               </select>
 
               <button
@@ -1104,24 +1110,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                   </button>
                 </th>
 
-                {/* 12. COMPUTADOR */}
-                <th className={`py-2 px-3 border-r ${isLight ? 'border-slate-200' : 'border-slate-800/80'}`}>
-                  <button
-                    type="button"
-                    onClick={() => handleSort('computador')}
-                    className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left"
-                    title="Click para ordenar por Computador"
-                  >
-                    <span>12. COMPUTADOR</span>
-                    {sortField === 'computador' ? (
-                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
-                    ) : (
-                      <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
-                    )}
-                  </button>
-                </th>
-
-                {/* 13. INTERNET */}
+                {/* 12. INTERNET */}
                 <th className={`py-2 px-3 border-r ${isLight ? 'border-slate-200' : 'border-slate-800/80'}`}>
                   <button
                     type="button"
@@ -1129,7 +1118,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                     className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left"
                     title="Click para ordenar por Internet"
                   >
-                    <span>13. INTERNET</span>
+                    <span>12. INTERNET</span>
                     {sortField === 'internet' ? (
                       sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
                     ) : (
@@ -1138,7 +1127,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                   </button>
                 </th>
 
-                {/* 14. NIT */}
+                {/* 13. NIT */}
                 <th className={`py-2 px-3 border-r ${isLight ? 'border-slate-200' : 'border-slate-800/80'}`}>
                   <button
                     type="button"
@@ -1146,7 +1135,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                     className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left"
                     title="Click para ordenar por NIT"
                   >
-                    <span>14. NIT</span>
+                    <span>13. NIT</span>
                     {sortField === 'nit' ? (
                       sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
                     ) : (
@@ -1155,7 +1144,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                   </button>
                 </th>
 
-                {/* 15. Correo Electronico */}
+                {/* 14. Correo Electronico */}
                 <th className={`py-2 px-3 border-r ${isLight ? 'border-slate-200' : 'border-slate-800/80'}`}>
                   <button
                     type="button"
@@ -1163,7 +1152,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                     className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left"
                     title="Click para ordenar por Correo Electrónico"
                   >
-                    <span>15. Correo Electronico</span>
+                    <span>14. Correo Electronico</span>
                     {sortField === 'correoElectronico' ? (
                       sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
                     ) : (
@@ -1172,7 +1161,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                   </button>
                 </th>
 
-                {/* 16. OBSERVACION */}
+                {/* 15. OBSERVACION */}
                 <th className="py-2 px-3 border-r border-slate-700/60">
                   <button
                     type="button"
@@ -1180,7 +1169,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                     className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left"
                     title="Click para ordenar por Observación"
                   >
-                    <span>16. OBSERVACION</span>
+                    <span>15. OBSERVACION</span>
                     {sortField === 'observacion' ? (
                       sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
                     ) : (
@@ -1189,7 +1178,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                   </button>
                 </th>
 
-                {/* 17. ÚLTIMA ACTUALIZACIÓN */}
+                {/* 16. ÚLTIMA ACTUALIZACIÓN */}
                 <th className="py-2 px-3 whitespace-nowrap">
                   <button
                     type="button"
@@ -1197,7 +1186,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                     className="flex items-center space-x-1 hover:text-sky-600 dark:hover:text-sky-400 font-bold transition-colors cursor-pointer text-left text-emerald-600 dark:text-emerald-400"
                     title="Click para ordenar por Fecha de Última Actualización"
                   >
-                    <span>17. ÚLTIMA ACTUALIZACIÓN</span>
+                    <span>16. ÚLTIMA ACTUALIZACIÓN</span>
                     {sortField === 'fechaUltimaActualizacion' ? (
                       sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-sky-600" /> : <ArrowDown className="w-3 h-3 text-sky-600" />
                     ) : (
@@ -1338,43 +1327,6 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
 
                     <td className={`py-3 px-3.5 font-mono border-r ${isLight ? 'border-slate-200 text-slate-700' : 'border-slate-800/80 text-slate-300'}`}>{exp.usuarioSipost}</td>
 
-                    {/* Computador */}
-                    <td className={`py-3 px-3.5 border-r ${isLight ? 'border-slate-200' : 'border-slate-800/80'}`}>
-                      {exp.computadorUrl ? (
-                        <button
-                          onClick={() => setSelectedPhotoModal({
-                            title: `Computador / Equipamiento - ${exp.localidad}`,
-                            subtitle: `Municipio: ${exp.municipio} | Operador Postal 4-72`,
-                            url: exp.computadorUrl!,
-                            metadata: {
-                              encargado: exp.encargado,
-                              cedula: exp.cedula,
-                              municipio: exp.municipio,
-                              direccion: exp.direccionPunto,
-                              telefono: exp.telefonoPunto,
-                            }
-                          })}
-                          className={`inline-flex items-center space-x-1 text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer transition-colors ${
-                            isLight
-                              ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200 border border-emerald-300'
-                              : 'bg-emerald-950/80 text-emerald-300 hover:bg-emerald-900 border border-emerald-800'
-                          }`}
-                        >
-                          <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                          <span>CARGADO</span>
-                        </button>
-                      ) : (
-                        <span className={`inline-flex items-center space-x-1 text-[11px] px-2 py-0.5 rounded ${
-                          isLight
-                            ? 'bg-slate-100 text-slate-400 border border-slate-200'
-                            : 'bg-slate-950 text-slate-500 border border-slate-800'
-                        }`}>
-                          <XCircle className="w-3 h-3 text-slate-400" />
-                          <span>PENDIENTE</span>
-                        </span>
-                      )}
-                    </td>
-
                     <td className={`py-3 px-3.5 border-r ${isLight ? 'border-slate-200 text-slate-600' : 'border-slate-800/80 text-slate-300'}`}>{exp.internet}</td>
                     <td className={`py-3 px-3.5 font-mono border-r ${isLight ? 'border-slate-200 text-slate-700' : 'border-slate-800/80 text-slate-200'}`}>{exp.nit}</td>
                     <td className={`py-3 px-3.5 border-r ${isLight ? 'border-slate-200 text-slate-600' : 'border-slate-800/80 text-slate-300'}`}>{exp.correoElectronico}</td>
@@ -1392,7 +1344,7 @@ export const ClientePanel: React.FC<ClientePanelProps> = ({ session, theme = 'li
                 ))
               ) : (
                 <tr>
-                  <td colSpan={18} className={`py-12 text-center ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>
+                  <td colSpan={17} className={`py-12 text-center ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>
                     No se encontraron registros de expendios que coincidan con los filtros seleccionados.
                   </td>
                 </tr>

@@ -3,7 +3,7 @@ services:
     name: expendios-camarca
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: NODE_OPTIONS="--max-old-space-size=2048" npm install --include=dev && NODE_OPTIONS="--max-old-space-size=2048" npm run build
     startCommand: npm start
     healthCheckPath: /
     envVars:
