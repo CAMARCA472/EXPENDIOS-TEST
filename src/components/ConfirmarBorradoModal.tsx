@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { AlertTriangle, Lock, Eye, EyeOff, Trash2, X, ShieldAlert } from 'lucide-react';
 
-export const ADMIN_SECURITY_PASSWORD = 'Camarca.2023*';
+// Modal de confirmación con re-autenticación de seguridad para acciones críticas
 
 interface ConfirmarBorradoModalProps {
   isOpen: boolean;
@@ -37,13 +37,8 @@ export const ConfirmarBorradoModal: React.FC<ConfirmarBorradoModalProps> = ({
       return;
     }
 
-    if (password !== ADMIN_SECURITY_PASSWORD) {
-      setErrorMsg('Contraseña de seguridad incorrecta. Operación cancelada.');
-      return;
-    }
-
     setErrorMsg('');
-    onConfirm(password);
+    onConfirm(password.trim());
   };
 
   return (

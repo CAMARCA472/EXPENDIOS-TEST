@@ -95,39 +95,34 @@ export function decryptToken(cipherText: string): string | null {
 }
 
 /**
- * Guarda el Refresh Token encriptado en localStorage y sessionStorage
+ * Guarda el Refresh Token - DEPRECADO según Regla 8 de Seguridad.
+ * El Refresh Token se almacena EXCLUSIVAMENTE en PostgreSQL en el servidor.
+ * Se purgan de inmediato llaves residuales en localStorage / sessionStorage.
  */
-export function saveEncryptedRefreshToken(refreshToken: string): void {
+export function saveEncryptedRefreshToken(_refreshToken: string): void {
   try {
     if (typeof window === 'undefined') return;
-    if (!refreshToken || refreshToken.trim().length < 5) return;
-    const encrypted = encryptToken(refreshToken.trim());
-    if (encrypted) {
-      window.localStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, encrypted);
-      window.sessionStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, encrypted);
-    }
-  } catch (e) {
-    console.warn('No se pudo guardar refresh token en localStorage:', e);
-  }
+    window.localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+    window.sessionStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+  } catch {}
 }
 
 /**
- * Obtiene el Refresh Token desencriptado desde localStorage
+ * Obtiene el Refresh Token - El Refresh Token reside estrictamente en PostgreSQL (Servidor).
+ * El frontend nunca almacena ni expone el Refresh Token.
  */
 export function getStoredRefreshToken(): string | null {
   try {
     if (typeof window === 'undefined') return null;
-    const raw = window.localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || 
-                window.sessionStorage.getItem(REFRESH_TOKEN_STORAGE_KEY);
-    if (!raw) return null;
-    return decryptToken(raw);
-  } catch {
-    return null;
-  }
+    // Purgar inmediatamente si existía alguna llave previa
+    window.localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+    window.sessionStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+  } catch {}
+  return null;
 }
 
 /**
- * Elimina el Refresh Token encriptado de localStorage
+ * Elimina cualquier rastro de credenciales en almacenamiento local del navegador
  */
 export function clearEncryptedRefreshToken(): void {
   try {
@@ -140,10 +135,10 @@ export function clearEncryptedRefreshToken(): void {
 }
 
 /**
- * Comprueba si hay un Refresh Token almacenado
+ * Comprueba si hay un Refresh Token activo - Gestionado en el servidor backend en PostgreSQL
  */
 export function hasStoredRefreshToken(): boolean {
-  return Boolean(getStoredRefreshToken());
+  return false;
 }
 
 /**

@@ -5,10 +5,12 @@ export interface ExpendioData {
   centroOperativo: string;
   centroAcopio: string;
   localidad: string;
+  departamento?: string;
   encargado: string;
   cedula: string;
   direccionPunto: string;
   telefonoPunto: string;
+  telefono?: string;
   
   // 7 Fotos oficiales requeridas
   fotoAvisoUrl?: string; // 1. Foto aviso
@@ -58,12 +60,20 @@ export interface ExpendioData {
   tieneAviso?: 'SI' | 'NO' | '' | 'N/A';
   tieneBascula?: 'SI' | 'NO' | '' | 'N/A';
   tieneMatasello?: 'SI' | 'NO' | '' | 'N/A';
+  tieneImpresora?: 'SI' | 'NO' | '' | 'N/A';
   motivoFaltaAviso?: string;
   motivoFaltaBascula?: string;
   motivoFaltaMatasello?: string;
+  motivoFaltaImpresora?: string;
 
   // Observaciones, comentarios o sugerencias del expendio
   observaciones?: string;
+  celular?: string;
+  correo?: string;
+  direccion?: string;
+  numeroCuenta?: string;
+  updatedAt?: string;
+  revision?: number;
 }
 
 export interface CuentaCobroParams {
@@ -116,10 +126,18 @@ export interface CuentaCobroResult {
   nombre?: string;
   concepto?: string;
   fechaGeneracion?: string;
+  estado?: string;
+  soporteUrl?: string;
+  cuenta?: string;
+  tipoCuenta?: string;
 }
 
 export interface TrazabilidadExpendio {
   id: string;
+  expendioId?: string;
+  actorId?: string;
+  actorRole?: string;
+  timestamp?: string;
   municipio: string;
   localidad: string;
   tipoMovimiento?: 'CAMBIO_ENCARGADO' | 'RETIRO_INHABILITACION' | 'INGRESO_NUEVO' | 'REACTIVACION' | string;
@@ -143,6 +161,9 @@ export interface TrazabilidadExpendio {
   observaciones?: string;
   fechaRegistro: string;
   registradoPor?: string;
+  commitId?: string;
+  before?: any;
+  after?: any;
 }
 
 export interface HistorialItem {
@@ -153,6 +174,7 @@ export interface HistorialItem {
   cedula: string;
   expendio: string;
   monto: number;
+  valorBase?: number;
   fecha: string;
   estado: 'Procesado' | 'Pendiente' | 'Aprobado' | 'Cancelado' | string;
   detalles?: string;
@@ -193,7 +215,20 @@ export interface ResultadoConciliacionAI {
     tipoTransaccion?: string;
   };
   observacionesIA?: string;
-  estadoConciliacion: 'Listo' | 'RevisionManual' | 'Cancelado';
+  estadoDeterminista?: 'MATCH_EXACTO' | 'SIN_COINCIDENCIA' | 'AMBIGUA' | 'DUPLICADO_EXACTO';
+  motivoDeterminista?: string;
+  fileHashSha256?: string;
+  candidatosAmbiguedad?: Array<{
+    id: string;
+    nombrePunto: string;
+    municipio: string;
+    localidad?: string | null;
+    cedula: string;
+    encargado: string;
+    valorMensual?: number;
+    regional?: string | null;
+  }>;
+  estadoConciliacion: 'Listo' | 'RevisionManual' | 'Cancelado' | 'MATCH_EXACTO' | 'SIN_COINCIDENCIA' | 'AMBIGUA' | 'DUPLICADO_EXACTO';
   historialMatchedId?: string;
   expendioMatchedId?: string;
   expendioNombre?: string;
@@ -217,6 +252,7 @@ export interface OfflinePhotoItem {
 export interface StoredPhotoRecord {
   id?: number;
   uuid: string;
+  expendioId?: string;
   cedula: string;
   slotKey: string;
   slotTitle: string;
@@ -233,8 +269,13 @@ export interface StoredPhotoRecord {
   fileName: string;
   gpsCoordinates?: { latitude: number; longitude: number; accuracy?: number } | null;
   status: 'pending' | 'uploading' | 'synced' | 'failed';
+  version?: number | string;
+  checksum?: string;
   serverSynced: boolean;
   serverSyncedAt?: string;
+  downloadedFromServer?: boolean;
+  firestoreSynced?: boolean;
+  s3Synced?: boolean;
   driveSynced: boolean;
   driveSyncedAt?: string;
   driveFileId?: string;
@@ -254,6 +295,9 @@ export interface IndexedDBStorageStats {
   totalRecords?: number;
   pendingRecords?: number;
   driveSyncedRecords?: number;
+  drivePendingRecords?: number;
+  firestoreSyncedRecords?: number;
+  s3SyncedRecords?: number;
   estimatedBytesFormatted?: string;
   lastPurgeAt?: string;
   totalPurgedCount?: number;
@@ -301,8 +345,8 @@ export interface DocumentoExpendioConfig {
 
 export interface SystemConfig {
   isEphemeralSeed?: boolean;
-  periodoHabilitadoDescarga: string; // e.g. "FEBRERO 2026"
-  descargaHabilitada: boolean;
+  periodoHabilitadoDescarga?: string; // e.g. "FEBRERO 2026"
+  descargaHabilitada?: boolean;
   fechaActualizacion?: string;
   googleDriveWebhookUrl?: string;
   lastSyncFromPublished?: string;
@@ -320,6 +364,10 @@ export interface SystemConfig {
   googleDriveAccountEmail?: string;
   googleDriveAccountName?: string;
   googleDriveTokenExpiresAt?: number;
+  googleOAuthClientId?: string;
+  googleOAuthClientSecret?: string;
+  lastModified?: string;
+  lastSyncTimestamp?: string;
 }
 
 export interface AnalisisIACuentaCobro {
@@ -437,6 +485,8 @@ export interface UserSession {
   name: string;
   expendioData?: ExpendioData;
   isMultiRoleAdmin?: boolean;
+  isCleanAdmin?: boolean;
+  token?: string;
 }
 
 export interface ResumenFinancieroCuentas {
@@ -500,6 +550,21 @@ export interface ResumenExpendioAcceso {
   isp?: string;
 }
 
+export interface UsuarioActivoEnLinea {
+  key: string;
+  cedula: string;
+  usuario: string;
+  rol: string;
+  municipio: string;
+  ip: string;
+  dispositivo: string;
+  navegador?: string;
+  path: string;
+  lastSeen: number;
+  haceCuantoSegundos: number;
+  timestampIso: string;
+}
+
 export interface MetricasAccesoResumen {
   totalIngresos: number;
   totalUsuariosUnicos: number;
@@ -528,5 +593,27 @@ export interface MetricasAccesoResumen {
     telefonoPunto?: string;
   }[];
   ultimosAccesos: RegistroAcceso[];
+  usuariosEnLineaCount?: number;
+  desgloseEnLinea?: {
+    expendio: number;
+    admin: number;
+    cliente: number;
+  };
+  listaUsuariosEnLinea?: UsuarioActivoEnLinea[];
+}
+
+export interface DatabaseSchema {
+  expendios: ExpendioData[];
+  historial: HistorialItem[];
+  trazabilidad: TrazabilidadExpendio[];
+  config?: SystemConfig;
+  cuentasCargadas?: CuentaCargadaExpendio[];
+  relacionPagos?: PagoRelacionItem[];
+  registrosAcceso?: RegistroAcceso[];
+  visitasGenerales?: number;
+  updatedAt?: string;
+  revision?: number;
+  version?: string;
+  googleDrivePhotos?: Record<string, any>;
 }
 

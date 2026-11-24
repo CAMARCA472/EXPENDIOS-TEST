@@ -1,13 +1,3 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { 
-  getAuth, 
-  signInWithPopup, 
-  GoogleAuthProvider, 
-  onAuthStateChanged, 
-  User, 
-  signOut 
-} from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
 import {
   saveEncryptedRefreshToken,
   getStoredRefreshToken,
@@ -26,26 +16,38 @@ export {
   getTimeUntilExpiration
 };
 
-// Defined scopes for Google Drive backup & Google Sheets database integration
+export interface GoogleUser {
+  email?: string | null;
+  displayName?: string | null;
+  photoURL?: string | null;
+  uid?: string;
+}
+
+export type User = GoogleUser;
+
+// Scopes for Google Drive photo backup
 export const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/spreadsheets',
 ];
 
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+const GOOGLE_CLIENT_ID = '1094702324887-rp4lbvga43esdfrgjvp00huuf2tihoit.apps.googleusercontent.com';
 
-const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/drive.file');
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-provider.setCustomParameters({
-  prompt: 'consent',
-  access_type: 'offline',
-});
+async function resolveClientId(): Promise<string> {
+  try {
+    const res = await fetch('/api/admin/google-drive/token');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.googleOAuthClientId && data.googleOAuthClientId.trim()) {
+        return data.googleOAuthClientId.trim();
+      }
+    }
+  } catch {}
+  return GOOGLE_CLIENT_ID;
+}
 
 // In-memory token cache with active session support
 let cachedAccessToken: string | null = null;
-let cachedUser: User | null = null;
+let cachedUser: GoogleUser | null = null;
 let isSigningIn = false;
 let activeRefreshPromise: Promise<string | null> | null = null;
 
@@ -85,17 +87,15 @@ function saveSessionToken(token: string | null, email?: string, displayName?: st
         window.sessionStorage.setItem(SESSION_NAME_KEY, displayName);
       }
 
-      // Persistir al servidor backend
-      const storedRefreshToken = getStoredRefreshToken();
+      // Persistir al servidor backend (el Refresh Token se gestiona exclusivamente en PostgreSQL en el backend)
       fetch('/api/admin/google-drive/set-token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           accessToken: cleanToken,
-          refreshToken: storedRefreshToken || undefined,
           expiresIn: expiresInSeconds,
-          email: email || window.localStorage.getItem(SESSION_EMAIL_KEY) || '',
-          displayName: displayName || window.localStorage.getItem(SESSION_NAME_KEY) || '',
+          email: email || (typeof window !== 'undefined' ? window.localStorage.getItem(SESSION_EMAIL_KEY) || '' : ''),
+          displayName: displayName || (typeof window !== 'undefined' ? window.localStorage.getItem(SESSION_NAME_KEY) || '' : ''),
         }),
       }).catch(() => {});
     } else {
@@ -109,23 +109,19 @@ function saveSessionToken(token: string | null, email?: string, displayName?: st
 
 /**
  * Renueva automáticamente el Access Token utilizando el Refresh Token
- * Almacenado de forma encriptada en localStorage o persistido en el servidor
+ * persistido de forma segura en PostgreSQL en el servidor.
  */
 export const refreshGoogleAccessToken = async (): Promise<string | null> => {
-  // Deduplicación de promesas concurrentes
   if (activeRefreshPromise) {
     return activeRefreshPromise;
   }
 
   activeRefreshPromise = (async () => {
     try {
-      const storedRefreshToken = getStoredRefreshToken();
       const res = await fetch('/api/admin/google-drive/refresh-token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          refreshToken: storedRefreshToken || undefined,
-        }),
+        body: JSON.stringify({}),
       });
 
       const data = await res.json();
@@ -137,7 +133,6 @@ export const refreshGoogleAccessToken = async (): Promise<string | null> => {
         saveTokenExpiration(expiresIn);
         saveSessionToken(newAccessToken, undefined, undefined, expiresIn);
 
-        // Notificar al navegador que el token ha sido renovado
         if (typeof window !== 'undefined') {
           window.dispatchEvent(
             new CustomEvent('googleDriveTokenRefreshed', {
@@ -146,7 +141,7 @@ export const refreshGoogleAccessToken = async (): Promise<string | null> => {
           );
         }
 
-        console.log(`[GoogleAuth] ✓ Token de acceso renovado exitosamente sin requerir inicio de sesión. Vigencia: ${expiresIn}s`);
+        console.log(`[GoogleAuth] ✓ Token de acceso renovado exitosamente desde PostgreSQL. Vigencia: ${expiresIn}s`);
         return newAccessToken;
       } else {
         console.warn('[GoogleAuth] Fallo en la renovación automática de token:', data.error);
@@ -163,14 +158,11 @@ export const refreshGoogleAccessToken = async (): Promise<string | null> => {
   return activeRefreshPromise;
 };
 
-/**
- * Temporizador de fondo que renueva proactivamente el access token antes de que expire (< 5 min)
- */
+// Temporizador proactivo para renovar token antes de que expire (< 5 min)
 if (typeof window !== 'undefined') {
   setInterval(async () => {
     try {
       if (hasStoredRefreshToken() && isAccessTokenExpired(300)) {
-        console.log('[GoogleAuth Watchdog] Token próximo a expirar (< 5 min). Auto-renovando con Refresh Token...');
         await refreshGoogleAccessToken();
       }
     } catch {}
@@ -178,115 +170,178 @@ if (typeof window !== 'undefined') {
 }
 
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthSuccess?: (user: GoogleUser, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  // Sincronizar token existente
   const storedToken = getStoredSessionToken();
-  const storedRefreshToken = getStoredRefreshToken();
+  const email = typeof window !== 'undefined' ? window.localStorage.getItem(SESSION_EMAIL_KEY) || 'admin@camarca.com' : 'admin@camarca.com';
+  const displayName = typeof window !== 'undefined' ? window.localStorage.getItem(SESSION_NAME_KEY) || 'Administrador' : 'Administrador';
 
-  if (storedToken) {
-    if (isAccessTokenExpired(0)) {
-      if (storedRefreshToken) {
-        refreshGoogleAccessToken()
-          .then((newToken) => {
-            if (newToken && onAuthSuccess && cachedUser) {
-              onAuthSuccess(cachedUser, newToken);
-            }
-          })
-          .catch(() => {
-            clearSessionToken();
-          });
-      } else {
-        // Token expirado y sin refresh token: limpiar sesión obsoleta
-        clearSessionToken();
-        cachedAccessToken = null;
+  const defaultUser: GoogleUser = { email, displayName };
+
+  // Intentar refrescar o recuperar token sin desconectar
+  const tryRecoverToken = async () => {
+    // 1. Probar renovación con Refresh Token backend/PostgreSQL
+    try {
+      const refreshedToken = await refreshGoogleAccessToken();
+      if (refreshedToken) {
+        cachedAccessToken = refreshedToken;
+        cachedUser = defaultUser;
+        if (onAuthSuccess) onAuthSuccess(defaultUser, refreshedToken);
+        return;
       }
-    } else {
+    } catch {}
+
+    // 2. Probar consultar token activo del servidor
+    try {
+      const res = await fetch('/api/admin/google-drive/token', { cache: 'no-store' });
+      const data = await res.json();
+      if (data.success && data.accessToken && data.hasToken) {
+        cachedAccessToken = data.accessToken;
+        const u: GoogleUser = {
+          email: data.email || email,
+          displayName: data.displayName || displayName,
+        };
+        cachedUser = u;
+        saveSessionToken(data.accessToken, u.email || '', u.displayName || '');
+        if (onAuthSuccess) onAuthSuccess(u, data.accessToken);
+        return;
+      }
+    } catch {}
+
+    // Si aún no hay token nuevo pero tenemos token almacenado, preservarlo
+    if (storedToken) {
       cachedAccessToken = storedToken;
-      fetch('/api/admin/google-drive/set-token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          accessToken: storedToken,
-          refreshToken: storedRefreshToken || undefined,
-        }),
-      }).catch(() => {});
+      cachedUser = defaultUser;
+      if (onAuthSuccess) onAuthSuccess(defaultUser, storedToken);
+      return;
     }
+
+    if (onAuthFailure) onAuthFailure();
+  };
+
+  if (storedToken && !isAccessTokenExpired(0)) {
+    cachedAccessToken = storedToken;
+    cachedUser = defaultUser;
+    if (onAuthSuccess) onAuthSuccess(defaultUser, storedToken);
+  } else {
+    tryRecoverToken();
   }
 
-  return onAuthStateChanged(auth, async (user: User | null) => {
-    if (user) {
-      cachedUser = user;
-      let validToken: string | null = cachedAccessToken || getStoredSessionToken();
+  return () => {};
+};
 
-      // Si no hay token o expiró, intentar renovar con refresh token
-      if (!validToken || isAccessTokenExpired(0)) {
-        if (hasStoredRefreshToken()) {
-          validToken = await refreshGoogleAccessToken();
-        } else {
-          validToken = null;
-          clearSessionToken();
-          cachedAccessToken = null;
+
+/**
+ * Inicio de sesión con Google usando Google Identity Services (GIS)
+ * Prefiere el flujo de código offline para obtener y persistir el Refresh Token en PostgreSQL
+ */
+export const googleSignIn = async (): Promise<{ user: GoogleUser; accessToken: string } | null> => {
+  try {
+    const offlineRes = await connectGoogleOAuth2Offline();
+    if (offlineRes.success && offlineRes.accessToken) {
+      let userInfo: GoogleUser = { email: 'admin@camarca.com', displayName: 'Administrador CAMARCA' };
+      try {
+        const uRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${offlineRes.accessToken}` },
+        });
+        if (uRes.ok) {
+          const uJson = await uRes.json();
+          userInfo = {
+            email: uJson.email,
+            displayName: uJson.name,
+            photoURL: uJson.picture,
+            uid: uJson.sub,
+          };
         }
+      } catch {}
+
+      cachedUser = userInfo;
+      cachedAccessToken = offlineRes.accessToken;
+      return { user: userInfo, accessToken: offlineRes.accessToken };
+    }
+  } catch (offlineErr) {
+    console.warn('[GoogleAuth] Fallo en flujo offline, intentando fallback token client:', offlineErr);
+  }
+
+  return new Promise((resolve, reject) => {
+    try {
+      isSigningIn = true;
+      const googleObj = typeof window !== 'undefined' ? (window as any).google : null;
+
+      if (!googleObj?.accounts?.oauth2) {
+        // Fallback: Si no está cargado GIS, verificar si el servidor ya tiene token
+        fetch('/api/admin/google-drive/token', { cache: 'no-store' })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.success && data.accessToken && data.hasToken) {
+              const u: GoogleUser = { email: data.email || 'admin@camarca.com', displayName: data.displayName || 'Administrador' };
+              cachedAccessToken = data.accessToken;
+              cachedUser = u;
+              resolve({ user: u, accessToken: data.accessToken });
+            } else {
+              reject(new Error('Google Identity Services no está disponible en este momento.'));
+            }
+          })
+          .catch((err) => reject(err));
+        return;
       }
 
-      if (validToken && !isAccessTokenExpired(0)) {
-        cachedAccessToken = validToken;
-        if (onAuthSuccess) onAuthSuccess(user, validToken);
-      } else if (!isSigningIn) {
-        cachedAccessToken = null;
-        if (onAuthFailure) onAuthFailure();
-      }
-    } else {
-      cachedUser = null;
-      cachedAccessToken = null;
-      if (onAuthFailure) onAuthFailure();
+      resolveClientId().then((activeClientId) => {
+        const client = googleObj.accounts.oauth2.initTokenClient({
+          client_id: activeClientId,
+          scope: SCOPES.join(' '),
+          prompt: 'consent',
+          callback: async (response: any) => {
+            if (response.error) {
+              reject(new Error(response.error_description || response.error));
+              return;
+            }
+
+            if (response.access_token) {
+              const token = response.access_token;
+              cachedAccessToken = token;
+              const expiresIn = Number(response.expires_in) || 3600;
+
+              let userInfo: GoogleUser = { email: 'admin@camarca.com', displayName: 'Administrador CAMARCA' };
+              try {
+                const uRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                  headers: { Authorization: `Bearer ${token}` },
+                });
+                if (uRes.ok) {
+                  const uJson = await uRes.json();
+                  userInfo = {
+                    email: uJson.email,
+                    displayName: uJson.name,
+                    photoURL: uJson.picture,
+                    uid: uJson.sub,
+                  };
+                }
+              } catch {}
+
+              cachedUser = userInfo;
+              saveSessionToken(token, userInfo.email || '', userInfo.displayName || '', expiresIn);
+
+              resolve({ user: userInfo, accessToken: token });
+            } else {
+              reject(new Error('No se recibió token de acceso de Google.'));
+            }
+          },
+        });
+
+        client.requestAccessToken();
+      }).catch((e) => reject(e));
+    } catch (err) {
+      reject(err);
+    } finally {
+      isSigningIn = false;
     }
   });
 };
 
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('No se pudo obtener el token de acceso de Google Drive');
-    }
-
-    cachedAccessToken = credential.accessToken;
-    cachedUser = result.user;
-    
-    // Guardar token de acceso y vigencia estimada (3600 segundos estándar)
-    saveSessionToken(cachedAccessToken, result.user.email || '', result.user.displayName || '', 3600);
-
-    // Si ya existe un refresh token encriptado guardado, asociarlo de inmediato en el servidor
-    const existingRefreshToken = getStoredRefreshToken();
-    fetch('/api/admin/google-drive/set-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        accessToken: credential.accessToken,
-        refreshToken: existingRefreshToken || undefined,
-        expiresIn: 3600,
-        email: result.user.email || '',
-        displayName: result.user.displayName || '',
-      }),
-    }).catch(() => {});
-
-    return { user: result.user, accessToken: cachedAccessToken };
-  } catch (error: any) {
-    console.error('Error al iniciar sesión con Google:', error);
-    throw error;
-  } finally {
-    isSigningIn = false;
-  }
-};
-
 /**
  * Flujo de autorización OAuth2 Offline con Google Identity Services (GIS)
- * Permite obtener directamente el código de autorización para recibir el Refresh Token permanente
+ * Permite obtener el Refresh Token permanente mediante intercambio de código
  */
 export const connectGoogleOAuth2Offline = async (): Promise<{
   success: boolean;
@@ -296,9 +351,8 @@ export const connectGoogleOAuth2Offline = async (): Promise<{
 }> => {
   return new Promise((resolve) => {
     try {
-      const googleObj = (window as any).google;
+      const googleObj = typeof window !== 'undefined' ? (window as any).google : null;
       if (!googleObj?.accounts?.oauth2) {
-        // Si no está cargado el script GIS, intentar con Firebase popup directo
         googleSignIn()
           .then((res) => {
             if (res) {
@@ -315,143 +369,181 @@ export const connectGoogleOAuth2Offline = async (): Promise<{
         return;
       }
 
-      const client = googleObj.accounts.oauth2.initCodeClient({
-        client_id: (firebaseConfig as any).oAuthClientId || '1094702324887-rp4lbvga43esdfrgjvp00huuf2tihoit.apps.googleusercontent.com',
-        scope: SCOPES.join(' '),
-        ux_mode: 'popup',
-        select_account: true,
-        access_type: 'offline', // Clave para obtener el Refresh Token permanente
-        prompt: 'consent', // Forzar pantalla de consentimiento para emitir refresh_token
-        callback: async (response: any) => {
-          if (response.error) {
-            console.error('Error en popup OAuth2 GIS:', response.error);
-            resolve({ success: false, hasRefreshToken: false, error: response.error });
+      fetch('/api/admin/google-drive/token')
+        .then((res) => res.json())
+        .then((data) => {
+          const activeClientId = (data?.googleOAuthClientId && data.googleOAuthClientId.trim()) || GOOGLE_CLIENT_ID;
+          const hasClientSecret = Boolean(data?.googleOAuthClientSecret && data.googleOAuthClientSecret.trim());
+
+          if (!hasClientSecret && activeClientId === GOOGLE_CLIENT_ID) {
+            console.log('[GoogleAuth] Fallback: No se detectó googleOAuthClientSecret propio. Usando initTokenClient de Google.');
+            // Fallback a initTokenClient para obtener el access token directamente en el cliente
+            const client = googleObj.accounts.oauth2.initTokenClient({
+              client_id: activeClientId,
+              scope: SCOPES.join(' '),
+              prompt: 'consent',
+              callback: async (response: any) => {
+                if (response.error) {
+                  resolve({ success: false, hasRefreshToken: false, error: response.error_description || response.error });
+                  return;
+                }
+
+                if (response.access_token) {
+                  const token = response.access_token;
+                  cachedAccessToken = token;
+                  const expiresIn = Number(response.expires_in) || 3600;
+
+                  let userInfo: GoogleUser = { email: 'admin@camarca.com', displayName: 'Administrador CAMARCA' };
+                  try {
+                    const uRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                      headers: { Authorization: `Bearer ${token}` },
+                    });
+                    if (uRes.ok) {
+                      const uJson = await uRes.json();
+                      userInfo = {
+                        email: uJson.email,
+                        displayName: uJson.name,
+                        photoURL: uJson.picture,
+                        uid: uJson.sub,
+                      };
+                    }
+                  } catch {}
+
+                  cachedUser = userInfo;
+                  saveSessionToken(token, userInfo.email || '', userInfo.displayName || '', expiresIn);
+
+                  resolve({
+                    success: true,
+                    accessToken: token,
+                    hasRefreshToken: false,
+                  });
+                } else {
+                  resolve({ success: false, hasRefreshToken: false, error: 'No se recibió token de acceso de Google.' });
+                }
+              },
+            });
+
+            client.requestAccessToken();
             return;
           }
 
-          if (response.code) {
-            try {
-              // Intercambiar código por Access Token y Refresh Token en el servidor
-              const exchangeRes = await fetch('/api/admin/google-drive/oauth2/code-exchange', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  code: response.code,
-                  redirectUri: 'postmessage',
-                }),
-              });
-
-              const exchangeData = await exchangeRes.json();
-              if (exchangeRes.ok && exchangeData.success && exchangeData.accessToken) {
-                cachedAccessToken = exchangeData.accessToken;
-                const expiresIn = exchangeData.expiresIn || 3600;
-
-                // Almacenar el Refresh Token de forma encriptada en localStorage
-                if (exchangeData.refreshToken) {
-                  saveEncryptedRefreshToken(exchangeData.refreshToken);
-                }
-
-                saveSessionToken(exchangeData.accessToken, undefined, undefined, expiresIn);
-
-                if (typeof window !== 'undefined') {
-                  window.dispatchEvent(
-                    new CustomEvent('googleDriveTokenRefreshed', {
-                      detail: { accessToken: exchangeData.accessToken, expiresIn },
-                    })
-                  );
-                }
-
-                resolve({
-                  success: true,
-                  accessToken: exchangeData.accessToken,
-                  hasRefreshToken: Boolean(exchangeData.refreshToken || hasStoredRefreshToken()),
-                });
-              } else {
-                resolve({
-                  success: false,
-                  hasRefreshToken: false,
-                  error: exchangeData.error || 'Fallo en el intercambio de código OAuth2',
-                });
+          // Si hay un client secret configurado o un Client ID propio, procedemos con el flujo offline seguro
+          const client = googleObj.accounts.oauth2.initCodeClient({
+            client_id: activeClientId,
+            scope: SCOPES.join(' '),
+            ux_mode: 'popup',
+            select_account: true,
+            access_type: 'offline',
+            prompt: 'consent',
+            callback: async (response: any) => {
+              if (response.error) {
+                resolve({ success: false, hasRefreshToken: false, error: response.error });
+                return;
               }
-            } catch (err: any) {
-              resolve({ success: false, hasRefreshToken: false, error: err.message });
-            }
-          } else {
-            resolve({ success: false, hasRefreshToken: false, error: 'No se recibió código de autorización de Google.' });
-          }
-        },
-      });
 
-      client.requestCode();
+              if (response.code) {
+                try {
+                  const exchangeRes = await fetch('/api/admin/google-drive/oauth2/code-exchange', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      code: response.code,
+                      redirectUri: 'postmessage',
+                    }),
+                  });
+
+                  const exchangeData = await exchangeRes.json();
+                  if (exchangeRes.ok && exchangeData.success && exchangeData.accessToken) {
+                    cachedAccessToken = exchangeData.accessToken;
+                    const expiresIn = exchangeData.expiresIn || 3600;
+
+                    // El Refresh Token queda protegido en PostgreSQL, nunca en el navegador
+                    clearEncryptedRefreshToken();
+
+                    saveSessionToken(exchangeData.accessToken, undefined, undefined, expiresIn);
+
+                    if (typeof window !== 'undefined') {
+                      window.dispatchEvent(
+                        new CustomEvent('googleDriveTokenRefreshed', {
+                          detail: { accessToken: exchangeData.accessToken, expiresIn },
+                        })
+                      );
+                    }
+
+                    resolve({
+                      success: true,
+                      accessToken: exchangeData.accessToken,
+                      hasRefreshToken: Boolean(exchangeData.hasRefreshToken),
+                    });
+                  } else {
+                    resolve({
+                      success: false,
+                      hasRefreshToken: false,
+                      error: exchangeData.error || 'Fallo en el intercambio de código OAuth2',
+                    });
+                  }
+                } catch (err: any) {
+                  resolve({ success: false, hasRefreshToken: false, error: err.message });
+                }
+              } else {
+                resolve({ success: false, hasRefreshToken: false, error: 'No se recibió código de autorización de Google.' });
+              }
+            },
+          });
+
+          client.requestCode();
+        })
+        .catch((e) => resolve({ success: false, hasRefreshToken: false, error: e.message }));
     } catch (err: any) {
       resolve({ success: false, hasRefreshToken: false, error: err.message });
     }
   });
 };
 
-/**
- * Guarda manualmente un Refresh Token (por ejemplo de consola GCP o credencial de servicio)
- * encriptándolo de forma segura en localStorage y sincronizándolo al servidor.
- */
 export const saveManualRefreshToken = async (rawToken: string): Promise<boolean> => {
   if (!rawToken || rawToken.trim().length < 5) return false;
   try {
     const cleanToken = rawToken.trim();
-    saveEncryptedRefreshToken(cleanToken);
-
-    // Intentar renovar el access token inmediatamente para validar que el refresh token sea funcional
-    const newAccessToken = await refreshGoogleAccessToken();
-    return Boolean(newAccessToken);
+    // Guardar Refresh Token exclusivamente en PostgreSQL en el backend
+    const res = await fetch('/api/admin/google-drive/set-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: cleanToken }),
+    });
+    if (res.ok) {
+      const newAccessToken = await refreshGoogleAccessToken();
+      return Boolean(newAccessToken);
+    }
+    return false;
   } catch (err) {
-    console.error('Error guardando refresh token manual:', err);
+    console.error('Error guardando refresh token manual en PostgreSQL:', err);
     return false;
   }
 };
 
 export const getAccessToken = async (forceRefresh: boolean = false): Promise<string | null> => {
-  // 1. Si no se fuerza y el token en memoria sigue vigente (> 1 minuto restante), usarlo
   if (!forceRefresh && cachedAccessToken && !isAccessTokenExpired(60)) {
     return cachedAccessToken;
   }
 
-  // 2. Si ha expirado o se fuerza refresco, intentar renovar con refresh token
-  const hasRt = hasStoredRefreshToken();
-  if (forceRefresh || hasRt || isAccessTokenExpired(0)) {
-    if (hasRt) {
-      const refreshed = await refreshGoogleAccessToken();
-      if (refreshed && !isAccessTokenExpired(0)) {
-        return refreshed;
-      }
-    }
+  // Renovar a través del servidor backend con el Refresh Token de PostgreSQL
+  const refreshed = await refreshGoogleAccessToken();
+  if (refreshed && !isAccessTokenExpired(0)) {
+    return refreshed;
   }
 
-  // 3. Verificar token almacenado en localStorage SOLO si sigue vigente
-  const stored = getStoredSessionToken();
-  if (stored && !isAccessTokenExpired(0)) {
-    cachedAccessToken = stored;
-    return stored;
-  }
-
-  // Si el token almacenado expiró y no se pudo renovar, limpiar la sesión
-  if (stored && isAccessTokenExpired(0) && !hasRt) {
-    clearSessionToken();
-    cachedAccessToken = null;
-  }
-
-  // 4. Fallback: Consultar al servidor backend
+  // Fallback a consultar token activo desde servidor
   try {
     const res = await fetch('/api/admin/google-drive/token', { cache: 'no-store' });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.success && data.accessToken && data.hasToken) {
-        cachedAccessToken = data.accessToken;
-        saveSessionToken(data.accessToken);
-        return data.accessToken;
-      }
+    const data = await res.json();
+    if (data.success && data.accessToken && data.hasToken) {
+      cachedAccessToken = data.accessToken;
+      saveSessionToken(data.accessToken, data.email, data.displayName);
+      return data.accessToken;
     }
   } catch {}
 
-  return null;
+  return cachedAccessToken;
 };
 
 export const setCachedAccessToken = (token: string | null) => {
@@ -459,8 +551,8 @@ export const setCachedAccessToken = (token: string | null) => {
   saveSessionToken(token);
 };
 
-export const getCachedUser = (): User | null => {
-  return cachedUser || auth.currentUser;
+export const getCachedUser = (): GoogleUser | null => {
+  return cachedUser;
 };
 
 export const clearSessionToken = () => {
@@ -482,12 +574,7 @@ export const clearSessionToken = () => {
 };
 
 export const logoutGoogle = async () => {
-  try {
-    await signOut(auth);
-  } catch {}
   clearSessionToken();
-
-  // Limpiar servidor
   try {
     await fetch('/api/admin/google-drive/set-token', {
       method: 'POST',

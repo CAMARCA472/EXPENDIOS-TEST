@@ -59,6 +59,12 @@ export const CameraGpsCaptureModal: React.FC<CameraGpsCaptureModalProps> = ({
   // Stamped preview state
   const [stampedDataUrl, setStampedDataUrl] = useState<string | null>(null);
   const [stampedFile, setStampedFile] = useState<File | null>(null);
+  const [compressionInfo, setCompressionInfo] = useState<{
+    originalSizeFormatted: string;
+    compressedSizeFormatted: string;
+    speedFactor: number;
+    compressionSummary: string;
+  } | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -101,6 +107,12 @@ export const CameraGpsCaptureModal: React.FC<CameraGpsCaptureModalProps> = ({
 
       setStampedDataUrl(stamped.dataUrl);
       setStampedFile(stamped.file);
+      setCompressionInfo({
+        originalSizeFormatted: stamped.originalSizeFormatted,
+        compressedSizeFormatted: stamped.compressedSizeFormatted,
+        speedFactor: stamped.speedFactor,
+        compressionSummary: stamped.compressionSummary,
+      });
     } catch (err: any) {
       console.error('Error al estampar fotografía:', err);
       setErrorMessage(err.message || 'Error procesando la imagen. Intenta nuevamente.');
@@ -124,6 +136,7 @@ export const CameraGpsCaptureModal: React.FC<CameraGpsCaptureModalProps> = ({
       setErrorMessage('');
       setStampedDataUrl(null);
       setStampedFile(null);
+      setCompressionInfo(null);
       fetchGpsSilently();
 
       if (initialFile) {
@@ -220,10 +233,10 @@ export const CameraGpsCaptureModal: React.FC<CameraGpsCaptureModalProps> = ({
               <RefreshCw className="w-8 h-8 text-amber-400 animate-spin" />
               <div className="space-y-1">
                 <p className="text-sm font-bold text-slate-100">
-                  Estampando fotografía con datos oficiales...
+                  Comprimiendo (~400 KB) y estampando fotografía en tu celular...
                 </p>
                 <p className="text-xs text-slate-400">
-                  Aplicando marca de agua, fecha, expendio y coordenadas satelitales
+                  Optimizando peso para internet lento (2G/3G) en alta nitidez y agregando marca de agua oficial
                 </p>
               </div>
             </div>
@@ -241,8 +254,28 @@ export const CameraGpsCaptureModal: React.FC<CameraGpsCaptureModalProps> = ({
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                     <span>Marca de Agua Oficial Lista</span>
                   </div>
+                  {compressionInfo && (
+                    <div className="absolute top-2 right-2 bg-sky-950/90 text-sky-300 border border-sky-600/80 px-2.5 py-1 rounded-lg text-[10px] font-black backdrop-blur">
+                      ⚡ {compressionInfo.compressedSizeFormatted} (2G/3G)
+                    </div>
+                  )}
                 </div>
               </div>
+
+              {/* Compression feedback card for weak signal municipalities */}
+              {compressionInfo && (
+                <div className="bg-emerald-950/50 border border-emerald-500/40 rounded-xl p-2.5 text-[11px] text-emerald-200 flex items-start space-x-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-black text-emerald-300">
+                      ⚡ Compresión Automática en Celular (Modo Señal 2G/3G):
+                    </p>
+                    <p className="text-[10.5px] text-emerald-100 mt-0.5">
+                      {compressionInfo.compressionSummary}
+                    </p>
+                  </div>
+                </div>
+              )}
 
               {/* Stamped details summary */}
               <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 text-[11px] space-y-1">

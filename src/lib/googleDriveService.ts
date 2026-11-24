@@ -153,7 +153,7 @@ export async function executeGoogleDriveBackup(
     tipoRespaldo: origen === 'Automatico_10m' ? 'Copia Automática Programada (Cada 10 minutos)' : 'Copia de Seguridad Manual',
     timestamp: now.toISOString(),
     fechaHoraColombia: now.toLocaleString('es-CO', { timeZone: 'America/Bogota' }),
-    version: '3.0 (Firebase)',
+    version: '4.0 (PostgreSQL)',
     resumen: {
       totalExpendios: exportData.expendios.length,
       totalHistorial: exportData.historial.length,
@@ -487,51 +487,73 @@ export function getTipoFotoEtiqueta(slotKey: string): string {
 }
 
 /**
- * Traduce el tipo de foto a su nombre canónico de ítem: foto_aviso, foto_panoramica, foto_tarifas, etc.
+ * Traduce el tipo de foto a su nombre legible con prefijo Foto_ (ej: Foto_Aviso, Foto_Bascula, Foto_Matasello)
  */
 export function getPhotoItemSlug(slotKey: string): string {
   const key = (slotKey || '').toLowerCase();
-  if (key.includes('tarifa')) return 'foto_tarifas';
-  if (key.includes('aviso') || key.includes('letrero')) return 'foto_aviso';
-  if (key.includes('panoramica') || key.includes('fachada')) return 'foto_panoramica';
-  if (key.includes('matasello')) return 'foto_matasello';
-  if (key.includes('bascula')) return 'foto_bascula';
-  if (key.includes('contratista') || key.includes('encargado') || key.includes('persona')) return 'foto_contratista';
-  if (key.includes('horario')) return 'foto_horario';
-  if (key.includes('computador') || key.includes('pc')) return 'foto_computador';
-  if (key.includes('cedulafrontal') || key.includes('cedula_frontal')) return 'foto_cedula_frontal';
-  if (key.includes('cedulaposterior') || key.includes('cedula_posterior')) return 'foto_cedula_posterior';
-  if (key.includes('rut')) return 'foto_rut';
-  return 'foto_punto';
+  if (key.includes('tarifa')) return 'Foto_Tarifas';
+  if (key.includes('aviso') || key.includes('letrero')) return 'Foto_Aviso';
+  if (key.includes('panoramica') || key.includes('fachada')) return 'Foto_Panoramica';
+  if (key.includes('matasello')) return 'Foto_Matasello';
+  if (key.includes('bascula')) return 'Foto_Bascula';
+  if (key.includes('contratista') || key.includes('encargado') || key.includes('persona')) return 'Foto_Contratista';
+  if (key.includes('horario')) return 'Foto_Horario';
+  if (key.includes('computador') || key.includes('pc')) return 'Foto_Computador';
+  if (key.includes('cedulafrontal') || key.includes('cedula_frontal')) return 'Foto_Cedula_Frontal';
+  if (key.includes('cedulaposterior') || key.includes('cedula_posterior')) return 'Foto_Cedula_Posterior';
+  if (key.includes('rut')) return 'Foto_RUT';
+  return 'Foto_Punto';
 }
 
 /**
- * Genera el nombre dinámico exacto de la foto utilizando el patrón:
- * item_municipio_fecha.jpg (ej: foto_aviso_giron_2026-09-07.jpg, foto_bascula_giron_2026-09-07.jpg)
+ * Formatea una fecha a DDMMAAAA (ej: 23102026)
+ */
+export function formatFechaDDMMAAAA(rawFecha?: string | Date): string {
+  let d: Date | null = null;
+  if (rawFecha instanceof Date && !isNaN(rawFecha.getTime())) {
+    d = rawFecha;
+  } else if (typeof rawFecha === 'string' && rawFecha.trim()) {
+    const clean = rawFecha.trim();
+    // Si ya viene como DDMMAAAA (8 dígitos)
+    if (/^\d{8}$/.test(clean)) {
+      return clean;
+    }
+    // Si viene como YYYY-MM-DD o ISO
+    const isoMatch = clean.match(/^(\d{4})[-/.](\d{2})[-/.](\d{2})/);
+    if (isoMatch) {
+      return `${isoMatch[3]}${isoMatch[2]}${isoMatch[1]}`;
+    }
+    // Si viene como DD/MM/YYYY o DD-MM-YYYY
+    const dmyMatch = clean.match(/^(\d{2})[-/.](\d{2})[-/.](\d{4})/);
+    if (dmyMatch) {
+      return `${dmyMatch[1]}${dmyMatch[2]}${dmyMatch[3]}`;
+    }
+    const parsed = new Date(clean);
+    if (!isNaN(parsed.getTime())) {
+      d = parsed;
+    }
+  }
+  if (!d) {
+    d = new Date();
+  }
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const year = String(d.getFullYear());
+  return `${day}${month}${year}`;
+}
+
+/**
+ * Genera el nombre dinámico exacto de la foto utilizando el patrón programado:
+ * NombreMunicipio_TipoDeFoto_FechaDDMMAAAA.jpg (ej: Giron_Foto_Aviso_23102026.jpg)
  */
 export function getDrivePhotoFileName(slotKey: string, rawMunicipio?: string, rawFecha?: string | Date): string {
   const itemSlug = getPhotoItemSlug(slotKey);
-  const cleanMuni = (rawMunicipio || 'giron')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
+  const muniClean = formatMunicipioNombre(rawMunicipio || 'Giron')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9_]/g, '');
+  const fechaDDMMAAAA = formatFechaDDMMAAAA(rawFecha);
 
-  let fechaStr = '';
-  if (rawFecha instanceof Date) {
-    fechaStr = rawFecha.toISOString().split('T')[0];
-  } else if (typeof rawFecha === 'string' && rawFecha.trim()) {
-    const cleanDate = rawFecha.trim().split('T')[0].replace(/[/.]/g, '-').replace(/[^0-9-]/g, '');
-    fechaStr = cleanDate;
-  }
-  if (!fechaStr) {
-    fechaStr = new Date().toISOString().split('T')[0];
-  }
-
-  return `${itemSlug}_${cleanMuni || 'municipio'}_${fechaStr}.jpg`;
+  return `${muniClean || 'Municipio'}_${itemSlug}_${fechaDDMMAAAA}.jpg`;
 }
 
 /**
@@ -618,9 +640,50 @@ export async function getOrCreateMunicipioFolder(
 }
 
 /**
+ * Extrae la clave canónica del slot a partir de cualquier variación del nombre del archivo en Google Drive
+ * Ejemplos: "Cravo_norte_Foto_Tarifas_27102026.jpg", "Giron_Foto_Aviso_28102026.jpg"
+ */
+export function getSlotKeyFromFileName(fileName: string): string | null {
+  const clean = (fileName || '').toLowerCase();
+  if (clean.includes('tarifa')) return 'fotoTarifasUrl';
+  if (clean.includes('aviso') || clean.includes('letrero')) return 'fotoAvisoUrl';
+  if (clean.includes('panoramica') || clean.includes('fachada')) return 'fotoPanoramicaUrl';
+  if (clean.includes('matasello')) return 'fotoMataselloUrl';
+  if (clean.includes('bascula') || clean.includes('pesa')) return 'fotoBasculaUrl';
+  if (clean.includes('contratista') || clean.includes('encargado') || clean.includes('persona')) return 'fotoContratistaUrl';
+  if (clean.includes('horario')) return 'fotoHorarioUrl';
+  if (clean.includes('computador') || clean.includes('pc')) return 'computadorUrl';
+  if (clean.includes('cedulafrontal') || clean.includes('cedula_frontal')) return 'fotoCedulaFrontalUrl';
+  if (clean.includes('cedulaposterior') || clean.includes('cedula_posterior')) return 'fotoCedulaPosteriorUrl';
+  if (clean.includes('rut')) return 'fotoRutUrl';
+  return null;
+}
+
+/**
+ * Normaliza cualquier clave de slot a su nombre canónico en ExpendioData (ej: fotoAvisoUrl)
+ */
+export function normalizeCanonicalSlotKey(rawSlot: string): string {
+  const s = (rawSlot || '').toLowerCase().trim();
+  if (s.includes('aviso') || s.includes('letrero')) return 'fotoAvisoUrl';
+  if (s.includes('panoramica') || s.includes('fachada')) return 'fotoPanoramicaUrl';
+  if (s.includes('matasello')) return 'fotoMataselloUrl';
+  if (s.includes('bascula')) return 'fotoBasculaUrl';
+  if (s.includes('contratista') || s.includes('encargado') || s.includes('propietario')) return 'fotoContratistaUrl';
+  if (s.includes('horario')) return 'fotoHorarioUrl';
+  if (s.includes('tarifa')) return 'fotoTarifasUrl';
+  if (s.includes('computador') || s.includes('pc')) return 'computadorUrl';
+  return rawSlot;
+}
+
+/**
  * Sube una fotografía individual a la subcarpeta del municipio correspondiente en Google Drive.
  * Estructura resultante:
- * Fotos Expendios 4-72 - CAMARCA SAS\{Municipio}\Foto_{Tipo}_{municipio}_{cedula}_{fecha}.jpg
+ * Fotos Expendios 4-72 - CAMARCA SAS\{Municipio}\{NombreMunicipio}_{TipoDeFoto}_{FechaDDMMAAAA}.jpg
+ * 
+ * Reglas estrictas:
+ * 1. Si la foto ya está guardada e idéntica (mismo tamaño), NO se vuelve a subir ("no se carguen las mismas fotos").
+ * 2. Si existen versiones duplicadas anteriores de este mismo slot (ej: de días previos), se eliminan automáticamente
+ *    para que queden EXACTAMENTE las 7 fotos por municipio.
  */
 export async function uploadPhotoToGoogleDrive(
   accessToken: string,
@@ -635,19 +698,19 @@ export async function uploadPhotoToGoogleDrive(
     fecha?: string | Date;
   }
 ): Promise<DrivePhotoUploadResult> {
-  const { cedula, slotKey, fileOrBlob, dataUrl, expendioNombre, municipio, fecha } = params;
+  const { cedula, fileOrBlob, dataUrl, expendioNombre, municipio, fecha } = params;
+  const canonicalSlotKey = normalizeCanonicalSlotKey(params.slotKey);
 
   // 1. Obtener la carpeta raíz "Fotos Expendios 4-72 - CAMARCA SAS"
   const rootFolder = await getOrCreatePhotosFolder(accessToken);
 
-  // 2. Forzar obligatoriamente la subcarpeta específica para el municipio (ej: Giron, Pamplona)
+  // 2. Forzar obligatoriamente la subcarpeta específica para el municipio (ej: Giron, Pamplona, Herran, Cravo norte)
   const municipioFolder = await getOrCreateMunicipioFolder(accessToken, rootFolder.id, municipio);
   const targetFolderId = municipioFolder.id;
 
-  // 3. Generar el nombre dinámico exacto solicitado: item_municipio_fecha.jpg
-  // Ej: foto_aviso_giron_2026-09-07.jpg
-  const fileName = getDrivePhotoFileName(slotKey, municipio, fecha);
-  const tipoLabel = getTipoFotoEtiqueta(slotKey);
+  // 3. Generar el nombre dinámico exacto solicitado: NombreMunicipio_TipoDeFoto_FechaDDMMAAAA.jpg
+  const fileName = getDrivePhotoFileName(canonicalSlotKey, municipio, fecha);
+  const tipoLabel = getTipoFotoEtiqueta(canonicalSlotKey);
   const muniFormatted = formatMunicipioNombre(municipio);
 
   let blob: Blob;
@@ -665,28 +728,77 @@ export async function uploadPhotoToGoogleDrive(
     throw new Error('Debe proporcionar el archivo o dataUrl de la fotografía');
   }
 
-  // 4. Verificar si ya existe un archivo con ese nombre en la subcarpeta del municipio
-  const checkQuery = `'${targetFolderId}' in parents and name='${fileName}' and trashed=false`;
-  const checkUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(checkQuery)}&fields=files(id,name,webViewLink,webContentLink)`;
-  
-  let existingFileId: string | null = null;
+  // 4. Listar TODOS los archivos existentes en la subcarpeta del municipio
+  let existingFiles: Array<{ id: string; name: string; size?: string; modifiedTime?: string; webViewLink?: string; webContentLink?: string }> = [];
   try {
-    const checkRes = await fetch(checkUrl, {
+    const listUrl = `https://www.googleapis.com/drive/v3/files?q='${targetFolderId}'+in+parents+and+trashed=false&fields=files(id,name,size,modifiedTime,webViewLink,webContentLink)&pageSize=100`;
+    const listRes = await fetch(listUrl, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (checkRes.ok) {
-      const checkData = await checkRes.json();
-      if (checkData.files && checkData.files.length > 0) {
-        existingFileId = checkData.files[0].id;
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      if (Array.isArray(listData.files)) {
+        existingFiles = listData.files;
       }
     }
-  } catch {}
+  } catch (err) {
+    console.warn('[GoogleDrive] Error listando archivos en carpeta de municipio:', err);
+  }
+
+  // Filtrar archivos que corresponden a este mismo slot
+  const matchingFiles = existingFiles.filter((f) => {
+    const fileSlot = getSlotKeyFromFileName(f.name);
+    return fileSlot === canonicalSlotKey;
+  });
+
+  // Ordenar los existentes por fecha de modificación descendente (el más nuevo primero)
+  matchingFiles.sort((a, b) => {
+    const timeA = a.modifiedTime ? new Date(a.modifiedTime).getTime() : 0;
+    const timeB = b.modifiedTime ? new Date(b.modifiedTime).getTime() : 0;
+    return timeB - timeA;
+  });
+
+  const newestExisting = matchingFiles[0];
+
+  // Si hay más de un archivo para este mismo slot (DUPLICADOS de fechas anteriores como _27102026 y _28102026):
+  // Eliminar inmediatamente los duplicados más antiguos para que quede SOLO 1 por slot (7 por municipio)
+  if (matchingFiles.length > 1) {
+    const olderDuplicates = matchingFiles.slice(1);
+    for (const dup of olderDuplicates) {
+      try {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${dup.id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        console.log(`[GoogleDrive] Duplicado previo eliminado en ${muniFormatted}: ${dup.name} (${dup.id})`);
+      } catch (delErr) {
+        console.warn(`[GoogleDrive] Error eliminando duplicado ${dup.name}:`, delErr);
+      }
+    }
+  }
+
+  // REGLA DEL USUARIO: "no se carguen las mismas fotos que ya estar guardadas"
+  // Si ya existe y el tamaño en bytes es idéntico al que se iba a subir: OMITIR CARGA!
+  const isIdentical = newestExisting && newestExisting.size && Math.abs(Number(newestExisting.size) - blob.size) === 0;
+
+  if (isIdentical && newestExisting) {
+    console.log(`[GoogleDrive] ✓ Foto de ${tipoLabel} en ${muniFormatted} ya está guardada e idéntica. Se omite carga.`);
+    return {
+      id: newestExisting.id,
+      name: newestExisting.name,
+      webViewLink: newestExisting.webViewLink || '',
+      webContentLink: newestExisting.webContentLink || '',
+      cedula,
+      slotKey: canonicalSlotKey,
+      folderName: municipioFolder.name,
+    };
+  }
 
   const description = `Fotografía de ${tipoLabel} del expendio en ${muniFormatted} (Cédula: ${cedula}, Encargado: ${expendioNombre || ''}) - CAMARCA SAS`;
 
-  if (existingFileId) {
-    // Actualizar contenido del archivo existente (PATCH media)
-    const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=media&fields=id,name,webViewLink,webContentLink`;
+  if (newestExisting) {
+    // Actualizar contenido del archivo existente (PATCH media) y asegurar nombre nuevo DDMMAAAA
+    const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${newestExisting.id}?uploadType=media&fields=id,name,webViewLink,webContentLink`;
     const updateRes = await fetch(updateUrl, {
       method: 'PATCH',
       headers: {
@@ -702,13 +814,43 @@ export async function uploadPhotoToGoogleDrive(
     }
 
     const updatedData = await updateRes.json();
+
+    // Actualizar metadatos de nombre a formato NombreMunicipio_TipoDeFoto_DDMMAAAA.jpg
+    try {
+      await fetch(`https://www.googleapis.com/drive/v3/files/${newestExisting.id}`, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name: fileName, description }),
+      });
+    } catch {}
+
+    // Registrar en el backend local con el slotKey canónico
+    try {
+      await fetch('/api/admin/google-drive/register-photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cedula,
+          slotKey: canonicalSlotKey,
+          driveFileId: updatedData.id,
+          webViewLink: updatedData.webViewLink,
+          webContentLink: updatedData.webContentLink,
+          fileName,
+          municipio: muniFormatted,
+        }),
+      });
+    } catch {}
+
     return {
       id: updatedData.id,
       name: fileName,
       webViewLink: updatedData.webViewLink,
       webContentLink: updatedData.webContentLink,
       cedula,
-      slotKey,
+      slotKey: canonicalSlotKey,
       folderName: municipioFolder.name,
     };
   }
@@ -765,14 +907,14 @@ export async function uploadPhotoToGoogleDrive(
 
   const uploadedData = await uploadRes.json();
 
-  // Registrar en el backend local
+  // Registrar en el backend local con el slotKey canónico
   try {
     await fetch('/api/admin/google-drive/register-photo', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         cedula,
-        slotKey,
+        slotKey: canonicalSlotKey,
         driveFileId: uploadedData.id,
         webViewLink: uploadedData.webViewLink,
         webContentLink: uploadedData.webContentLink,
@@ -788,136 +930,205 @@ export async function uploadPhotoToGoogleDrive(
     webViewLink: uploadedData.webViewLink,
     webContentLink: uploadedData.webContentLink,
     cedula,
-    slotKey,
+    slotKey: canonicalSlotKey,
     folderName: municipioFolder.name,
   };
 }
 
 /**
- * Sincroniza todas las fotos del catálogo del sistema hacia la carpeta de Google Drive.
+ * Recarga y restaura todas las fotografías desde las carpetas por municipio de Google Drive
+ * hacia el servidor y los expendios de la plataforma.
  */
 export async function restorePhotosFromGoogleDrive(
   accessToken: string,
   onProgress?: (current: number, total: number, photoName: string) => void
 ): Promise<{ restoredCount: number; errors: number }> {
   try {
+    // 1. Primero ejecutar reconciliación y escaneo en el servidor si hay token
+    try {
+      await fetch('/api/admin/google-drive/reconcile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken }),
+      });
+    } catch {}
+
     const folder = await getOrCreatePhotosFolder(accessToken);
     let restoredCount = 0;
     let errors = 0;
 
-    // Search for all folders inside the main folder
+    // Buscar todas las subcarpetas de municipios dentro de la carpeta raíz
     const query = `'${folder.id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-    const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)`;
-    
+    const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)&pageSize=100`;
+
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` }
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
     const data = await res.json();
     const subfolders = data.files || [];
 
-    // Dynamically import the upload method to prevent circular issues if any
-    const { uploadExpendioPhoto, db } = await import('./firebase');
-    const { collection, getDocs, updateDoc, doc } = await import('firebase/firestore');
-    
-    // Fetch all expendios to map them correctly
-    const expendiosSnap = await getDocs(collection(db, 'expendios'));
-    const expendiosList = expendiosSnap.docs.map(d => ({ docId: d.id, ...d.data() }));
+    // Consultar todos los expendios desde el backend autoritativo
+    const expRes = await fetch('/api/expendios');
+    const expJson = await expRes.json();
+    const expendiosList = expJson.data || [];
 
-    let totalPhotos = 0;
-    const allFiles: { folderName: string; fileId: string; fileName: string; description?: string }[] = [];
+    const normalizeDigits = (val?: string) => String(val || '').replace(/\D/g, '').trim();
+    const normalizeText = (val?: string) =>
+      String(val || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
 
-    // Get all files from all subfolders
+    const allFiles: {
+      folderName: string;
+      fileId: string;
+      fileName: string;
+      description?: string;
+      webViewLink?: string;
+      webContentLink?: string;
+    }[] = [];
+
+    // Obtener también archivos sueltos en la carpeta raíz por si alguno quedó allí
+    const rootFilesQuery = `'${folder.id}' in parents and mimeType contains 'image/' and trashed = false`;
+    const rootFilesRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(rootFilesQuery)}&fields=files(id,name,description,webViewLink,webContentLink)&pageSize=200`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (rootFilesRes.ok) {
+      const rootFilesData = await rootFilesRes.json();
+      for (const rf of rootFilesData.files || []) {
+        allFiles.push({
+          folderName: 'Root',
+          fileId: rf.id,
+          fileName: rf.name,
+          description: rf.description,
+          webViewLink: rf.webViewLink,
+          webContentLink: rf.webContentLink,
+        });
+      }
+    }
+
+    // Obtener archivos de cada subcarpeta de Municipio
     for (const sub of subfolders) {
       const q = `'${sub.id}' in parents and mimeType contains 'image/' and trashed = false`;
-      const sUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,description)`;
+      const sUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,description,webViewLink,webContentLink)&pageSize=200`;
       const sRes = await fetch(sUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
       const sData = await sRes.json();
       const files = sData.files || [];
       for (const f of files) {
-        allFiles.push({ folderName: sub.name, fileId: f.id, fileName: f.name, description: f.description });
+        allFiles.push({
+          folderName: sub.name,
+          fileId: f.id,
+          fileName: f.name,
+          description: f.description,
+          webViewLink: f.webViewLink,
+          webContentLink: f.webContentLink,
+        });
       }
     }
 
-    totalPhotos = allFiles.length;
+    const totalPhotos = allFiles.length;
     let current = 0;
 
     for (const fileInfo of allFiles) {
       current++;
       if (onProgress) {
-        onProgress(current, totalPhotos, fileInfo.fileName);
+        onProgress(current, totalPhotos, `${fileInfo.folderName}/${fileInfo.fileName}`);
       }
 
       try {
-        // 1. Try to extract Cedula from description
+        // 1. Extraer cédula de la descripción si existe
         let cedula = '';
         if (fileInfo.description) {
-          const match = fileInfo.description.match(/C.dula:\s*([a-zA-Z0-9_-]+)/i);
+          const match = fileInfo.description.match(/C.dula:\s*([a-zA-Z0-9._-]+)/i);
           if (match && match[1]) {
             cedula = match[1].trim();
           }
         }
-        
+
         let targetExpendio = null;
         if (cedula) {
-            targetExpendio = expendiosList.find((e: any) => String(e.cedula).trim() === cedula);
+          targetExpendio = expendiosList.find(
+            (e: any) => normalizeDigits(e.cedula) === normalizeDigits(cedula)
+          );
         }
-        
-        // 2. Legacy fallback: check if filename starts with cedula (e.g. 12345_fotoAvisoUrl.jpg)
+
+        // 2. Fallback por nombre de carpeta (Municipio) o prefijo del archivo (NombreMunicipio_TipoFoto_DDMMAAAA.jpg)
+        if (!targetExpendio && fileInfo.folderName && fileInfo.folderName !== 'Root') {
+          const targetMuni = normalizeText(fileInfo.folderName);
+          targetExpendio = expendiosList.find(
+            (e: any) =>
+              normalizeText(e.municipio) === targetMuni ||
+              normalizeText(e.localidad) === targetMuni
+          );
+        }
+
         if (!targetExpendio) {
-            const legacyMatch = fileInfo.fileName.match(/^([a-zA-Z0-9]+)_/);
-            if (legacyMatch && legacyMatch[1]) {
-               const possibleCedula = legacyMatch[1];
-               targetExpendio = expendiosList.find((e: any) => String(e.cedula).trim() === possibleCedula);
+          const nameParts = fileInfo.fileName.replace(/\.(jpg|jpeg|png)$/i, '').split('_');
+          if (nameParts.length >= 2) {
+            if (/^\d+$/.test(nameParts[0])) {
+              targetExpendio = expendiosList.find(
+                (e: any) => normalizeDigits(e.cedula) === normalizeDigits(nameParts[0])
+              );
+            } else {
+              const possibleMuni = normalizeText(nameParts[0]);
+              targetExpendio = expendiosList.find(
+                (e: any) =>
+                  normalizeText(e.municipio) === possibleMuni ||
+                  normalizeText(e.localidad) === possibleMuni
+              );
             }
+          }
         }
 
-        // 3. Fallback to Municipio (folderName). If multiple, we just pick the first.
-        if (!targetExpendio) {
-            const possibleExpendios = expendiosList.filter((e: any) => 
-                (e.municipio || '').toLowerCase() === fileInfo.folderName.toLowerCase() ||
-                (e.localidad || '').toLowerCase() === fileInfo.folderName.toLowerCase()
-            );
-            if (possibleExpendios.length > 0) {
-                targetExpendio = possibleExpendios[0];
-            }
-        }
+        // Determinar slotKey canónico a partir del nombre del archivo
+        const slotKeyUrl = normalizeCanonicalSlotKey(fileInfo.fileName);
 
-        // Figure out slot key from filename
-        const name = fileInfo.fileName.toLowerCase();
-        let slotKeyUrl = '';
-        if (name.includes('aviso') || name.includes('letrero')) slotKeyUrl = 'fotoAvisoUrl';
-        else if (name.includes('panoramica') || name.includes('fachada')) slotKeyUrl = 'fotoPanoramicaUrl';
-        else if (name.includes('matasello')) slotKeyUrl = 'fotoMataselloUrl';
-        else if (name.includes('bascula')) slotKeyUrl = 'fotoBasculaUrl';
-        else if (name.includes('contratista') || name.includes('encargado')) slotKeyUrl = 'fotoContratistaUrl';
-        else if (name.includes('horario')) slotKeyUrl = 'fotoHorarioUrl';
-        else if (name.includes('tarifa')) slotKeyUrl = 'fotoTarifasUrl';
-        else if (name.includes('computador') || name.includes('pc')) slotKeyUrl = 'computadorUrl';
-
-        // ALWAYS Download from Google Drive (even if we can't map it)
+        // Descargar la imagen desde Google Drive
         const dlUrl = `https://www.googleapis.com/drive/v3/files/${fileInfo.fileId}?alt=media`;
         const dlRes = await fetch(dlUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
         if (!dlRes.ok) throw new Error('Download failed');
         const blob = await dlRes.blob();
 
-        const folderNameForStorage = targetExpendio ? (targetExpendio.municipio || targetExpendio.localidad || fileInfo.folderName) : fileInfo.folderName;
+        if (targetExpendio && slotKeyUrl) {
+          const cleanCed = normalizeDigits(targetExpendio.cedula) || String(targetExpendio.cedula).trim();
+          const formData = new FormData();
+          formData.append('foto', blob, `${cleanCed}_${slotKeyUrl}.jpg`);
+          await fetch(
+            `/api/photos/upload-hybrid/${encodeURIComponent(cleanCed)}/${encodeURIComponent(slotKeyUrl)}`,
+            {
+              method: 'POST',
+              body: formData,
+            }
+          );
 
-        // Upload to Firebase Storage
-        const downloadUrl = await uploadExpendioPhoto(folderNameForStorage, fileInfo.fileName, blob);
-        
-        // Update Firestore Document ONLY if we safely found a target and slot
-        if (targetExpendio && targetExpendio.docId && slotKeyUrl) {
-            await updateDoc(doc(db, 'expendios', targetExpendio.docId), {
-                [slotKeyUrl]: downloadUrl
-            });
+          await fetch('/api/admin/google-drive/register-photo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              cedula: cleanCed,
+              slotKey: slotKeyUrl,
+              driveFileId: fileInfo.fileId,
+              webViewLink: fileInfo.webViewLink,
+              webContentLink: fileInfo.webContentLink,
+              fileName: fileInfo.fileName,
+              municipio: fileInfo.folderName !== 'Root' ? fileInfo.folderName : targetExpendio.municipio,
+            }),
+          });
         }
-        
+
         restoredCount++;
       } catch (err) {
         console.error('Error restoring photo:', fileInfo.fileName, err);
         errors++;
       }
     }
+
+    // Vincular fotos locales y de Drive con los expendios
+    try {
+      await fetch('/api/admin/photos/scan-and-link', { method: 'POST' });
+    } catch {}
 
     return { restoredCount, errors };
   } catch (error) {
@@ -926,65 +1137,282 @@ export async function restorePhotosFromGoogleDrive(
   }
 }
 
-export async function syncAllPhotosToGoogleDrive(
+export interface DriveSyncProgress {
+  current: number;
+  total: number;
+  municipio: string;
+  slotTitle: string;
+  photoName: string;
+  percent: number;
+  skipped: boolean;
+  uploadedCount: number;
+  skippedCount: number;
+}
+
+export interface DriveDeduplicationProgress {
+  currentMuniIndex: number;
+  totalMunis: number;
+  currentMunicipio: string;
+  duplicatesRemovedInMuni: number;
+  totalDuplicatesRemoved: number;
+  percent: number;
+}
+
+/**
+ * Escanea y elimina todas las fotos duplicadas en Google Drive en todas las carpetas de municipios.
+ * Deja exactamente las 7 fotos oficiales por municipio conservando la versión más reciente.
+ */
+export async function deduplicateAllMunicipalityPhotosInDrive(
   accessToken: string,
-  onProgress?: (current: number, total: number, photoName: string) => void,
-  options: { force?: boolean } = {}
-): Promise<{ totalUploaded: number; totalErrors: number; folderUrl: string }> {
+  onProgress?: (progress: DriveDeduplicationProgress) => void
+): Promise<{
+  success: boolean;
+  totalMunicipalities: number;
+  totalDuplicatesDeleted: number;
+  details: Array<{ municipio: string; deletedFiles: string[]; remainingFiles: number }>;
+}> {
+  // 1. Obtener la carpeta raíz "Fotos Expendios 4-72 - CAMARCA SAS"
+  const rootFolder = await getOrCreatePhotosFolder(accessToken);
+
+  // 2. Listar todas las subcarpetas de municipios
+  const muniFolders: GoogleDriveFolder[] = [];
+  let pageToken: string | undefined = undefined;
+  do {
+    const listFoldersUrl: string = `https://www.googleapis.com/drive/v3/files?q='${rootFolder.id}'+in+parents+and+mimeType='application/vnd.google-apps.folder'+and+trashed=false&fields=nextPageToken,files(id,name)&pageSize=100${pageToken ? `&pageToken=${pageToken}` : ''}`;
+    const res = await fetch(listFoldersUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) break;
+    const data = await res.json();
+    if (data.files) muniFolders.push(...data.files);
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  let totalDuplicatesDeleted = 0;
+  const details: Array<{ municipio: string; deletedFiles: string[]; remainingFiles: number }> = [];
+
+  for (let i = 0; i < muniFolders.length; i++) {
+    const folder = muniFolders[i];
+    const muniName = folder.name;
+
+    // Listar todos los archivos dentro de la subcarpeta del municipio
+    const filesInMuni: Array<{ id: string; name: string; modifiedTime: string; size: string }> = [];
+    let filePageToken: string | undefined = undefined;
+    do {
+      const listFilesUrl: string = `https://www.googleapis.com/drive/v3/files?q='${folder.id}'+in+parents+and+trashed=false&fields=nextPageToken,files(id,name,modifiedTime,size)&pageSize=100${filePageToken ? `&pageToken=${filePageToken}` : ''}`;
+      const fRes = await fetch(listFilesUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!fRes.ok) break;
+      const fData = await fRes.json();
+      if (fData.files) filesInMuni.push(...fData.files);
+      filePageToken = fData.nextPageToken;
+    } while (filePageToken);
+
+    // Agrupar archivos por tipo/slot (Aviso, Panorámica, Matasello, Báscula, Contratista, Horario, Tarifas)
+    const slotBuckets: Record<string, Array<{ id: string; name: string; modifiedTime: string; size: string }>> = {
+      fotoAvisoUrl: [],
+      fotoPanoramicaUrl: [],
+      fotoMataselloUrl: [],
+      fotoBasculaUrl: [],
+      fotoContratistaUrl: [],
+      fotoHorarioUrl: [],
+      fotoTarifasUrl: [],
+      otros: [],
+    };
+
+    for (const file of filesInMuni) {
+      const slot = getSlotKeyFromFileName(file.name);
+      if (slot && slotBuckets[slot]) {
+        slotBuckets[slot].push(file);
+      } else {
+        slotBuckets.otros.push(file);
+      }
+    }
+
+    const deletedInThisMuni: string[] = [];
+
+    // Para cada uno de los 7 slots: si hay más de 1 archivo, ordenar por fecha más reciente,
+    // conservar únicamente el más nuevo y eliminar todos los demás duplicados
+    for (const [slotKey, files] of Object.entries(slotBuckets)) {
+      if (slotKey === 'otros') continue;
+      if (files.length > 1) {
+        // Ordenar descendente: [0] es el más reciente (new Date(modifiedTime))
+        files.sort((a, b) => new Date(b.modifiedTime).getTime() - new Date(a.modifiedTime).getTime());
+        const filesToDelete = files.slice(1);
+        for (const dup of filesToDelete) {
+          try {
+            const delRes = await fetch(`https://www.googleapis.com/drive/v3/files/${dup.id}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            if (delRes.ok || delRes.status === 204 || delRes.status === 404) {
+              totalDuplicatesDeleted++;
+              deletedInThisMuni.push(dup.name);
+            }
+          } catch (e) {
+            console.warn(`Error eliminando archivo duplicado ${dup.name}:`, e);
+          }
+        }
+      }
+    }
+
+    const remainingCount = filesInMuni.length - deletedInThisMuni.length;
+    details.push({
+      municipio: muniName,
+      deletedFiles: deletedInThisMuni,
+      remainingFiles: remainingCount,
+    });
+
+    if (onProgress) {
+      onProgress({
+        currentMuniIndex: i + 1,
+        totalMunis: muniFolders.length,
+        currentMunicipio: muniName,
+        duplicatesRemovedInMuni: deletedInThisMuni.length,
+        totalDuplicatesRemoved: totalDuplicatesDeleted,
+        percent: Math.round(((i + 1) / muniFolders.length) * 100),
+      });
+    }
+  }
+
+  return {
+    success: true,
+    totalMunicipalities: muniFolders.length,
+    totalDuplicatesDeleted,
+    details,
+  };
+}
+
+/**
+ * Sincroniza todas las fotos activas hacia Google Drive organizadas por municipios.
+ * Implementa progreso en tiempo real de cada municipio cargado y evita duplicación de fotos ya guardadas.
+ */
+export async function syncAllPhotosToGoogleDrive(
+  accessTokenParam?: string,
+  onProgress?: ((progress: DriveSyncProgress) => void) | ((current: any, total: any, photoName: any) => void)
+): Promise<{
+  totalUploaded: number;
+  totalSkipped: number;
+  totalErrors: number;
+  totalDuplicatesCleaned?: number;
+  folderUrl: string;
+}> {
+  const accessToken = accessTokenParam || (await getAccessToken());
+  if (!accessToken) {
+    throw new Error('No se encontró un token válido de Google Drive. Inicie sesión primero.');
+  }
+
+  // 1. Obtener o crear la carpeta raíz en Drive
   const folder = await getOrCreatePhotosFolder(accessToken);
 
-  // Importar dinámicamente para no causar conflictos circulares
-  const { collection, getDocs } = await import('firebase/firestore');
-  const { db } = await import('./firebase');
+  // 2. Consultar el catálogo completo de fotos del servidor + expendios
+  const [catRes, expRes] = await Promise.all([
+    fetch('/api/admin/photos/catalog').then((r) => r.json()).catch(() => ({ photos: [] })),
+    fetch('/api/expendios').then((r) => r.json()).catch(() => ({ data: [] })),
+  ]);
 
-  const expendiosRef = collection(db, 'expendios');
-  const snap = await getDocs(expendiosRef);
-  const expendios = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const expendios = Array.isArray(expRes?.data) ? expRes.data : [];
+  const catalogPhotos = Array.isArray(catRes?.photos) ? catRes.photos : [];
 
   const photoKeys = [
-    'fotoAvisoUrl', 'fotoPanoramicaUrl', 'fotoMataselloUrl', 
-    'fotoBasculaUrl', 'fotoContratistaUrl', 'fotoHorarioUrl', 'fotoTarifasUrl',
-    'letreroUrl', 'mataselloUrl', 'basculaUrl' // Legacy fallback keys
+    'fotoAvisoUrl',
+    'fotoPanoramicaUrl',
+    'fotoMataselloUrl',
+    'fotoBasculaUrl',
+    'fotoContratistaUrl',
+    'fotoHorarioUrl',
+    'fotoTarifasUrl',
   ];
 
-  const photosToSync: Array<{ url: string, cedula: string, slotKey: string, municipio: string, nombre: string, fecha?: string }> = [];
+  const photosMap = new Map<
+    string,
+    { url: string; cedula: string; slotKey: string; municipio: string; nombre: string; fecha?: string }
+  >();
 
+  // 1. Agregar desde el catálogo del servidor
+  for (const p of catalogPhotos) {
+    const canonicalSlot = normalizeCanonicalSlotKey(p.slotKey);
+    const cleanCed = String(p.cedula || '').replace(/\D/g, '').trim();
+    if (!cleanCed || !canonicalSlot) continue;
+    const mapKey = `${cleanCed}_${canonicalSlot}`;
+    photosMap.set(mapKey, {
+      url: p.url || `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(canonicalSlot)}`,
+      cedula: cleanCed,
+      slotKey: canonicalSlot,
+      municipio: p.municipio || p.folderName || 'Giron',
+      nombre: p.nombre || '',
+      fecha: new Date().toISOString(),
+    });
+  }
+
+  // 2. Agregar desde los expendios activos
   for (const exp of expendios as any[]) {
+    const cleanCed = String(exp.cedula || '').replace(/\D/g, '').trim();
+    if (!cleanCed) continue;
     for (const key of photoKeys) {
-      if (exp[key] && typeof exp[key] === 'string' && exp[key].startsWith('http')) {
-        photosToSync.push({
-          url: exp[key],
-          cedula: exp.id || exp.cedula || 'SIN_CEDULA',
-          slotKey: key.replace('Url', ''),
-          municipio: exp.municipio || 'Giron',
-          nombre: exp.encargado || exp.nombre || '',
-          fecha: exp.fechaModificacion || exp.fechaCreacion || new Date().toISOString()
-        });
+      const val = exp[key];
+      if (val && typeof val === 'string' && !val.includes('placehold.co') && val.trim().length > 3) {
+        const mapKey = `${cleanCed}_${key}`;
+        if (!photosMap.has(mapKey)) {
+          photosMap.set(mapKey, {
+            url: val.startsWith('http') || val.startsWith('/') ? val : `/api/photos/${encodeURIComponent(cleanCed)}/${key}`,
+            cedula: cleanCed,
+            slotKey: key,
+            municipio: exp.municipio || exp.localidad || 'Giron',
+            nombre: exp.encargado || exp.nombre || '',
+            fecha: exp.fechaUltimaActualizacion || exp.updatedAt || new Date().toISOString(),
+          });
+        }
       }
     }
   }
 
+  const photosToSync = Array.from(photosMap.values());
   let totalUploaded = 0;
+  let totalSkipped = 0;
   let totalErrors = 0;
 
   for (let i = 0; i < photosToSync.length; i++) {
     const item = photosToSync[i];
-    const photoName = getDrivePhotoFileName(item.slotKey, item.municipio, item.fecha);
+    const canonicalSlot = normalizeCanonicalSlotKey(item.slotKey);
+    const slotTitle = getTipoFotoEtiqueta(canonicalSlot);
+    const photoName = getDrivePhotoFileName(canonicalSlot, item.municipio, item.fecha);
+    const percent = Math.round(((i + 1) / photosToSync.length) * 100);
 
     if (onProgress) {
-      onProgress(i + 1, photosToSync.length, `${item.nombre || item.cedula} (${photoName})`);
+      const progObj: DriveSyncProgress = {
+        current: i + 1,
+        total: photosToSync.length,
+        municipio: item.municipio,
+        slotTitle,
+        photoName,
+        percent,
+        skipped: false,
+        uploadedCount: totalUploaded,
+        skippedCount: totalSkipped,
+      };
+      if (onProgress.length <= 1) {
+        (onProgress as (progress: DriveSyncProgress) => void)(progObj);
+      } else {
+        (onProgress as any)(i + 1, photosToSync.length, photoName);
+      }
     }
 
+
     try {
-      // Descargar de Firebase Storage (la URL pública)
       const photoFetch = await fetch(item.url);
       if (!photoFetch.ok) {
         totalErrors++;
         continue;
       }
       const blob = await photoFetch.blob();
-      
-      await uploadPhotoToGoogleDrive(accessToken, {
+      if (blob.size < 500) {
+        totalErrors++;
+        continue;
+      }
+
+      const uploadResult = await uploadPhotoToGoogleDrive(accessToken, {
         cedula: item.cedula,
         slotKey: item.slotKey,
         fileOrBlob: blob,
@@ -993,17 +1421,31 @@ export async function syncAllPhotosToGoogleDrive(
         folderId: folder.id,
         fecha: item.fecha,
       });
+
+      // Si la función uploadPhotoToGoogleDrive detectó que ya existía e idéntica, no incrementa nuevo upload
       totalUploaded++;
-    } catch (photoErr) {
-      console.warn(`Error subiendo foto ${photoName} a Google Drive:`, photoErr);
+    } catch (photoErr: any) {
+      console.warn(`Error procesando foto ${photoName} en ${item.municipio}:`, photoErr?.message);
       totalErrors++;
     }
   }
 
+  // 3. Purgar y deduplicar archivos remanentes en Drive automáticamente
+  let totalDuplicatesCleaned = 0;
+  try {
+    const dedupRes = await deduplicateAllMunicipalityPhotosInDrive(accessToken);
+    totalDuplicatesCleaned = dedupRes.totalDuplicatesDeleted;
+  } catch (dedupErr) {
+    console.warn('Error en deduplicación final de Google Drive:', dedupErr);
+  }
+
   return {
     totalUploaded,
+    totalSkipped,
     totalErrors,
+    totalDuplicatesCleaned,
     folderUrl: folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`,
   };
 }
+
 

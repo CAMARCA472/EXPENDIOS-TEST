@@ -54,8 +54,9 @@ export const formatCuentaBancaria = (
   rawCuenta?: string | number | null,
   rawBanco?: string | null
 ): { cuenta: string; banco: string } => {
-  if (!rawCuenta) return { cuenta: 'NEQUI 3123304166', banco: 'NEQUI' };
+  if (!rawCuenta) return { cuenta: '', banco: String(rawBanco || '').trim() };
   const str = String(rawCuenta).trim();
+  if (!str) return { cuenta: '', banco: String(rawBanco || '').trim() };
   const upper = str.toUpperCase();
   const bancoUpper = (rawBanco || '').toUpperCase();
 
@@ -70,9 +71,9 @@ export const formatCuentaBancaria = (
 
   if (isNequi) {
     const numClean = cleanNequiNumber(str);
-    const validNum = numClean.length === 10 ? numClean : numClean || '3123304166';
+    const validNum = numClean.length === 10 ? numClean : numClean;
     return {
-      cuenta: `NEQUI ${validNum}`,
+      cuenta: validNum ? `NEQUI ${validNum}` : str,
       banco: 'NEQUI',
     };
   }

@@ -14,7 +14,6 @@ import {
   CheckSquare,
   Square,
 } from 'lucide-react';
-import { ADMIN_SECURITY_PASSWORD } from './ConfirmarBorradoModal';
 
 interface EliminarBaseDatosModalProps {
   isOpen: boolean;
@@ -71,20 +70,17 @@ export const EliminarBaseDatosModal: React.FC<EliminarBaseDatosModalProps> = ({
       return;
     }
 
-    if (password !== ADMIN_SECURITY_PASSWORD) {
-      setErrorMsg('Contraseña de seguridad incorrecta. Operación de borrado no autorizada.');
-      return;
-    }
-
     setErrorMsg('');
     setIsProcessing(true);
 
     try {
       const res = await fetch('/api/admin/vaciar-base-datos', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          },
         body: JSON.stringify({
-          password,
+          password: password.trim(),
           targets: {
             expendios: targetExpendios,
             relacionPagos: targetRelacionPagos,
@@ -298,7 +294,7 @@ export const EliminarBaseDatosModal: React.FC<EliminarBaseDatosModalProps> = ({
                   if (errorMsg) setErrorMsg('');
                 }}
                 autoFocus
-                placeholder="Ingrese la clave autorizada Camarca.2023*..."
+                placeholder="Ingrese la clave maestra de seguridad..."
                 className="w-full bg-slate-950 border border-slate-700 focus:border-rose-500 focus:ring-2 focus:ring-rose-500/20 text-slate-100 placeholder-slate-500 text-sm rounded-xl py-2.5 pl-3.5 pr-10 outline-none transition-all font-mono"
               />
               <button

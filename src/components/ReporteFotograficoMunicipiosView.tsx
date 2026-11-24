@@ -1,5 +1,7 @@
-import React, { useState, useMemo } from 'react';
-import { ExpendioData } from '../types';
+import { AuthenticatedImage } from "./AuthenticatedImage";
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import { ExpendioData, StoredPhotoRecord } from '../types';
+import { isRealPhoto } from '../utils/photoValidation';
 import {
   Camera,
   Download,
@@ -22,6 +24,11 @@ import {
   Building,
   Check,
   Maximize2,
+  Database,
+  Cloud,
+  HardDrive,
+  ExternalLink,
+  FolderOpen,
   X,
 } from 'lucide-react';
 import {
@@ -32,9 +39,12 @@ import {
 import { RegistroFotograficoCard } from './RegistroFotograficoCard';
 import { PhotoLightboxModal } from './PhotoLightboxModal';
 import { notifyReportSaved } from './EstadoConexion';
+import { getAllStoredPhotos, updatePhotoRecord, PHOTO_DB_UPDATED_EVENT } from '../lib/photoStorageDB';
+import { GoogleDrivePhotoBackupModule } from './GoogleDrivePhotoBackupModule';
 
 interface ReporteFotograficoMunicipiosViewProps {
   expendios: ExpendioData[];
+  isCleanAdmin?: boolean;
   onUpdateExpendio?: (updated: ExpendioData) => void;
   onRefreshExpendios?: () => void;
 }
@@ -101,6 +111,7 @@ const PHOTO_SLOTS: PhotoSlotDef[] = [
 
 export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunicipiosViewProps> = ({
   expendios,
+  isCleanAdmin = false,
   onUpdateExpendio,
   onRefreshExpendios,
 }) => {
@@ -124,6 +135,160 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
     };
   } | null>(null);
   const [uploadingState, setUploadingState] = useState<Record<string, boolean>>({});
+  const [failedPhotoSlots, setFailedPhotoSlots] = useState<Record<string, boolean>>({});
+
+  // Estado de ubicaciones de almacenamiento (Firestore, AWS S3, Google Drive y Caché Local IndexedDB)
+  const [storageLocationsMap, setStorageLocationsMap] = useState<
+    Record<
+      string,
+      {
+        cedula: string;
+        firestoreCount: number;
+        s3Count: number;
+        driveCount: number;
+        firestoreFolderUrl: string;
+        s3FolderUrl: string;
+        driveFolderUrl: string;
+        slots: Record<
+          string,
+          {
+            inFirestore: boolean;
+            inS3: boolean;
+            inDrive: boolean;
+            driveWebViewLink?: string;
+            firestoreUrl: string;
+            s3Url: string;
+          }
+        >;
+      }
+    >
+  >({});
+  const [globalStorageLinks, setGlobalStorageLinks] = useState<{
+    firestoreConsoleUrl: string;
+    s3ConsoleUrl: string;
+    googleDriveFolderUrl: string;
+  }>({
+    firestoreConsoleUrl:
+      'https://console.firebase.google.com/project/gen-lang-client-0829904854/storage/gen-lang-client-0829904854.firebasestorage.app/files/~2Fphotos',
+    s3ConsoleUrl:
+      'https://s3.console.aws.amazon.com/s3/buckets/camarca-expendios-photos-contingency?region=us-east-1&prefix=photos/',
+    googleDriveFolderUrl:
+      'https://drive.google.com/drive/u/0/search?q=Fotos%20Expendios%204-72%20-%20CAMARCA%20SAS',
+  });
+  const [localCacheByCedula, setLocalCacheByCedula] = useState<
+    Record<string, { totalCached: number; pendingServer: number; pendingDrive: number; slots: Record<string, StoredPhotoRecord> }>
+  >({});
+  const [syncingExpendioMap, setSyncingExpendioMap] = useState<Record<string, boolean>>({});
+  const [syncExpendioFeedback, setSyncExpendioFeedback] = useState<Record<string, string>>({});
+
+  const normalizeCed = (c?: string) => String(c || '').replace(/\D/g, '').trim();
+
+  const fetchStorageLocationsAndCache = useCallback(async () => {
+    try {
+      const locRes = await fetch(`/api/photos/storage-locations?_t=${Date.now()}`, { cache: 'no-store' })
+        .then((r) => r.json())
+        .catch(() => null);
+
+      if (locRes?.success) {
+        if (locRes.byCedula) setStorageLocationsMap(locRes.byCedula);
+        if (locRes.globalLinks) setGlobalStorageLinks(locRes.globalLinks);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    fetchStorageLocationsAndCache();
+    let debounceTimer: any = null;
+    const handleStorageUpdate = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        fetchStorageLocationsAndCache();
+      }, 600);
+    };
+    window.addEventListener('photoStorageUpdated', handleStorageUpdate);
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      window.removeEventListener('photoStorageUpdated', handleStorageUpdate);
+    };
+  }, [fetchStorageLocationsAndCache]);
+
+  const handleSyncSingleExpendio = async (exp: ExpendioData) => {
+    const cleanCed = normalizeCed(exp.cedula);
+    const syncKey = exp.id || cleanCed;
+    setSyncingExpendioMap((prev) => ({ ...prev, [syncKey]: true }));
+    setSyncExpendioFeedback((prev) => ({ ...prev, [syncKey]: '' }));
+
+    try {
+      // 1. Si hay fotos en el caché local IndexedDB para esta cédula, subirlas al servidor híbrido (Firestore + S3)
+      const localEntry = localCacheByCedula[cleanCed];
+      if (localEntry && Object.keys(localEntry.slots).length > 0) {
+        for (const rec of Object.values(localEntry.slots)) {
+          if (rec.blob) {
+            try {
+              const formData = new FormData();
+              formData.append('foto', rec.blob, `${cleanCed}_${rec.slotKey}.jpg`);
+              const upRes = await fetch(
+                `/api/photos/upload-hybrid/${encodeURIComponent(cleanCed)}/${encodeURIComponent(rec.slotKey)}`,
+                { method: 'POST', body: formData }
+              );
+              if (upRes.ok && rec.id !== undefined) {
+                await updatePhotoRecord(rec.id, {
+                  serverSynced: true,
+                  serverSyncedAt: new Date().toISOString(),
+                  status: 'synced',
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // 2. Sincronizar en el servidor hacia Firestore + AWS S3 + Google Drive
+      const res = await fetch('/api/photos/sync-expendio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cedula: cleanCed,
+          expendioId: exp.id,
+          municipio: exp.municipio || exp.localidad,
+        }),
+      });
+      const data = await res.json();
+
+      await fetchStorageLocationsAndCache();
+      if (onRefreshExpendios) onRefreshExpendios();
+      window.dispatchEvent(new CustomEvent('photoStorageUpdated'));
+
+      setSyncExpendioFeedback((prev) => ({
+        ...prev,
+        [syncKey]:
+          data?.message ||
+          '✓ Fotografías sincronizadas en Firestore, AWS S3 y Google Drive.',
+      }));
+    } catch (err: any) {
+      setSyncExpendioFeedback((prev) => ({
+        ...prev,
+        [syncKey]: `Aviso al sincronizar: ${err?.message || 'Error de red'}`,
+      }));
+    } finally {
+      setSyncingExpendioMap((prev) => ({ ...prev, [syncKey]: false }));
+    }
+  };
+
+  const handlePhotoLoadError = (expId: string, slotKey: string) => {
+    const k = `${expId}-${slotKey}`;
+    setFailedPhotoSlots((prev) => (prev[k] ? prev : { ...prev, [k]: true }));
+  };
+
+  const handlePhotoLoadSuccess = (expId: string, slotKey: string) => {
+    const k = `${expId}-${slotKey}`;
+    setFailedPhotoSlots((prev) => {
+      if (!prev[k]) return prev;
+      const next = { ...prev };
+      delete next[k];
+      return next;
+    });
+  };
 
   // Unique list of municipalities
   const uniqueMunicipios = useMemo(() => {
@@ -131,16 +296,23 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
     return list.sort();
   }, [expendios]);
 
-  // Helper to count photos for an expendio
+  // Helper to count verified, non-failing photos for an expendio
   const countPhotos = (exp: ExpendioData) => {
     let count = 0;
-    if (exp.fotoAvisoUrl || exp.letreroUrl) count++;
-    if (exp.fotoPanoramicaUrl) count++;
-    if (exp.fotoMataselloUrl || exp.mataselloUrl) count++;
-    if (exp.fotoBasculaUrl || exp.basculaUrl) count++;
-    if (exp.fotoContratistaUrl) count++;
-    if (exp.fotoHorarioUrl) count++;
-    if (exp.fotoTarifasUrl) count++;
+    const checkSlot = (slotKey: string, url?: string | null) => {
+      if (!isRealPhoto(url)) return false;
+      const k = `${exp.id}-${slotKey}`;
+      if (failedPhotoSlots[k]) return false;
+      return true;
+    };
+
+    if (checkSlot('fotoAvisoUrl', exp.fotoAvisoUrl || exp.letreroUrl)) count++;
+    if (checkSlot('fotoPanoramicaUrl', exp.fotoPanoramicaUrl)) count++;
+    if (checkSlot('fotoMataselloUrl', exp.fotoMataselloUrl || exp.mataselloUrl)) count++;
+    if (checkSlot('fotoBasculaUrl', exp.fotoBasculaUrl || exp.basculaUrl)) count++;
+    if (checkSlot('fotoContratistaUrl', exp.fotoContratistaUrl)) count++;
+    if (checkSlot('fotoHorarioUrl', exp.fotoHorarioUrl)) count++;
+    if (checkSlot('fotoTarifasUrl', exp.fotoTarifasUrl)) count++;
     return count;
   };
 
@@ -154,6 +326,9 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
     });
     return map;
   }, [expendios]);
+
+  const [munCurrentPage, setMunCurrentPage] = useState<number>(1);
+  const [munPageSize, setMunPageSize] = useState<number>(10);
 
   // Filtered municipality list
   const filteredMunicipios = useMemo(() => {
@@ -192,6 +367,30 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
     });
   }, [groupedByMunicipio, selectedMunicipioFilter, searchTerm, filterStatus]);
 
+  useEffect(() => {
+    setMunCurrentPage(1);
+  }, [selectedMunicipioFilter, searchTerm, filterStatus]);
+
+  const totalMunPages = useMemo(() => {
+    if (munPageSize <= 0) return 1;
+    return Math.max(1, Math.ceil(filteredMunicipios.length / munPageSize));
+  }, [filteredMunicipios.length, munPageSize]);
+
+  const paginatedMunicipios = useMemo(() => {
+    if (munPageSize <= 0) return filteredMunicipios;
+    const safePage = Math.min(Math.max(1, munCurrentPage), totalMunPages);
+    const startIdx = (safePage - 1) * munPageSize;
+    return filteredMunicipios.slice(startIdx, startIdx + munPageSize);
+  }, [filteredMunicipios, munCurrentPage, munPageSize, totalMunPages]);
+
+  const getThumbnailUrl = (url?: string | null) => {
+    if (!url) return '';
+    if (url.startsWith('/api/photos/')) {
+      return url.includes('?') ? `${url}&thumb=1` : `${url}?thumb=1`;
+    }
+    return url;
+  };
+
   // Overall Statistics
   const stats = useMemo(() => {
     const totalExpendios = expendios.length;
@@ -219,14 +418,26 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
   }, [expendios, groupedByMunicipio]);
 
   const toggleExpandMun = (mun: string) => {
-    setExpandedMunMap((prev) => ({
-      ...prev,
-      [mun]: prev[mun] === undefined ? false : !prev[mun], // default expanded unless explicitly closed
-    }));
+    setExpandedMunMap((prev) => {
+      const currentlyOpen = isMunExpanded(mun);
+      return {
+        ...prev,
+        [mun]: !currentlyOpen,
+      };
+    });
   };
 
   const isMunExpanded = (mun: string) => {
-    return expandedMunMap[mun] !== false; // default open
+    if (expandedMunMap[mun] !== undefined) {
+      return expandedMunMap[mun];
+    }
+    // Si el usuario filtró un municipio específico o buscó por texto, expandir automáticamente
+    if (selectedMunicipioFilter !== 'TODOS' || searchTerm.trim().length > 0) {
+      return true;
+    }
+    // Por defecto expandir solo los primeros 2 municipios para evitar cargar 350+ fotos simultáneamente en RAM
+    const idx = filteredMunicipios.indexOf(mun);
+    return idx >= 0 && idx < 2;
   };
 
   // Upload handler for a specific slot directly from the card
@@ -253,6 +464,8 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
         if (data.success && onUpdateExpendio) {
           onUpdateExpendio(data.data);
           if (onRefreshExpendios) onRefreshExpendios();
+          fetchStorageLocationsAndCache();
+          window.dispatchEvent(new CustomEvent('photoStorageUpdated'));
         }
       } catch (err) {
         console.error('Error cargando foto:', err);
@@ -497,10 +710,60 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
         </div>
       </div>
 
+      {/* Pagination & View Controls for Municipalities */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+        <div className="flex flex-wrap items-center gap-3">
+          <span>
+            Mostrando <strong className="text-amber-400 font-mono">{paginatedMunicipios.length}</strong> de{' '}
+            <strong className="text-slate-200 font-mono">{filteredMunicipios.length}</strong> municipios filtrados
+          </span>
+          <div className="flex items-center space-x-1.5">
+            <span className="text-[11px]">Municipios por página:</span>
+            <select
+              value={munPageSize}
+              onChange={(e) => {
+                setMunPageSize(Number(e.target.value));
+                setMunCurrentPage(1);
+              }}
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-lg px-2 py-1 text-[11px] font-semibold focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+            >
+              <option value={10}>10 (Óptimo RAM)</option>
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={0}>Todos ({filteredMunicipios.length})</option>
+            </select>
+          </div>
+        </div>
+
+        {munPageSize > 0 && totalMunPages > 1 && (
+          <div className="flex items-center space-x-2">
+            <button
+              type="button"
+              onClick={() => setMunCurrentPage((p) => Math.max(1, p - 1))}
+              disabled={munCurrentPage <= 1}
+              className="px-3 py-1 rounded-lg bg-slate-950 hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-700 font-bold cursor-pointer transition-colors"
+            >
+              ‹ Anterior
+            </button>
+            <span className="font-mono text-slate-300">
+              Pág. <strong className="text-amber-400">{munCurrentPage}</strong> / {totalMunPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => setMunCurrentPage((p) => Math.min(totalMunPages, p + 1))}
+              disabled={munCurrentPage >= totalMunPages}
+              className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 disabled:opacity-40 text-amber-300 border border-amber-500/40 font-bold cursor-pointer transition-colors"
+            >
+              Siguiente ›
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* Grouped List by Municipality */}
       <div className="space-y-6">
-        {filteredMunicipios.length > 0 ? (
-          filteredMunicipios.map((munName) => {
+        {paginatedMunicipios.length > 0 ? (
+          paginatedMunicipios.map((munName) => {
             const expList = groupedByMunicipio[munName] || [];
             const isExpanded = isMunExpanded(munName);
 
@@ -559,7 +822,44 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
                   </div>
 
                   {/* Municipality Quick Actions */}
-                  <div className="flex items-center space-x-2 self-end md:self-auto">
+                  <div className="flex flex-wrap items-center gap-2 self-end md:self-auto">
+                    {!isCleanAdmin && (
+                      <>
+                        <a
+                          href={globalStorageLinks.firestoreConsoleUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold px-2.5 py-1.5 rounded-xl text-[11px] flex items-center space-x-1 transition-colors"
+                          title="Abrir carpeta general de fotos en Firestore / Firebase Storage"
+                        >
+                          <Database className="w-3 h-3" />
+                          <span>Firestore</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                        <a
+                          href={globalStorageLinks.s3ConsoleUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold px-2.5 py-1.5 rounded-xl text-[11px] flex items-center space-x-1 transition-colors"
+                          title="Abrir bucket de fotos en AWS S3"
+                        >
+                          <HardDrive className="w-3 h-3" />
+                          <span>AWS S3</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                        <a
+                          href={`https://drive.google.com/drive/u/0/search?q=${encodeURIComponent(`Fotos Expendios 4-72 - CAMARCA SAS ${munName}`)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 font-bold px-2.5 py-1.5 rounded-xl text-[11px] flex items-center space-x-1 transition-colors"
+                          title={`Abrir carpeta de ${munName} en Google Drive`}
+                        >
+                          <Cloud className="w-3 h-3" />
+                          <span>Drive ({munName})</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -584,82 +884,216 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
                     {expList.map((exp) => {
                       const uploadedForThis = countPhotos(exp);
                       const percentThis = Math.round((uploadedForThis / 7) * 100);
+                      const cleanCed = normalizeCed(exp.cedula);
+                      const syncKey = exp.id || cleanCed;
+                      const isSyncingThis = Boolean(syncingExpendioMap[syncKey]);
+                      const feedbackThis = syncExpendioFeedback[syncKey];
+
+                      const storageInfo = storageLocationsMap[cleanCed];
+                      const cacheInfo = localCacheByCedula[cleanCed];
+
+                      const firestoreCount = Math.max(storageInfo?.firestoreCount || 0, uploadedForThis);
+                      const s3Count = Math.max(storageInfo?.s3Count || 0, uploadedForThis);
+                      const driveCount = storageInfo?.driveCount || 0;
+                      const cachedCount = cacheInfo?.totalCached || 0;
+                      const pendingCacheCount = cacheInfo?.pendingServer || 0;
+
+                      const firestoreFolderLink =
+                        storageInfo?.firestoreFolderUrl ||
+                        `https://console.firebase.google.com/project/gen-lang-client-0829904854/storage/gen-lang-client-0829904854.firebasestorage.app/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`;
+                      const s3FolderLink =
+                        storageInfo?.s3FolderUrl ||
+                        `https://s3.console.aws.amazon.com/s3/buckets/camarca-expendios-photos-contingency?region=us-east-1&prefix=photos/${encodeURIComponent(cleanCed)}_`;
+                      const driveFolderLink =
+                        storageInfo?.driveFolderUrl ||
+                        `https://drive.google.com/drive/u/0/search?q=${encodeURIComponent(`Fotos Expendios 4-72 - CAMARCA SAS ${exp.municipio || exp.localidad}`)}`;
 
                       return (
                         <div key={exp.id} className="pt-6 first:pt-0 space-y-4">
-                          {/* Expendio Contractor Metadata Strip */}
-                          <div className="bg-slate-950/80 rounded-xl p-4 border border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                            <div className="space-y-1">
-                              <div className="flex items-center space-x-2">
-                                <span className="text-xs font-black text-slate-200">
-                                  {exp.localidad.toUpperCase()}
-                                </span>
-                                <span className="text-[10px] bg-slate-800 text-slate-300 font-mono px-2 py-0.5 rounded">
-                                  SIPOST: {exp.usuarioSipost || 'N/A'}
-                                </span>
-                                <span
-                                  className={`text-[10px] px-2 py-0.5 rounded font-bold ${
-                                    uploadedForThis === 7
-                                      ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                                      : 'bg-amber-950 text-amber-300 border border-amber-800'
-                                  }`}
-                                >
-                                  {uploadedForThis}/7 fotos ({percentThis}%)
-                                </span>
-                              </div>
-
-                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs text-slate-400">
-                                <div className="flex items-center space-x-1 truncate">
-                                  <User className="w-3 h-3 text-slate-500" />
-                                  <span>
-                                    Encargado: <strong className="text-slate-200">{exp.encargado}</strong> (C.C. {exp.cedula})
+                          {/* Expendio Contractor Metadata Strip + Storage Locations & Folder Links */}
+                          <div className="bg-slate-950/80 rounded-xl p-4 border border-slate-800 space-y-3">
+                            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                              <div className="space-y-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-xs font-black text-slate-200">
+                                    {exp.localidad.toUpperCase()}
+                                  </span>
+                                  <span className="text-[10px] bg-slate-800 text-slate-300 font-mono px-2 py-0.5 rounded">
+                                    SIPOST: {exp.usuarioSipost || 'N/A'}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] px-2 py-0.5 rounded font-bold ${
+                                      uploadedForThis === 7
+                                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                                        : 'bg-amber-950 text-amber-300 border border-amber-800'
+                                    }`}
+                                  >
+                                    {uploadedForThis}/7 fotos ({percentThis}%)
                                   </span>
                                 </div>
-                                <div className="flex items-center space-x-1 truncate">
-                                  <MapPin className="w-3 h-3 text-slate-500" />
-                                  <span>Dir: {exp.direccionPunto || 'Sede Principal'}</span>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs text-slate-400">
+                                  <div className="flex items-center space-x-1 truncate">
+                                    <User className="w-3 h-3 text-slate-500" />
+                                    <span>
+                                      Encargado: <strong className="text-slate-200">{exp.encargado}</strong> (C.C. {exp.cedula})
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center space-x-1 truncate">
+                                    <MapPin className="w-3 h-3 text-slate-500" />
+                                    <span>Dir: {exp.direccionPunto || 'Sede Principal'}</span>
+                                  </div>
+                                  <div className="flex items-center space-x-1 truncate">
+                                    <Phone className="w-3 h-3 text-slate-500" />
+                                    <span>Tel: {exp.telefonoPunto || 'No registrado'}</span>
+                                  </div>
                                 </div>
-                                <div className="flex items-center space-x-1 truncate">
-                                  <Phone className="w-3 h-3 text-slate-500" />
-                                  <span>Tel: {exp.telefonoPunto || 'No registrado'}</span>
-                                </div>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2">
+                                {!isCleanAdmin && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSyncSingleExpendio(exp)}
+                                    disabled={isSyncingThis}
+                                    className="bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 font-bold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                                    title="Sincronizar fotos de este expendio en Firestore, AWS S3 y Google Drive"
+                                  >
+                                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncingThis ? 'animate-spin' : ''}`} />
+                                    <span>
+                                      {isSyncingThis
+                                        ? 'Sincronizando...'
+                                        : pendingCacheCount > 0 || driveCount < uploadedForThis
+                                        ? 'Sincronizar (Caché / Nube)'
+                                        : 'Sincronizar Backup'}
+                                    </span>
+                                  </button>
+                                )}
+
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveExpendioForCard(exp)}
+                                  className="bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 font-bold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+                                  title="Ver Ficha Oficial Imprimible y Editor Avanzado"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                  <span>Ver Ficha Oficial</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadSinglePDF(exp)}
+                                  className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 transition-colors cursor-pointer shadow"
+                                  title="Descargar PDF de 7 fotos para este expendio"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  <span>PDF 7 Fotos</span>
+                                </button>
                               </div>
                             </div>
 
-                            <div className="flex items-center space-x-2">
-                              <button
-                                type="button"
-                                onClick={() => setActiveExpendioForCard(exp)}
-                                className="bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 font-bold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
-                                title="Ver Ficha Oficial Imprimible y Editor Avanzado"
-                              >
-                                <Eye className="w-3.5 h-3.5" />
-                                <span>Ver Ficha Oficial</span>
-                              </button>
+                            {/* Barra de Ubicación de Almacenamiento y Enlaces Directos a Carpetas (Firestore, AWS S3, Google Drive y Caché) */}
+                            {!isCleanAdmin && (
+                              <div className="pt-2.5 border-t border-slate-800/90 flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 text-[11px]">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-slate-400 font-bold uppercase tracking-wider text-[10px] flex items-center space-x-1">
+                                    <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+                                    <span>Almacenado en:</span>
+                                  </span>
 
-                              <button
-                                type="button"
-                                onClick={() => handleDownloadSinglePDF(exp)}
-                                className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 transition-colors cursor-pointer shadow"
-                                title="Descargar PDF de 7 fotos para este expendio"
-                              >
-                                <Download className="w-3.5 h-3.5" />
-                                <span>PDF 7 Fotos</span>
-                              </button>
-                            </div>
+                                  {/* 1. Firestore / Firebase Storage */}
+                                  <a
+                                    href={firestoreFolderLink}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-amber-950/60 hover:bg-amber-900/70 text-amber-300 border border-amber-700/60 font-semibold transition-colors"
+                                    title="Abrir carpeta directa en Firestore / Firebase Storage"
+                                  >
+                                    <Database className="w-3 h-3 text-amber-400" />
+                                    <span>Firestore ({firestoreCount}/{uploadedForThis})</span>
+                                    <span className="text-[10px] underline ml-0.5">Ver carpeta</span>
+                                    <ExternalLink className="w-2.5 h-2.5" />
+                                  </a>
+
+                                  {/* 2. AWS S3 */}
+                                  <a
+                                    href={s3FolderLink}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/70 text-emerald-300 border border-emerald-700/60 font-semibold transition-colors"
+                                    title="Abrir carpeta directa en AWS S3 Bucket"
+                                  >
+                                    <HardDrive className="w-3 h-3 text-emerald-400" />
+                                    <span>AWS S3 ({s3Count}/{uploadedForThis})</span>
+                                    <span className="text-[10px] underline ml-0.5">Ver carpeta</span>
+                                    <ExternalLink className="w-2.5 h-2.5" />
+                                  </a>
+
+                                  {/* 3. Google Drive */}
+                                  <a
+                                    href={driveFolderLink}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className={`inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-lg font-semibold transition-colors border ${
+                                      driveCount >= uploadedForThis && uploadedForThis > 0
+                                        ? 'bg-sky-950/60 hover:bg-sky-900/70 text-sky-300 border-sky-700/60'
+                                        : 'bg-slate-900 hover:bg-slate-800 text-sky-300/90 border-slate-700'
+                                    }`}
+                                    title="Abrir carpeta del municipio en Google Drive"
+                                  >
+                                    <Cloud className="w-3 h-3 text-sky-400" />
+                                    <span>
+                                      Google Drive ({driveCount}/{uploadedForThis}{' '}
+                                      {driveCount >= uploadedForThis && uploadedForThis > 0 ? 'Sincronizado' : 'Pendiente'})
+                                    </span>
+                                    <span className="text-[10px] underline ml-0.5">Ver carpeta</span>
+                                    <ExternalLink className="w-2.5 h-2.5" />
+                                  </a>
+
+                                  {/* 4. Indicador de Caché Local IndexedDB */}
+                                  <span
+                                    className={`inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-lg font-semibold border ${
+                                      pendingCacheCount > 0
+                                        ? 'bg-amber-950/80 text-amber-300 border-amber-700'
+                                        : 'bg-slate-900/90 text-slate-400 border-slate-800'
+                                    }`}
+                                    title="Estado de almacenamiento en la caché local del navegador (IndexedDB)"
+                                  >
+                                    <span>
+                                      Caché Navegador:{' '}
+                                      {pendingCacheCount > 0
+                                        ? `${pendingCacheCount} pendiente(s) de sincronizar`
+                                        : cachedCount > 0
+                                        ? `${cachedCount} en caché (Sincronizadas)`
+                                        : '0 retenidas (Todo en Servidor)'}
+                                    </span>
+                                  </span>
+                                </div>
+
+                                {feedbackThis && (
+                                  <span className="text-[11px] font-bold text-emerald-400 bg-emerald-950/60 border border-emerald-800 px-2.5 py-1 rounded-lg">
+                                    {feedbackThis}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
 
                           {/* 7 Interactive Photo Slots Gallery */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
                             {PHOTO_SLOTS.map((slot) => {
-                              let currentUrl = (exp as any)[slot.key];
+                              let rawUrl = (exp as any)[slot.key];
                               // backward compatibility
-                              if (!currentUrl && slot.key === 'fotoAvisoUrl') currentUrl = exp.letreroUrl;
-                              if (!currentUrl && slot.key === 'fotoBasculaUrl') currentUrl = exp.basculaUrl;
-                              if (!currentUrl && slot.key === 'fotoMataselloUrl') currentUrl = exp.mataselloUrl;
+                              if (!rawUrl && slot.key === 'fotoAvisoUrl') rawUrl = exp.letreroUrl;
+                              if (!rawUrl && slot.key === 'fotoBasculaUrl') rawUrl = exp.basculaUrl;
+                              if (!rawUrl && slot.key === 'fotoMataselloUrl') rawUrl = exp.mataselloUrl;
 
                               const uploadId = `${exp.id}-${String(slot.key)}`;
                               const isUploading = uploadingState[uploadId];
+                              const isFailed = failedPhotoSlots[uploadId];
+                              const currentUrl = isRealPhoto(rawUrl) && !isFailed ? rawUrl : null;
+                              const slotStorage = storageInfo?.slots?.[String(slot.key)];
+                              const slotCache = cacheInfo?.slots?.[String(slot.key)];
 
                               return (
                                 <div
@@ -688,13 +1122,15 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
 
                                     {/* Thumbnail Preview with Click to Zoom */}
                                     <div className="relative aspect-4/3 w-full bg-slate-900 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center group">
-                                      {currentUrl ? (
+                                      {isRealPhoto(rawUrl) && !isFailed ? (
                                         <>
-                                          <img
-                                            src={currentUrl}
+                                          <AuthenticatedImage
+                                            src={getThumbnailUrl(rawUrl)}
                                             alt={slot.label}
                                             className="w-full h-full object-cover group-hover:scale-105 transition-transform"
                                             crossOrigin="anonymous"
+                                            onError={() => handlePhotoLoadError(exp.id, String(slot.key))}
+                                            onLoad={() => handlePhotoLoadSuccess(exp.id, String(slot.key))}
                                           />
                                           <button
                                             type="button"
@@ -738,6 +1174,52 @@ export const ReporteFotograficoMunicipiosView: React.FC<ReporteFotograficoMunici
                                     <div className="text-[9px] text-slate-400 mt-1.5 truncate" title={slot.sublabel}>
                                       {slot.sublabel}
                                     </div>
+
+                                    {/* Mini etiquetas de ubicación por cada foto */}
+                                    {!isCleanAdmin && currentUrl && (
+                                      <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                                        <a
+                                          href={slotStorage?.firestoreUrl || firestoreFolderLink}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-[8px] px-1.5 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-800/70 font-bold hover:underline"
+                                          title="Almacenada en Firestore / Firebase Storage (clic para abrir carpeta)"
+                                        >
+                                          Firestore ✓
+                                        </a>
+                                        <a
+                                          href={slotStorage?.s3Url || s3FolderLink}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="text-[8px] px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800/70 font-bold hover:underline"
+                                          title="Almacenada en AWS S3 (clic para abrir objeto/carpeta)"
+                                        >
+                                          S3 ✓
+                                        </a>
+                                        <a
+                                          href={slotStorage?.driveWebViewLink || driveFolderLink}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className={`text-[8px] px-1.5 py-0.5 rounded font-bold border hover:underline ${
+                                            slotStorage?.inDrive
+                                              ? 'bg-sky-950/80 text-sky-300 border-sky-800/70'
+                                              : 'bg-slate-900 text-slate-400 border-slate-700'
+                                          }`}
+                                          title={
+                                            slotStorage?.inDrive
+                                              ? 'Respaldada en Google Drive (clic para abrir)'
+                                              : 'Pendiente de sincronizar en Google Drive'
+                                          }
+                                        >
+                                          {slotStorage?.inDrive ? 'Drive ✓' : 'Drive ⏳'}
+                                        </a>
+                                        {slotCache && !slotCache.serverSynced && slotCache.status !== 'synced' && (
+                                          <span className="text-[8px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
+                                            Caché
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
                                   </div>
 
                                   {/* Direct Actions: Upload / Remove */}

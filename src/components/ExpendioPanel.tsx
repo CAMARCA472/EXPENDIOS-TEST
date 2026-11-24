@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   ExpendioData,
   UserSession,
@@ -14,14 +14,16 @@ import { CameraGpsCaptureModal } from './CameraGpsCaptureModal';
 import { getCurrentGpsLocation, stampPhotoWithWatermarkAndGps, GeoCoordinates } from '../utils/photoWatermarkGps';
 import { formatPesos, formatCuentaBancaria } from '../utils/formatters';
 import { isRealPhoto } from '../utils/photoValidation';
+import { isPhotoConsistentWithExpendio } from '../lib/photoCacheHandler';
 import { getAccessToken } from '../lib/googleAuth';
 import { uploadPhotoToGoogleDrive } from '../lib/googleDriveService';
-import { updateSingleExpendioInGoogleSheets } from '../lib/googleSheetsService';
 import {
   savePhotoToIndexedDB,
   getStoredPhotosByCedula,
   updatePhotoRecord,
+  purgeCacheAndRedownloadPhotoFromServer,
 } from '../lib/photoStorageDB';
+import { reportPlatformError } from '../utils/errorLogger';
 import { StoredPhotoRecord } from '../types';
 import {
   addPhotoToOfflineQueue,
@@ -111,18 +113,24 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
   const isDatosActualizados = Boolean(expendio?.primeraVezActualizado);
 
   // Calculate loaded photos count out of 7 mandatory slots
-  const [localPhotos, setLocalPhotos] = useState<Record<string, string>>({
-    fotoAvisoUrl: (isRealPhoto(expendio?.fotoAvisoUrl) ? expendio.fotoAvisoUrl : (isRealPhoto(expendio?.letreroUrl) ? expendio.letreroUrl : '')) || '',
-    fotoPanoramicaUrl: (isRealPhoto(expendio?.fotoPanoramicaUrl) ? expendio.fotoPanoramicaUrl : '') || '',
-    fotoMataselloUrl: (isRealPhoto(expendio?.fotoMataselloUrl) ? expendio.fotoMataselloUrl : (isRealPhoto(expendio?.mataselloUrl) ? expendio.mataselloUrl : '')) || '',
-    fotoBasculaUrl: (isRealPhoto(expendio?.fotoBasculaUrl) ? expendio.fotoBasculaUrl : (isRealPhoto(expendio?.basculaUrl) ? expendio.basculaUrl : '')) || '',
-    fotoContratistaUrl: (isRealPhoto(expendio?.fotoContratistaUrl) ? expendio.fotoContratistaUrl : '') || '',
-    fotoHorarioUrl: (isRealPhoto(expendio?.fotoHorarioUrl) ? expendio.fotoHorarioUrl : '') || '',
-    fotoTarifasUrl: (isRealPhoto(expendio?.fotoTarifasUrl) ? expendio.fotoTarifasUrl : '') || '',
-    fotoCedulaFrontalUrl: (isRealPhoto(expendio?.fotoCedulaFrontalUrl) ? expendio.fotoCedulaFrontalUrl : '') || '',
-    fotoCedulaPosteriorUrl: (isRealPhoto(expendio?.fotoCedulaPosteriorUrl) ? expendio.fotoCedulaPosteriorUrl : '') || '',
-    fotoRutUrl: (isRealPhoto(expendio?.fotoRutUrl) ? expendio.fotoRutUrl : '') || '',
-  });
+  const safeInitUrl = (url?: string) => {
+    if (!url || !isRealPhoto(url)) return '';
+    if (!isPhotoConsistentWithExpendio(url, expendio)) return '';
+    return url;
+  };
+
+  const [localPhotos, setLocalPhotos] = useState<Record<string, string>>(() => ({
+    fotoAvisoUrl: safeInitUrl(expendio?.fotoAvisoUrl || expendio?.letreroUrl),
+    fotoPanoramicaUrl: safeInitUrl(expendio?.fotoPanoramicaUrl),
+    fotoMataselloUrl: safeInitUrl(expendio?.fotoMataselloUrl || expendio?.mataselloUrl),
+    fotoBasculaUrl: safeInitUrl(expendio?.fotoBasculaUrl || expendio?.basculaUrl),
+    fotoContratistaUrl: safeInitUrl(expendio?.fotoContratistaUrl),
+    fotoHorarioUrl: safeInitUrl(expendio?.fotoHorarioUrl),
+    fotoTarifasUrl: safeInitUrl(expendio?.fotoTarifasUrl),
+    fotoCedulaFrontalUrl: safeInitUrl(expendio?.fotoCedulaFrontalUrl),
+    fotoCedulaPosteriorUrl: safeInitUrl(expendio?.fotoCedulaPosteriorUrl),
+    fotoRutUrl: safeInitUrl(expendio?.fotoRutUrl),
+  }));
 
   // Validar si el slot está cumplido por foto REAL o justificado en BD como "NO tiene"
   const isAvisoCumplido = Boolean(isRealPhoto(localPhotos.fotoAvisoUrl) || isRealPhoto(expendio?.fotoAvisoUrl) || isRealPhoto(expendio?.letreroUrl) || expendio?.tieneAviso === 'NO');
@@ -159,7 +167,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     try {
       const res = await fetch('/api/expendio/marcar-bienvenida', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', },
         body: JSON.stringify({ cedula: expendio.cedula }),
       });
       const data = await res.json();
@@ -188,10 +196,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
   });
 
   const toggleAccordion = (section: 'modulo1' | 'modulo2' | 'modulo3' | 'modulo4') => {
-    setAccordionState((prev) => ({
-      ...prev,
-      [section]: !prev[section],
-    }));
+    setAccordionState((prev) => {
+      const willOpen = !prev[section];
+      return {
+        modulo1: section === 'modulo1' ? willOpen : false,
+        modulo2: section === 'modulo2' ? willOpen : false,
+        modulo3: section === 'modulo3' ? willOpen : false,
+        modulo4: section === 'modulo4' ? willOpen : false,
+      };
+    });
   };
 
   const handleOpenStep = (step: 'modulo1' | 'modulo2' | 'modulo3' | 'modulo4') => {
@@ -201,6 +214,12 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       modulo3: step === 'modulo3',
       modulo4: step === 'modulo4',
     });
+    setTimeout(() => {
+      const el = document.getElementById('expendio-active-section');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 60);
   };
 
   const [showDocModal, setShowDocModal] = useState<boolean>(false);
@@ -235,7 +254,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
   const handleAutoFillTestData = () => {
     const testEncargado = (expendio?.encargado || 'ENCARGADO PRUEBAS CAMARCA').toUpperCase();
-    const testCedula = (expendio?.cedula || '1094269932').toUpperCase();
+    const testCedula = (expendio?.cedula || '').toUpperCase();
     const testDireccion = (expendio?.direccionPunto || 'CRA 15 # 24-30 CENTRO').toUpperCase();
     const testTelefono = (expendio?.telefonoPunto || '3182822512').toUpperCase();
     const testEmail = (expendio?.correoElectronico || 'expendio.pruebas@camarca.com').toUpperCase();
@@ -265,20 +284,92 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     return { tipo: 'OTROS', otro: upper };
   };
 
-  // Form 1 State (Contact & Bank Details) - All in UPPERCASE
-  const [encargado, setEncargado] = useState<string>((expendio?.encargado || '').toUpperCase());
+  // Autoguardado local en el teléfono para proteger el registro si se cae el internet
+  const localDraftKey = `camarca_local_draft_${expendio?.cedula || 'default'}`;
+  const initialDraft = React.useMemo(() => {
+    try {
+      if (typeof window !== 'undefined' && expendio?.cedula) {
+        const raw = localStorage.getItem(`camarca_local_draft_${expendio.cedula}`);
+        if (raw) return JSON.parse(raw);
+      }
+    } catch {}
+    return null;
+  }, [expendio?.cedula]);
+
+  // Form 1 State (Contact & Bank Details) - All in UPPERCASE (Restaurado desde borrador local si existe)
+  const [encargado, setEncargado] = useState<string>(
+    (initialDraft?.encargado || expendio?.encargado || '').toUpperCase()
+  );
   const [cedulaInput, setCedulaInput] = useState<string>((expendio?.cedula || '').toUpperCase());
-  const [direccionPunto, setDireccionPunto] = useState<string>((expendio?.direccionPunto || '').toUpperCase());
-  const [telefonoPunto, setTelefonoPunto] = useState<string>((expendio?.telefonoPunto || '').toUpperCase());
-  const [cuentaBancaria, setCuentaBancaria] = useState<string>((expendio?.cuentaBancaria || '').toUpperCase());
-  const initialBancoParsed = parseBancoState(expendio?.banco);
+  const [direccionPunto, setDireccionPunto] = useState<string>(
+    (initialDraft?.direccionPunto || expendio?.direccionPunto || '').toUpperCase()
+  );
+  const [telefonoPunto, setTelefonoPunto] = useState<string>(
+    (initialDraft?.telefonoPunto || expendio?.telefonoPunto || '').toUpperCase()
+  );
+  const [cuentaBancaria, setCuentaBancaria] = useState<string>(
+    (initialDraft?.cuentaBancaria || expendio?.cuentaBancaria || '').toUpperCase()
+  );
+  const initialBancoParsed = parseBancoState(initialDraft?.banco || expendio?.banco);
   const [tipoBanco, setTipoBanco] = useState<string>(initialBancoParsed.tipo);
   const [otroBanco, setOtroBanco] = useState<string>(initialBancoParsed.otro);
-  const [banco, setBanco] = useState<string>((expendio?.banco || 'NEQUI').toUpperCase());
-  const [correoElectronico, setCorreoElectronico] = useState<string>((expendio?.correoElectronico || '').toUpperCase());
-  const [observaciones, setObservaciones] = useState<string>((expendio?.observaciones || expendio?.observacion || '').toUpperCase());
+  const [banco, setBanco] = useState<string>(
+    (initialDraft?.banco || expendio?.banco || 'NEQUI').toUpperCase()
+  );
+  const [correoElectronico, setCorreoElectronico] = useState<string>(
+    (initialDraft?.correoElectronico || expendio?.correoElectronico || '').toUpperCase()
+  );
+  const [observaciones, setObservaciones] = useState<string>(
+    (initialDraft?.observaciones ?? expendio?.observaciones ?? expendio?.observacion ?? '').toUpperCase()
+  );
   const [savingForm1, setSavingForm1] = useState<boolean>(false);
   const [msgForm1, setMsgForm1] = useState<string>('');
+  const [lastLocalSaveTime, setLastLocalSaveTime] = useState<string>(
+    initialDraft?.savedAtTime || ''
+  );
+  const [hasPendingOfflineData, setHasPendingOfflineData] = useState<boolean>(
+    Boolean(initialDraft?.pendingSync)
+  );
+
+  // Efecto de Autoguardado Local Automático en cada cambio del contratista
+  useEffect(() => {
+    if (!expendio?.cedula) return;
+    try {
+      const nowTime = new Date().toLocaleTimeString('es-CO', {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const finalBancoDraft =
+        tipoBanco === 'OTROS' ? (otroBanco.trim() || 'OTRO BANCO').toUpperCase() : tipoBanco.toUpperCase();
+      const prevRaw = localStorage.getItem(localDraftKey);
+      const prevParsed = prevRaw ? JSON.parse(prevRaw) : {};
+      const draftPayload = {
+        cedula: expendio.cedula,
+        encargado: encargado.toUpperCase(),
+        direccionPunto: direccionPunto.toUpperCase(),
+        telefonoPunto: telefonoPunto.toUpperCase(),
+        cuentaBancaria: cuentaBancaria.toUpperCase(),
+        banco: finalBancoDraft,
+        correoElectronico: correoElectronico.toUpperCase(),
+        observaciones: (observaciones || '').toUpperCase(),
+        savedAtTime: nowTime,
+        pendingSync: Boolean(prevParsed?.pendingSync),
+      };
+      localStorage.setItem(localDraftKey, JSON.stringify(draftPayload));
+      setLastLocalSaveTime(nowTime);
+    } catch {}
+  }, [
+    expendio?.cedula,
+    localDraftKey,
+    encargado,
+    direccionPunto,
+    telefonoPunto,
+    cuentaBancaria,
+    tipoBanco,
+    otroBanco,
+    correoElectronico,
+    observaciones,
+  ]);
 
   // Availability toggle for Báscula, Matasello, Letrero
   const [savingItemKey, setSavingItemKey] = useState<string | null>(null);
@@ -300,10 +391,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       if (data.success && data.data) {
         onUpdateSessionData(data.data);
         if (tiene === 'NO') {
-          setLocalPhotos((prev) => ({ ...prev, [slotKey]: '' }));
-          setMsgForm2(`✓ Implemento marcado como NO DISPONIBLE en la base de datos.`);
+          const generatedUrl = data.fileUrl || data.data[slotKey] || '';
+          setLocalPhotos((prev) => ({
+            ...prev,
+            [slotKey]: generatedUrl ? `${generatedUrl.split('?')[0]}?v=${Date.now()}` : '',
+          }));
+          setMsgForm2(`✓ Implemento marcado como NO DISPONIBLE y soporte en blanco generado para completar las 7 imágenes.`);
         } else {
-          setMsgForm2(`✓ Implemento actualizado a DISPONIBLE (SI) en la base de datos.`);
+          setLocalPhotos((prev) => ({ ...prev, [slotKey]: '' }));
+          setMsgForm2(`✓ Implemento actualizado a DISPONIBLE (SI) en la base de datos. Por favor adjunta la fotografía real.`);
         }
       }
     } catch (err) {
@@ -338,18 +434,47 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
   const handleSyncOffline = async () => {
     setIsSyncingOffline(true);
     setSyncStatusMsg('Sincronizando fotografías almacenadas en cola offline...');
+    
+    // Purga selectiva de cachés del navegador y localStorage relacionado con fotos
+    if (typeof (window as any).clearAppCache === 'function') {
+      try {
+        await (window as any).clearAppCache();
+      } catch (err) {
+        console.warn('[Cache-Purge] Advertencia purgando cachés:', err);
+      }
+    }
+
     try {
       const res = await syncOfflinePhotos((synced, total, current) => {
         setSyncStatusMsg(`Sincronizando foto ${synced + 1} de ${total} (${current.slotTitle})...`);
       });
       refreshOfflineQueue();
+      await fetchConfigAndCuentas();
+
+      if (expendio?.cedula) {
+        try {
+          const resp = await fetch(`/api/expendio/me?_t=${Date.now()}`, {
+            headers: {
+              ...(sessionStorage.getItem('camarca_token') ? { Authorization: `Bearer ${sessionStorage.getItem('camarca_token')}` } : {}),
+            },
+          });
+          if (resp.ok) {
+            const freshData = await resp.json();
+            if (freshData && freshData.expendio) {
+              onUpdateSessionData(freshData.expendio);
+            }
+          }
+        } catch (fetchErr) {
+          console.warn('[handleSyncOffline] Error refrescando datos de expendio:', fetchErr);
+        }
+      }
+
       if (res.syncedCount > 0) {
-        setSyncStatusMsg(`✓ Se sincronizaron ${res.syncedCount} fotografía(s) con el servidor.`);
-        fetchConfigAndCuentas();
+        setSyncStatusMsg(`✓ Se sincronizaron ${res.syncedCount} fotografía(s) con el servidor y se refrescó la información.`);
       } else if (res.failedCount > 0) {
         setSyncStatusMsg(`⚠️ ${res.failedCount} foto(s) no pudieron subirse aún (reintentando en segundo plano).`);
       } else {
-        setSyncStatusMsg('Cola offline al día. Todas las fotos están sincronizadas.');
+        setSyncStatusMsg('✓ Sincronización completada. Fotografías y datos actualizados al día.');
       }
       setTimeout(() => setSyncStatusMsg(''), 4000);
     } catch (err: any) {
@@ -360,12 +485,47 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     }
   };
 
+  // Sincronizar borrador de datos pendientes cuando regrese la señal de internet
+  const syncPendingLocalDataDraft = useCallback(async () => {
+    if (!expendio?.cedula) return;
+    try {
+      const raw = localStorage.getItem(localDraftKey);
+      if (!raw) return;
+      const draft = JSON.parse(raw);
+      if (!draft?.pendingSync) return;
+
+      const res = await fetch('/api/expendio/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cedula: expendio.cedula,
+          encargado: draft.encargado,
+          direccionPunto: draft.direccionPunto,
+          telefonoPunto: draft.telefonoPunto,
+          cuentaBancaria: draft.cuentaBancaria,
+          banco: draft.banco,
+          correoElectronico: draft.correoElectronico,
+          observaciones: draft.observaciones || '',
+          primeraVezActualizado: true,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        localStorage.setItem(localDraftKey, JSON.stringify({ ...draft, pendingSync: false }));
+        setHasPendingOfflineData(false);
+        onUpdateSessionData(data.data);
+        setMsgForm1('✓ Tus datos autoguardados en el teléfono se sincronizaron automáticamente con el servidor.');
+      }
+    } catch {}
+  }, [expendio?.cedula, localDraftKey, onUpdateSessionData]);
+
   // Listeners para cola offline y reconexión a internet
   useEffect(() => {
     const handleQueueUpdate = () => refreshOfflineQueue();
     const handleOnline = () => {
-      console.log('Conexión reestablecida. Sincronizando cola offline...');
+      console.log('Conexión reestablecida. Sincronizando cola offline y autoguardado local...');
       handleSyncOffline();
+      syncPendingLocalDataDraft();
     };
 
     window.addEventListener('camarca_offline_queue_updated', handleQueueUpdate);
@@ -375,37 +535,51 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       window.removeEventListener('camarca_offline_queue_updated', handleQueueUpdate);
       window.removeEventListener('online', handleOnline);
     };
-  }, []);
+  }, [syncPendingLocalDataDraft]);
 
-  // Sincronizar fotos locales cuando expendio se actualice sin bucles de re-renderizado
+  const activeExpendioKeyRef = useRef<string>(expendio?.id || expendio?.cedula || '');
+
+  // Sincronizar fotos locales cuando expendio se actualice sin mezclar datos de otros municipios
   useEffect(() => {
     if (!expendio || !expendio.cedula) return;
 
+    const currentKey = expendio.id || expendio.cedula || '';
+    const hasExpChanged = activeExpendioKeyRef.current !== currentKey;
+    if (hasExpChanged) {
+      activeExpendioKeyRef.current = currentKey;
+    }
+
+    const resolveSafeSlot = (serverUrl?: string, prevUrl?: string) => {
+      // 1. Si cambió de expendio, jamás heredar el prevUrl del expendio anterior (ej. Girón/Pamplona)
+      if (hasExpChanged) {
+        prevUrl = '';
+      }
+      // 2. Si hay URL en el expendio y es consistente con este municipio
+      if (serverUrl && isRealPhoto(serverUrl) && isPhotoConsistentWithExpendio(serverUrl, expendio)) {
+        return serverUrl;
+      }
+      // 3. Si hay prevUrl local (ej. foto recién tomada o dataURL en memoria), verificar consistencia
+      if (prevUrl && isRealPhoto(prevUrl) && isPhotoConsistentWithExpendio(prevUrl, expendio)) {
+        return prevUrl;
+      }
+      return '';
+    };
+
     setLocalPhotos((prev) => {
-      const nextAviso = (isRealPhoto(expendio.fotoAvisoUrl) ? expendio.fotoAvisoUrl : '') || (isRealPhoto(expendio.letreroUrl) ? expendio.letreroUrl : '');
-      const nextPano = (isRealPhoto(expendio.fotoPanoramicaUrl) ? expendio.fotoPanoramicaUrl : '');
-      const nextMata = (isRealPhoto(expendio.fotoMataselloUrl) ? expendio.fotoMataselloUrl : '') || (isRealPhoto(expendio.mataselloUrl) ? expendio.mataselloUrl : '');
-      const nextBasc = (isRealPhoto(expendio.fotoBasculaUrl) ? expendio.fotoBasculaUrl : '') || (isRealPhoto(expendio.basculaUrl) ? expendio.basculaUrl : '');
-      const nextCont = (isRealPhoto(expendio.fotoContratistaUrl) ? expendio.fotoContratistaUrl : '');
-      const nextHora = (isRealPhoto(expendio.fotoHorarioUrl) ? expendio.fotoHorarioUrl : '');
-      const nextTari = (isRealPhoto(expendio.fotoTarifasUrl) ? expendio.fotoTarifasUrl : '');
-      const nextCedF = (isRealPhoto(expendio.fotoCedulaFrontalUrl) ? expendio.fotoCedulaFrontalUrl : '');
-      const nextCedP = (isRealPhoto(expendio.fotoCedulaPosteriorUrl) ? expendio.fotoCedulaPosteriorUrl : '');
-      const nextRut = (isRealPhoto(expendio.fotoRutUrl) ? expendio.fotoRutUrl : '');
+      const targetAviso = resolveSafeSlot(expendio.fotoAvisoUrl || expendio.letreroUrl, prev.fotoAvisoUrl);
+      const targetPano = resolveSafeSlot(expendio.fotoPanoramicaUrl, prev.fotoPanoramicaUrl);
+      const targetMata = resolveSafeSlot(expendio.fotoMataselloUrl || expendio.mataselloUrl, prev.fotoMataselloUrl);
+      const targetBasc = resolveSafeSlot(expendio.fotoBasculaUrl || expendio.basculaUrl, prev.fotoBasculaUrl);
+      const targetCont = resolveSafeSlot(expendio.fotoContratistaUrl, prev.fotoContratistaUrl);
+      const targetHora = resolveSafeSlot(expendio.fotoHorarioUrl, prev.fotoHorarioUrl);
+      const targetTari = resolveSafeSlot(expendio.fotoTarifasUrl, prev.fotoTarifasUrl);
+      const targetCedF = resolveSafeSlot(expendio.fotoCedulaFrontalUrl, prev.fotoCedulaFrontalUrl);
+      const targetCedP = resolveSafeSlot(expendio.fotoCedulaPosteriorUrl, prev.fotoCedulaPosteriorUrl);
+      const targetRut = resolveSafeSlot(expendio.fotoRutUrl, prev.fotoRutUrl);
 
-      const targetAviso = nextAviso || (isRealPhoto(prev.fotoAvisoUrl) ? prev.fotoAvisoUrl : '');
-      const targetPano = nextPano || (isRealPhoto(prev.fotoPanoramicaUrl) ? prev.fotoPanoramicaUrl : '');
-      const targetMata = nextMata || (isRealPhoto(prev.fotoMataselloUrl) ? prev.fotoMataselloUrl : '');
-      const targetBasc = nextBasc || (isRealPhoto(prev.fotoBasculaUrl) ? prev.fotoBasculaUrl : '');
-      const targetCont = nextCont || (isRealPhoto(prev.fotoContratistaUrl) ? prev.fotoContratistaUrl : '');
-      const targetHora = nextHora || (isRealPhoto(prev.fotoHorarioUrl) ? prev.fotoHorarioUrl : '');
-      const targetTari = nextTari || (isRealPhoto(prev.fotoTarifasUrl) ? prev.fotoTarifasUrl : '');
-      const targetCedF = nextCedF || (isRealPhoto(prev.fotoCedulaFrontalUrl) ? prev.fotoCedulaFrontalUrl : '');
-      const targetCedP = nextCedP || (isRealPhoto(prev.fotoCedulaPosteriorUrl) ? prev.fotoCedulaPosteriorUrl : '');
-      const targetRut = nextRut || (isRealPhoto(prev.fotoRutUrl) ? prev.fotoRutUrl : '');
-
-      // Si todos los valores ya coinciden exactamente, no cambiamos la referencia del estado
+      // Si todos los valores ya coinciden exactamente y no hubo cambio de expendio, no cambiar referencia
       if (
+        !hasExpChanged &&
         prev.fotoAvisoUrl === targetAviso &&
         prev.fotoPanoramicaUrl === targetPano &&
         prev.fotoMataselloUrl === targetMata &&
@@ -421,7 +595,6 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       }
 
       return {
-        ...prev,
         fotoAvisoUrl: targetAviso,
         fotoPanoramicaUrl: targetPano,
         fotoMataselloUrl: targetMata,
@@ -435,15 +608,17 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       };
     });
 
-    // Restaurar inmediatamente fotos estructuradas desde IndexedDB para este expendio si existen en caché local
-    getStoredPhotosByCedula(expendio.cedula)
+    // Restaurar fotos desde IndexedDB: solo si corresponden al expendio y no están cruzadas
+    getStoredPhotosByCedula(expendio.cedula, expendio.id)
       .then((stored) => {
         if (stored && stored.length > 0) {
           setLocalPhotos((prev) => {
             const additions: Record<string, string> = {};
             for (const sp of stored) {
-              if (sp.dataUrl && isRealPhoto(sp.dataUrl) && !prev[sp.slotKey]) {
-                additions[sp.slotKey] = sp.dataUrl;
+              if (!sp.serverSynced && sp.dataUrl && isRealPhoto(sp.dataUrl) && !prev[sp.slotKey]) {
+                if (isPhotoConsistentWithExpendio(sp.dataUrl, expendio)) {
+                  additions[sp.slotKey] = sp.dataUrl;
+                }
               }
             }
             return Object.keys(additions).length > 0 ? { ...prev, ...additions } : prev;
@@ -469,6 +644,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     expendio?.fotoCedulaFrontalUrl,
     expendio?.fotoCedulaPosteriorUrl,
     expendio?.fotoRutUrl,
+    expendio?.revision,
   ]);
 
   // Helper to query / verify GPS permissions
@@ -556,50 +732,96 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
       const formData = new FormData();
       formData.append('cedula', expendio.cedula);
+      formData.append('expendioId', expendio.id || '');
+      formData.append('encargado', expendio.encargado || '');
+      formData.append('municipio', expendio.municipio || expendio.localidad || '');
       formData.append('photoType', photoType);
       formData.append('photo', stamped.file);
 
       try {
-        const res = await fetch('/api/expendio/upload-photo', {
+        let res = await fetch('/api/expendio/upload-photo', {
           method: 'POST',
           body: formData,
         });
 
-        const data = await res.json();
+        let data = await res.json().catch(() => ({ success: false }));
+
+        if (!res.ok || !data.success) {
+          // Fallback 1: Subida vía JSON Base64
+          const b64Res = await fetch('/api/expendio/upload-photo-base64', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              cedula: expendio.cedula,
+              expendioId: expendio.id || '',
+              encargado: expendio.encargado || '',
+              municipio: expendio.municipio || expendio.localidad || '',
+              photoType,
+              photoBase64: stamped.dataUrl,
+            }),
+          });
+          const b64Data = await b64Res.json().catch(() => ({ success: false }));
+          if (b64Res.ok && b64Data.success) {
+            res = b64Res;
+            data = b64Data;
+          } else {
+            // Fallback 2: Ruta híbrida directa
+            const hybridForm = new FormData();
+            hybridForm.append('foto', stamped.file);
+            const hybRes = await fetch(
+              `/api/photos/upload-hybrid/${encodeURIComponent(expendio.cedula)}/${encodeURIComponent(photoType)}`,
+              {
+                method: 'POST',
+                body: hybridForm,
+              }
+            );
+            const hybData = await hybRes.json().catch(() => ({ success: false }));
+            if (hybRes.ok && hybData.success) {
+              res = hybRes;
+              data = hybData;
+            }
+          }
+        }
+
         if (data.success) {
+          const todayDate = new Date().toISOString().split('T')[0];
           const updatedExpendio = data.data || data.expendio;
           if (updatedExpendio) {
-            onUpdateSessionData(updatedExpendio);
+            onUpdateSessionData({
+              ...updatedExpendio,
+              fechaUltimaActualizacion: updatedExpendio.fechaUltimaActualizacion || todayDate,
+            });
+          } else {
+            onUpdateSessionData({
+              ...expendio,
+              [photoType]: data.url || data.fileUrl || stamped.dataUrl,
+              fechaUltimaActualizacion: data.fechaUltimaActualizacion || todayDate,
+              updatedAt: data.updatedAt || new Date().toISOString(),
+            });
           }
+
+          setMsgForm2(`Borrando caché local y descargando ${slotTitle} desde el servidor para visualización...`);
+
+          // Borrar caché local al cargarse al servidor, descargar nuevamente la imagen del servidor y guardarla en caché DESPUÉS de descargarse
+          const redownloaded = await purgeCacheAndRedownloadPhotoFromServer({
+            cedula: expendio.cedula,
+            slotKey: photoType,
+            slotTitle,
+            expendioNombre: expendio.nombre || expendio.encargado,
+            municipio: expendio.municipio || expendio.localidad || 'Giron',
+            fecha: expendio.fechaUltimaActualizacion || new Date().toISOString().split('T')[0],
+            coords,
+          });
+
           setLocalPhotos((prev) => ({
             ...prev,
-            [photoType]: stamped.dataUrl || data.fileUrl || prev[photoType],
+            [photoType]: redownloaded.serverUrl || data.fileUrl || data.url || prev[photoType],
           }));
+          refreshOfflineQueue();
 
-          if (storedRecord?.id) {
-            updatePhotoRecord(storedRecord.id, {
-              serverSynced: true,
-              serverSyncedAt: new Date().toISOString(),
-            }).catch(() => {});
-          }
-
-          if (data.driveUploaded) {
-            if (storedRecord?.id) {
-              updatePhotoRecord(storedRecord.id, {
-                serverSynced: true,
-                serverSyncedAt: new Date().toISOString(),
-                driveSynced: true,
-                driveSyncedAt: new Date().toISOString(),
-                driveFileId: data.driveFileId,
-                driveWebViewLink: data.driveWebViewLink,
-                driveFolderName: data.driveFolderName || expendio.municipio || 'Giron',
-                status: 'synced',
-              }).catch(() => {});
-            }
-            setMsgForm2(`✓ Fotografía guardada y respaldada en Google Drive (Carpeta "${data.driveFolderName || expendio.municipio || 'Giron'}").`);
-          } else {
-            setMsgForm2(`✓ Fotografía (${slotTitle}) guardada en el servidor central.`);
-          }
+          setMsgForm2(
+            `✓ Fotografía (${slotTitle}) cargada con éxito. ⚡ ${stamped.compressionSummary}`
+          );
         } else {
           if (storedRecord?.id) {
             updatePhotoRecord(storedRecord.id, {
@@ -607,7 +829,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
               lastError: data.message || 'Rechazado por el servidor',
             }).catch(() => {});
           }
-          setMsgForm2(`Guardado seguro en IndexedDB (Servidor: ${data.message || 'No se pudo guardar'}).`);
+          setMsgForm2('✓ Fotografía guardada en tu teléfono. Se enviará al servidor cuando haya conexión.');
+          reportPlatformError({
+            errorCode: 'PHOTO_UPLOAD_FAILED',
+            expendio: { id: expendio.id, municipio: expendio.municipio, cedula: expendio.cedula },
+            userMessage: 'Fotografía guardada en tu teléfono. Se sincronizará automáticamente.',
+            technicalDetails: `Respuesta servidor: ${data.message || 'Error desconocido'}`,
+            category: 'FOTOS_S3',
+            severity: 'ALTO',
+          });
         }
       } catch (err: any) {
         if (storedRecord?.id) {
@@ -616,11 +846,27 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
             lastError: err.message || 'Error de red',
           }).catch(() => {});
         }
-        setMsgForm2(`✓ Fotografía protegida en IndexedDB. Se sincronizará automáticamente cuando haya red.`);
+        setMsgForm2('✓ Fotografía protegida en tu teléfono. Se sincronizará automáticamente cuando haya red.');
+        reportPlatformError({
+          errorCode: 'PHOTO_UPLOAD_FAILED',
+          expendio: { id: expendio.id, municipio: expendio.municipio, cedula: expendio.cedula },
+          userMessage: 'Fotografía guardada en tu teléfono.',
+          technicalDetails: `Error de red al subir foto: ${err?.message || 'Error desconocido'}`,
+          category: 'FOTOS_S3',
+          severity: 'MEDIO',
+        });
       }
     } catch (err: any) {
       console.error('Error subiendo foto con GPS:', err);
-      setMsgForm2(`Error procesando foto: ${err.message || 'Error de conexión'}`);
+      setMsgForm2('No se pudo procesar la foto. Por favor intenta tomarla nuevamente.');
+      reportPlatformError({
+        errorCode: 'PHOTO_FORMAT_INVALID',
+        expendio: { id: expendio.id, municipio: expendio.municipio, cedula: expendio.cedula },
+        userMessage: 'No se pudo procesar la foto.',
+        technicalDetails: `Error en compresión/estampe GPS: ${err?.message || 'Error desconocido'}`,
+        category: 'CAMARA_GPS',
+        severity: 'ALTO',
+      });
     } finally {
       setUploadingPhotoType(null);
     }
@@ -628,19 +874,20 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
   const handlePhotoCapturedFromModal = async (slotKey: string, file: File, dataUrl: string) => {
     setUploadingPhotoType(slotKey);
-    setMsgForm2(`Guardando foto de ${slotKey} en IndexedDB y servidor...`);
+    setMsgForm2('Guardando fotografía en tu dispositivo y enviando al sistema...');
 
     setLocalPhotos((prev) => ({ ...prev, [slotKey]: dataUrl }));
 
+    const todayDate = new Date().toISOString().split('T')[0];
     const isAvailabilitySlot = slotKey === 'fotoAvisoUrl' || slotKey === 'fotoBasculaUrl' || slotKey === 'fotoMataselloUrl';
-    if (isAvailabilitySlot) {
-      onUpdateSessionData({
-        ...expendio,
-        ...(slotKey === 'fotoAvisoUrl' ? { tieneAviso: 'SI', motivoFaltaAviso: '', fotoAvisoUrl: dataUrl, letreroUrl: dataUrl } : {}),
-        ...(slotKey === 'fotoBasculaUrl' ? { tieneBascula: 'SI', motivoFaltaBascula: '', fotoBasculaUrl: dataUrl, basculaUrl: dataUrl } : {}),
-        ...(slotKey === 'fotoMataselloUrl' ? { tieneMatasello: 'SI', motivoFaltaMatasello: '', fotoMataselloUrl: dataUrl, mataselloUrl: dataUrl } : {}),
-      });
-    }
+    onUpdateSessionData({
+      ...expendio,
+      [slotKey]: dataUrl,
+      fechaUltimaActualizacion: todayDate,
+      ...(isAvailabilitySlot && slotKey === 'fotoAvisoUrl' ? { tieneAviso: 'SI', motivoFaltaAviso: '', fotoAvisoUrl: dataUrl, letreroUrl: dataUrl } : {}),
+      ...(isAvailabilitySlot && slotKey === 'fotoBasculaUrl' ? { tieneBascula: 'SI', motivoFaltaBascula: '', fotoBasculaUrl: dataUrl, basculaUrl: dataUrl } : {}),
+      ...(isAvailabilitySlot && slotKey === 'fotoMataselloUrl' ? { tieneMatasello: 'SI', motivoFaltaMatasello: '', fotoMataselloUrl: dataUrl, mataselloUrl: dataUrl } : {}),
+    });
 
     // 1. Guardar de inmediato en IndexedDB
     let storedRecord: StoredPhotoRecord | null = null;
@@ -666,46 +913,81 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       formData.append('photoType', slotKey);
       formData.append('photo', file);
 
-      const res = await fetch('/api/expendio/upload-photo', {
+      let res = await fetch('/api/expendio/upload-photo', {
         method: 'POST',
         body: formData,
       });
 
-      const data = await res.json();
+      let data = await res.json().catch(() => ({ success: false }));
+
+      if (!res.ok || !data.success) {
+        const b64Res = await fetch('/api/expendio/upload-photo-base64', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cedula: expendio.cedula,
+            photoType: slotKey,
+            photoBase64: dataUrl,
+          }),
+        });
+        const b64Data = await b64Res.json().catch(() => ({ success: false }));
+        if (b64Res.ok && b64Data.success) {
+          res = b64Res;
+          data = b64Data;
+        } else {
+          const hybridForm = new FormData();
+          hybridForm.append('foto', file);
+          const hybRes = await fetch(
+            `/api/photos/upload-hybrid/${encodeURIComponent(expendio.cedula)}/${encodeURIComponent(slotKey)}`,
+            {
+              method: 'POST',
+              body: hybridForm,
+            }
+          );
+          const hybData = await hybRes.json().catch(() => ({ success: false }));
+          if (hybRes.ok && hybData.success) {
+            res = hybRes;
+            data = hybData;
+          }
+        }
+      }
+
       if (data.success) {
         const updatedExpendio = data.data || data.expendio;
         if (updatedExpendio) {
-          onUpdateSessionData(updatedExpendio);
+          onUpdateSessionData({
+            ...updatedExpendio,
+            fechaUltimaActualizacion: updatedExpendio.fechaUltimaActualizacion || todayDate,
+          });
+        } else {
+          onUpdateSessionData({
+            ...expendio,
+            [slotKey]: data.url || data.fileUrl || dataUrl,
+            fechaUltimaActualizacion: data.fechaUltimaActualizacion || todayDate,
+            updatedAt: data.updatedAt || new Date().toISOString(),
+          });
         }
+
+        setMsgForm2(`Borrando caché local y descargando foto desde el servidor para visualización...`);
+
+        // Borrar caché local al cargarse al servidor, descargar nuevamente la imagen del servidor y guardarla en caché DESPUÉS de descargarse
+        const redownloaded = await purgeCacheAndRedownloadPhotoFromServer({
+          cedula: expendio.cedula,
+          slotKey,
+          slotTitle: slotKey,
+          expendioNombre: expendio.nombre || expendio.encargado,
+          municipio: expendio.municipio || expendio.localidad || 'Giron',
+          fecha: expendio.fechaUltimaActualizacion || new Date().toISOString().split('T')[0],
+          coords: globalCoords,
+        });
+
         setLocalPhotos((prev) => ({
           ...prev,
-          [slotKey]: data.fileUrl || prev[slotKey],
+          [slotKey]: redownloaded.serverUrl || data.fileUrl || data.url || prev[slotKey],
         }));
+        refreshOfflineQueue();
 
-        if (storedRecord?.id) {
-          updatePhotoRecord(storedRecord.id, {
-            serverSynced: true,
-            serverSyncedAt: new Date().toISOString(),
-          }).catch(() => {});
-        }
-
-        if (data.driveUploaded) {
-          if (storedRecord?.id) {
-            updatePhotoRecord(storedRecord.id, {
-              serverSynced: true,
-              serverSyncedAt: new Date().toISOString(),
-              driveSynced: true,
-              driveSyncedAt: new Date().toISOString(),
-              driveFileId: data.driveFileId,
-              driveWebViewLink: data.driveWebViewLink,
-              driveFolderName: data.driveFolderName || expendio.municipio || 'Giron',
-              status: 'synced',
-            }).catch(() => {});
-          }
-          setMsgForm2(`✓ Fotografía guardada y respaldada en Google Drive (Carpeta "${data.driveFolderName || expendio.municipio || 'Giron'}").`);
-        } else {
-          setMsgForm2(`✓ Fotografía guardada en el servidor central.`);
-        }
+        setMsgForm2(`✓ Fotografía cargada al servidor, descargada para visualización y almacenada en caché.`);
       } else {
         if (storedRecord?.id) {
           updatePhotoRecord(storedRecord.id, {
@@ -713,7 +995,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
             lastError: data.message || 'Rechazado por el servidor',
           }).catch(() => {});
         }
-        setMsgForm2(`Foto protegida en IndexedDB (Servidor: ${data.message || 'No se pudo guardar'}).`);
+        setMsgForm2('✓ Fotografía guardada en tu teléfono. Se sincronizará con el sistema al conectarse.');
+        reportPlatformError({
+          errorCode: 'PHOTO_UPLOAD_FAILED',
+          expendio: { id: expendio.id, municipio: expendio.municipio, cedula: expendio.cedula },
+          userMessage: 'Foto guardada en el teléfono.',
+          technicalDetails: `Servidor rechazó subida: ${data.message || 'Error'}`,
+          category: 'FOTOS_S3',
+          severity: 'ALTO',
+        });
       }
     } catch (err: any) {
       console.error('Error en carga de foto:', err);
@@ -723,7 +1013,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
           lastError: err.message || 'Error de red',
         }).catch(() => {});
       }
-      setMsgForm2(`✓ Fotografía guardada de forma segura en IndexedDB. Se sincronizará cuando haya conexión.`);
+      setMsgForm2('✓ Fotografía guardada de forma segura en tu teléfono. Se sincronizará cuando haya conexión.');
+      reportPlatformError({
+        errorCode: 'PHOTO_UPLOAD_FAILED',
+        expendio: { id: expendio.id, municipio: expendio.municipio, cedula: expendio.cedula },
+        userMessage: 'Fotografía guardada en el teléfono.',
+        technicalDetails: `Error de red modal upload: ${err?.message || 'Error'}`,
+        category: 'FOTOS_S3',
+        severity: 'MEDIO',
+      });
     } finally {
       setUploadingPhotoType(null);
     }
@@ -735,7 +1033,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       // Intentar primero /api/config y fallback a /api/system/config (con cache buster)
       let dataConfig: any = null;
       try {
-        const resConfig = await fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store' });
+        const resConfig = await fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store',  });
         if (resConfig.ok) {
           dataConfig = await resConfig.json();
         }
@@ -743,7 +1041,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
         // Fallback
       }
       if (!dataConfig?.success) {
-        const resConfig2 = await fetch(`/api/system/config?_t=${Date.now()}`, { cache: 'no-store' });
+        const resConfig2 = await fetch(`/api/system/config?_t=${Date.now()}`, { cache: 'no-store',  });
         if (resConfig2.ok) {
           dataConfig = await resConfig2.json();
         }
@@ -752,22 +1050,45 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       if (dataConfig?.success && dataConfig.data) {
         setSystemConfig(dataConfig.data);
         if (dataConfig.data.periodoHabilitadoDescarga) {
-          const parts = dataConfig.data.periodoHabilitadoDescarga.trim().split(/\s+/);
-          if (parts.length >= 2) {
-            const nextMes = parts[0].toUpperCase();
-            const nextAnio = parts[1];
-            setMesPeriodo((prev) => (prev === nextMes ? prev : nextMes));
-            setAnioPeriodo((prev) => (prev === nextAnio ? prev : nextAnio));
-          } else if (parts.length === 1) {
-            const nextMes = parts[0].toUpperCase();
-            setMesPeriodo((prev) => (prev === nextMes ? prev : nextMes));
+          const raw = dataConfig.data.periodoHabilitadoDescarga.trim();
+          let parsedMes = '';
+          let parsedAnio = '';
+          
+          const matchYyyyMm = raw.match(/^(\d{4})-(\d{2})$/);
+          if (matchYyyyMm) {
+            const y = matchYyyyMm[1];
+            const m = matchYyyyMm[2];
+            const months = [
+              'ENERO', 'FEBRERO', 'MARZO', 'ABRIL', 'MAYO', 'JUNIO',
+              'JULIO', 'AGOSTO', 'SEPTIEMBRE', 'OCTUBRE', 'NOVIEMBRE', 'DICIEMBRE'
+            ];
+            const monthIdx = parseInt(m, 10) - 1;
+            if (monthIdx >= 0 && monthIdx < 12) {
+              parsedMes = months[monthIdx];
+              parsedAnio = y;
+            }
+          } else {
+            const parts = raw.split(/\s+/);
+            if (parts.length >= 2) {
+              parsedMes = parts[0].toUpperCase();
+              parsedAnio = parts[1];
+            } else if (parts.length === 1) {
+              parsedMes = parts[0].toUpperCase();
+            }
+          }
+          
+          if (parsedMes) {
+            setMesPeriodo((prev) => (prev === parsedMes ? prev : parsedMes));
+          }
+          if (parsedAnio) {
+            setAnioPeriodo((prev) => (prev === parsedAnio ? prev : parsedAnio));
           }
         }
       }
 
       // Cuentas cargadas del expendio
       if (!expendio?.cedula) return;
-      const resCuentasCargadas = await fetch(`/api/cuentas-cargadas?cedula=${encodeURIComponent(expendio.cedula)}&_t=${Date.now()}`, { cache: 'no-store' });
+      const resCuentasCargadas = await fetch(`/api/cuentas-cargadas?cedula=${encodeURIComponent(expendio.cedula)}&_t=${Date.now()}`, { cache: 'no-store',  });
       if (resCuentasCargadas.ok) {
         const dataCuentasCargadas = await resCuentasCargadas.json();
         if (dataCuentasCargadas.success && Array.isArray(dataCuentasCargadas.data)) {
@@ -791,12 +1112,10 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
     window.addEventListener('focus', handleFocus);
     window.addEventListener('configUpdated', handleConfigEvent);
-    const interval = setInterval(fetchConfigAndCuentas, 15000);
 
     return () => {
       window.removeEventListener('focus', handleFocus);
       window.removeEventListener('configUpdated', handleConfigEvent);
-      clearInterval(interval);
     };
   }, [expendio?.cedula]);
 
@@ -808,7 +1127,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     setCuentaGenerada({ checked: false, generada: false });
 
     try {
-      const res = await fetch(`/api/expendio/cuenta-cobro?cedula=${encodeURIComponent(expendio.cedula)}&periodo=${encodeURIComponent(periodoBusqueda)}&_t=${Date.now()}`, { cache: 'no-store' });
+      const res = await fetch(`/api/expendio/cuenta-cobro?cedula=${encodeURIComponent(expendio.cedula)}&periodo=${encodeURIComponent(periodoBusqueda)}&_t=${Date.now()}`, { cache: 'no-store',  });
       const data = await res.json();
 
       if (data.success && data.data && data.generada !== false) {
@@ -843,7 +1162,29 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
   const selectedPeriodStr = `${mesPeriodo.trim().toUpperCase()} ${anioPeriodo.trim()}`;
   const periodoHabilitadoStr = systemConfig?.periodoHabilitadoDescarga?.trim().toUpperCase() || 'FEBRERO 2026';
-  const isPeriodoHabilitadoParaDescarga = selectedPeriodStr === periodoHabilitadoStr;
+
+  const normalizePeriodStr = (p: string) => {
+    if (!p) return '';
+    const clean = p.trim().toUpperCase();
+    if (/^\d{4}-\d{2}$/.test(clean)) {
+      return clean;
+    }
+    const parts = clean.split(/\s+/);
+    if (parts.length >= 2) {
+      const months = [
+        'ENERO', 'FEBRERO', 'MARZO', 'ABRIL', 'MAYO', 'JUNIO',
+        'JULIO', 'AGOSTO', 'SEPTIEMBRE', 'OCTUBRE', 'NOVIEMBRE', 'DICIEMBRE'
+      ];
+      const mIdx = months.indexOf(parts[0]);
+      if (mIdx !== -1) {
+        const mm = String(mIdx + 1).padStart(2, '0');
+        return `${parts[1]}-${mm}`;
+      }
+    }
+    return clean;
+  };
+
+  const isPeriodoHabilitadoParaDescarga = normalizePeriodStr(selectedPeriodStr) === normalizePeriodStr(periodoHabilitadoStr);
 
   // Handler Form 1: Save Contact & Bank Info
   const handleSaveContact = async (e: React.FormEvent) => {
@@ -856,7 +1197,7 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     try {
       const res = await fetch('/api/expendio/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', },
         body: JSON.stringify({
           cedula: expendio.cedula,
           encargado: encargado.toUpperCase(),
@@ -872,15 +1213,15 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
       const data = await res.json();
       if (data.success) {
+        try {
+          const prevRaw = localStorage.getItem(localDraftKey);
+          const prevParsed = prevRaw ? JSON.parse(prevRaw) : {};
+          localStorage.setItem(localDraftKey, JSON.stringify({ ...prevParsed, pendingSync: false }));
+          setHasPendingOfflineData(false);
+        } catch {}
         setMsgForm1('✓ Datos de contacto y cuenta bancaria actualizados correctamente en MAYÚSCULAS.');
         onUpdateSessionData(data.data);
 
-        // Sincronizar actualización directamente a Google Sheets
-        getAccessToken().then((token) => {
-          if (token && data.data) {
-            updateSingleExpendioInGoogleSheets(token, data.data).catch(() => {});
-          }
-        }).catch(() => {});
 
         if (fotosCargadasCount < 7) {
           setAccordionState({ modulo1: false, modulo2: true, modulo3: false, modulo4: false });
@@ -890,7 +1231,44 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       }
     } catch (err) {
       console.error('Error guardando formulario 1:', err);
-      setMsgForm1('Error de conexión al guardar cambios.');
+      // Preservar avance localmente en el teléfono para no perder lo escrito si se cayó el internet
+      try {
+        const nowTime = new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' });
+        localStorage.setItem(
+          localDraftKey,
+          JSON.stringify({
+            cedula: expendio.cedula,
+            encargado: encargado.toUpperCase(),
+            direccionPunto: direccionPunto.toUpperCase(),
+            telefonoPunto: telefonoPunto.toUpperCase(),
+            cuentaBancaria: cuentaBancaria.toUpperCase(),
+            banco: finalBanco,
+            correoElectronico: correoElectronico.toUpperCase(),
+            observaciones: (observaciones || '').toUpperCase(),
+            savedAtTime: nowTime,
+            pendingSync: true,
+          })
+        );
+        setHasPendingOfflineData(true);
+      } catch {}
+      onUpdateSessionData({
+        ...expendio,
+        encargado: encargado.toUpperCase(),
+        direccionPunto: direccionPunto.toUpperCase(),
+        telefonoPunto: telefonoPunto.toUpperCase(),
+        cuentaBancaria: cuentaBancaria.toUpperCase(),
+        banco: finalBanco,
+        correoElectronico: correoElectronico.toUpperCase(),
+        observaciones: (observaciones || '').toUpperCase(),
+        primeraVezActualizado: true,
+        fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+      });
+      setMsgForm1(
+        '💾 Señal inestable: Tus datos quedaron autoguardados en tu teléfono y se sincronizarán automáticamente apenas vuelva el internet.'
+      );
+      if (fotosCargadasCount < 7) {
+        setAccordionState({ modulo1: false, modulo2: true, modulo3: false, modulo4: false });
+      }
     } finally {
       setSavingForm1(false);
     }
@@ -899,8 +1277,8 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
   // Handler First Login Modal: Mandatory Initial Data Update
   const handleSaveFirstLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!encargado.trim() || !cedulaInput.trim() || !direccionPunto.trim() || !telefonoPunto.trim() || !cuentaBancaria.trim() || !correoElectronico.trim()) {
-      setMsgFirstLogin('Por favor complete todos los 6 campos requeridos.');
+    if (!encargado.trim() || !direccionPunto.trim() || !telefonoPunto.trim() || !cuentaBancaria.trim() || !correoElectronico.trim()) {
+      setMsgFirstLogin('Por favor complete todos los campos requeridos.');
       return;
     }
 
@@ -917,11 +1295,10 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     try {
       const res = await fetch('/api/expendio/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', },
         body: JSON.stringify({
           cedula: expendio.cedula,
           encargado: encargado.toUpperCase(),
-          cedulaNueva: cedulaInput.toUpperCase(),
           direccionPunto: direccionPunto.toUpperCase(),
           telefonoPunto: telefonoPunto.toUpperCase(),
           cuentaBancaria: cuentaBancaria.toUpperCase(),
@@ -934,6 +1311,12 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
 
       const data = await res.json();
       if (data.success) {
+        try {
+          const prevRaw = localStorage.getItem(localDraftKey);
+          const prevParsed = prevRaw ? JSON.parse(prevRaw) : {};
+          localStorage.setItem(localDraftKey, JSON.stringify({ ...prevParsed, pendingSync: false }));
+          setHasPendingOfflineData(false);
+        } catch {}
         onUpdateSessionData(data.data);
         setShowFirstLoginModal(false);
         try {
@@ -943,12 +1326,6 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
         } catch {}
         setMsgForm1('✓ Actualización inicial completada con éxito. Ahora procede con el Registro Fotográfico obligatorio.');
         
-        // Sincronizar primera actualización directamente a Google Sheets
-        getAccessToken().then((token) => {
-          if (token && data.data) {
-            updateSingleExpendioInGoogleSheets(token, data.data).catch(() => {});
-          }
-        }).catch(() => {});
 
         setAccordionState({ modulo1: false, modulo2: true, modulo3: false, modulo4: false });
       } else {
@@ -956,7 +1333,42 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
       }
     } catch (err) {
       console.error('Error guardando primer inicio de sesión:', err);
-      setMsgFirstLogin('Error de conexión con el servidor.');
+      try {
+        const nowTime = new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' });
+        localStorage.setItem(
+          localDraftKey,
+          JSON.stringify({
+            cedula: expendio.cedula,
+            encargado: encargado.toUpperCase(),
+            direccionPunto: direccionPunto.toUpperCase(),
+            telefonoPunto: telefonoPunto.toUpperCase(),
+            cuentaBancaria: cuentaBancaria.toUpperCase(),
+            banco: finalBanco,
+            correoElectronico: correoElectronico.toUpperCase(),
+            observaciones: (observaciones || '').toUpperCase(),
+            savedAtTime: nowTime,
+            pendingSync: true,
+          })
+        );
+        setHasPendingOfflineData(true);
+      } catch {}
+      onUpdateSessionData({
+        ...expendio,
+        encargado: encargado.toUpperCase(),
+        direccionPunto: direccionPunto.toUpperCase(),
+        telefonoPunto: telefonoPunto.toUpperCase(),
+        cuentaBancaria: cuentaBancaria.toUpperCase(),
+        banco: finalBanco,
+        correoElectronico: correoElectronico.toUpperCase(),
+        observaciones: (observaciones || '').toUpperCase(),
+        primeraVezActualizado: true,
+        fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+      });
+      setShowFirstLoginModal(false);
+      setMsgForm1(
+        '💾 Tus datos quedaron autoguardados en tu teléfono (sin conexión temporal) y se enviarán automáticamente cuando regrese la señal.'
+      );
+      setAccordionState({ modulo1: false, modulo2: true, modulo3: false, modulo4: false });
     } finally {
       setSavingFirstLogin(false);
     }
@@ -1014,31 +1426,46 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
     }
   };
 
-  // Construct mock/real CuentaCobroResult for Document modal view
-  const docResultData: CuentaCobroResult = cuentaGenerada.data || {
-    id: 'preview',
-    encargado: expendio.encargado,
-    expendio: expendio.municipio,
-    cargoBasico: 350000,
-    admisionSipost: 0,
-    valorVariable: 0,
-    pagoTotal: 350000,
-    retef1: 0,
-    valorNeto: 350000,
-    cedula: expendio.cedula,
-    nombre: expendio.encargado,
-    municipio: expendio.municipio,
-    periodo: selectedPeriodStr,
-    concepto: `Servicios de expendio postal 4-72 en el punto ${expendio.localidad || expendio.municipio}`,
-    valorBruto: 350000,
-    porcentajeRetefuente: 6,
-    retefuente: 21000,
-    porcentajeReteica: 0.966,
-    reteica: 3381,
-    netoPagar: 325619,
-    banco: expendio.banco || 'NEQUI',
-    cuentaBancaria: expendio.cuentaBancaria || expendio.telefonoPunto,
-    fechaGeneracion: new Date().toISOString().split('T')[0],
+  // Construct dynamic CuentaCobroResult for Document modal view strictly from generated cuenta data
+  const dCuenta = (cuentaGenerada.data || {}) as any;
+  const baseVal = Number(dCuenta.cargoBasico ?? dCuenta.valorBase ?? 0) || 0;
+  const sipostVal = Number(dCuenta.admisionSipost ?? 0) || 0;
+  const varVal = Number(dCuenta.valorVariable ?? 0) || 0;
+  const totalVal = Number(dCuenta.pagoTotal ?? dCuenta.valorBruto) || (baseVal + sipostVal + varVal);
+  const retefVal = Number(dCuenta.retef1 ?? dCuenta.retencionValor ?? dCuenta.retefuente) || Math.round(totalVal * 0.01);
+  const netoVal = Number(dCuenta.valorNeto ?? dCuenta.netoPagar) || (totalVal - retefVal);
+
+  const docResultData: CuentaCobroResult = {
+    ...(cuentaGenerada.data || {}),
+    id: dCuenta.id || `preview_${expendio.id}`,
+    encargado: dCuenta.encargado || expendio.encargado,
+    expendio: dCuenta.expendio || expendio.municipio,
+    cargoBasico: baseVal,
+    valorBase: baseVal,
+    admisionSipost: sipostVal,
+    valorVariable: varVal,
+    pagoTotal: totalVal,
+    retef1: retefVal,
+    retencionValor: retefVal,
+    valorNeto: netoVal,
+    cedula: dCuenta.cedula || expendio.cedula,
+    nombre: dCuenta.nombre || dCuenta.encargado || expendio.encargado,
+    municipio: dCuenta.municipio || expendio.municipio,
+    centroOperativo: dCuenta.centroOperativo || expendio.centroOperativo || '',
+    centroAcopio: dCuenta.centroAcopio || expendio.centroAcopio || expendio.municipio || '',
+    direccion: dCuenta.direccion || expendio.direccionPunto || '',
+    telefono: dCuenta.telefono || expendio.telefonoPunto || '',
+    periodo: dCuenta.periodo || selectedPeriodStr,
+    concepto: dCuenta.concepto || `Servicios de expendio postal 4-72 en el punto ${expendio.localidad || expendio.municipio}`,
+    valorBruto: totalVal,
+    porcentajeRetefuente: Number(dCuenta.porcentajeRetefuente ?? dCuenta.porcentajeRetencion ?? 1),
+    retefuente: retefVal,
+    porcentajeReteica: 0,
+    reteica: 0,
+    netoPagar: netoVal,
+    banco: dCuenta.banco || expendio.banco || '',
+    cuentaBancaria: dCuenta.cuentaBancaria || expendio.cuentaBancaria || '',
+    fechaGeneracion: dCuenta.fechaGeneracion || dCuenta.fechaEmision || new Date().toISOString().split('T')[0],
   };
 
   return (
@@ -1059,6 +1486,8 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
         activeAccordion={accordionState}
         onOpenStep={handleOpenStep}
         isLight={isLight}
+        lastLocalSaveTime={lastLocalSaveTime}
+        hasPendingOfflineData={hasPendingOfflineData}
       />
 
       {/* 3. ACCORDION SECTIONS */}
@@ -1148,6 +1577,8 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
                 uploadingContract={uploadingContract}
                 msgForm3={msgForm3}
                 isLight={isLight}
+                lastLocalSaveTime={lastLocalSaveTime}
+                hasPendingOfflineData={hasPendingOfflineData}
               />
             </div>
           )}
@@ -1212,7 +1643,9 @@ export const ExpendioPanel: React.FC<ExpendioPanelProps> = ({
                 uploadingPhotoType={uploadingPhotoType}
                 onOpenGpsCamera={handleOpenGpsCamera}
                 onUploadPhotoWithGps={handlePhotoUploadWithGps}
-                onViewPhotoDetail={(photo) => setViewingPhotoDetail(photo)}
+                onViewPhotoDetail={(photo) => {
+                  setViewingPhotoDetail(photo);
+                }}
                 onRequestGpsPermission={requestGpsPermission}
                 isRequestingGps={isRequestingGps}
                 gpsStatusMsg={gpsStatusMsg}

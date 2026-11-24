@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+.aistudio/
+data/
+database/
+uploads/
+public/assets/aistudio/
+spa.traineddata
+*.zip
+*.tar.gz
+*.tmp

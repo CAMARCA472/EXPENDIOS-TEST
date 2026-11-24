@@ -1,5 +1,6 @@
 import jsPDF from 'jspdf';
 import { ExpendioData } from '../types';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 
 /**
  * Genera el documento oficial de "HORARIO DE ATENCIÓN EXPENDIO 4-72"
@@ -105,7 +106,7 @@ export async function generateHorarioAtencionPDF(expendio: ExpendioData): Promis
   // --- CUERPO PRINCIPAL (AMPLIADO Y DESTACADO PARA TAMAÑO CARTA) ---
   // Título "EXPENDIO 4-72" agrandado y con gran impacto visual
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(44);
+  doc.setFontSize(48);
   doc.setTextColor(10, 37, 85);
   doc.text('EXPENDIO 4-72', pageWidth / 2, 49, { align: 'center' });
 
@@ -118,36 +119,36 @@ export async function generateHorarioAtencionPDF(expendio: ExpendioData): Promis
     .join(' ');
 
   doc.setFont('times', 'normal');
-  doc.setFontSize(38);
+  doc.setFontSize(42);
   doc.setTextColor(10, 37, 85);
   doc.text(`Municipio ${formattedMunicipio}`, pageWidth / 2, 68, { align: 'center' });
 
   // Subtítulo "Horario de Atención" con peso visual
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(42);
+  doc.setFontSize(46);
   doc.setTextColor(10, 37, 85);
   doc.text('Horario de Atención', pageWidth / 2, 94, { align: 'center' });
 
   // Franja "LUNES A VIERNES"
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
+  doc.setFontSize(24);
   doc.setTextColor(10, 37, 85);
   doc.text('LUNES A VIERNES', pageWidth / 2, 114, { align: 'center' });
 
   // Horas L-V ampliadas para máxima legibilidad
   doc.setFont('times', 'normal');
-  doc.setFontSize(27);
+  doc.setFontSize(32);
   doc.text('8 a.m. a 12 m.', pageWidth / 2, 126, { align: 'center' });
   doc.text('2 p.m. a 6 p.m.', pageWidth / 2, 139, { align: 'center' });
 
   // Franja "SÁBADOS"
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
+  doc.setFontSize(24);
   doc.text('SÁBADOS', pageWidth / 2, 156, { align: 'center' });
 
   // Horas Sábado
   doc.setFont('times', 'normal');
-  doc.setFontSize(27);
+  doc.setFontSize(32);
   doc.text('8 a.m. a 12 m.', pageWidth / 2, 168, { align: 'center' });
 
   // Línea sólida de base centrada
@@ -260,45 +261,51 @@ export async function generateAviso472PDF(expendio: ExpendioData): Promise<void>
   doc.rect(pageWidth - 30, pageHeight - 10, 15, 8, 'F');
 
   // --- SECCIÓN SUPERIOR: LOGO Y PUNTO DE VENTA ---
-  // Chevrons « y »
+  // El centro de la sección izquierda (entre el borde 14 y la línea de división 146) es 80
+  const leftColumnCenter = 80;
+
+  // 4-72 en azul marino de gran tamaño (de 54 a 68) y centrado perfectamente en la sección izquierda
+  doc.setTextColor(10, 45, 115);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(68);
+  doc.text('4-72', leftColumnCenter, 78, { align: 'center' });
+
+  // Chevrons « y » agrandados (de 44 a 58) posicionados simétricamente con respecto a '4-72'
   // Chevron amarillo izquierdo «
   doc.setTextColor(245, 197, 24);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(44);
-  doc.text('«', 36, 75);
-
-  // 4-72 en azul marino de gran tamaño
-  doc.setTextColor(10, 45, 115);
-  doc.setFontSize(54);
-  doc.text('4-72', 54, 76);
+  doc.setFontSize(58);
+  doc.text('«', leftColumnCenter - 34, 77, { align: 'center' });
 
   // Chevron rojo derecho »
   doc.setTextColor(218, 37, 28);
-  doc.setFontSize(44);
-  doc.text('»', 114, 75);
+  doc.text('»', leftColumnCenter + 34, 77, { align: 'center' });
 
   // Línea divisoria vertical amarilla
   doc.setDrawColor(245, 197, 24);
   doc.setLineWidth(1.6);
   doc.line(146, 36, 146, 118);
 
-  // Texto PUNTO DE VENTA
+  // El centro de la sección derecha (entre la línea de división 146 y el margen derecho ~283) es 214.5
+  const rightColumnCenter = 214.5;
+
+  // Texto PUNTO DE VENTA agrandado (de 30 a 38) y centrado perfectamente en la sección derecha
   doc.setTextColor(10, 45, 115);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(30);
-  doc.text('PUNTO DE VENTA', 156, 55);
+  doc.setFontSize(38);
+  doc.text('PUNTO DE VENTA', rightColumnCenter, 56, { align: 'center' });
 
-  // Texto SERVICIOS POSTALES
-  doc.setFontSize(14);
-  doc.text('SERVICIOS POSTALES', 170, 72);
+  // Texto SERVICIOS POSTALES agrandado (de 14 a 18) y centrado perfectamente
+  doc.setFontSize(18);
+  doc.text('SERVICIOS POSTALES', rightColumnCenter, 74, { align: 'center' });
 
-  // Barra tricolor centrada
+  // Barra tricolor centrada de forma impecable en la columna derecha
+  // Ancho total = 14 + 16 + 14 = 44 mm. Punto de partida = 214.5 - 22 = 192.5 mm.
   doc.setFillColor(245, 197, 24); // Amarillo
-  doc.rect(173, 85, 14, 3.5, 'F');
+  doc.rect(192.5, 87, 14, 3.5, 'F');
   doc.setFillColor(14, 88, 189); // Azul
-  doc.rect(187, 85, 16, 3.5, 'F');
+  doc.rect(206.5, 87, 16, 3.5, 'F');
   doc.setFillColor(218, 37, 28); // Rojo
-  doc.rect(203, 85, 14, 3.5, 'F');
+  doc.rect(222.5, 87, 14, 3.5, 'F');
 
   // --- SECCIÓN INFERIOR: EXPENDIO ---
   doc.setFont('helvetica', 'bold');
@@ -316,8 +323,19 @@ export async function generateAviso472PDF(expendio: ExpendioData): Promise<void>
   const munNombre = (expendio.municipio && expendio.municipio.toUpperCase() !== rawNombre) ? ` - ${expendio.municipio.toUpperCase()}` : '';
   const expendioCompleto = `${rawNombre}${munNombre}`;
 
+  // Cálculo de tamaño dinámico inteligente para que el nombre del expendio sea de tamaño gigante (hasta 32)
+  // pero se auto-ajuste para no sobrepasar el ancho físico de la línea (evitando que se salga de la hoja)
+  let nameFontSize = 32;
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
+  doc.setFontSize(nameFontSize);
+  
+  const maxWidth = (pageWidth - 32) - 88; // 265 - 88 = 177 mm
+  let textWidth = doc.getTextWidth(expendioCompleto);
+  if (textWidth > maxWidth) {
+    nameFontSize = Math.max(16, Math.floor(nameFontSize * (maxWidth / textWidth)));
+    doc.setFontSize(nameFontSize);
+  }
+
   doc.setTextColor(10, 45, 115);
   doc.text(expendioCompleto, 88, 153);
 
@@ -334,7 +352,216 @@ export async function generateAviso472PDF(expendio: ExpendioData): Promise<void>
  * - Páginas 1 a 12: Cláusulas PRIMERA a TRIGÉSIMA SEGUNDA completas y exactas
  * - Página 13: Bloque de firmas oficial con MAURICIO PARDO MESA y datos del CONTRATISTA
  */
-export async function generateContratoServiciosPDF(expendio: ExpendioData): Promise<void> {
+export async function generateContratoServiciosPDF(expendio: ExpendioData, archivoUrl?: string): Promise<void> {
+  const contratistaNombre = (expendio.encargado || 'CONTRATISTA AUTORIZADO').toUpperCase().trim();
+  const contratistaCedula = (expendio.cedula || 'SIN CÉDULA').toUpperCase().trim();
+  const contratistaMunicipio = (expendio.municipio || expendio.localidad || 'SANTANDER').toUpperCase().trim();
+  const contratistaTelefono = (expendio.telefonoPunto || '').toUpperCase().trim();
+  const contratistaDireccion = (expendio.direccionPunto || '').toUpperCase().trim();
+
+  if (archivoUrl) {
+    try {
+      console.log('[Contrato-Personalización] Descargando modelo original de contrato:', archivoUrl);
+      const token =
+        (typeof window !== 'undefined' &&
+          (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) ||
+        '';
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      const res = await fetch(archivoUrl, { headers });
+      if (!res.ok) throw new Error(`HTTP ${res.status} al descargar el modelo del contrato.`);
+      const arrayBuffer = await res.arrayBuffer();
+
+      // CASO 1: Archivo Microsoft Word (.docx)
+      const isDocx =
+        archivoUrl.toLowerCase().includes('.docx') ||
+        archivoUrl.toLowerCase().endsWith('.docx');
+      if (isDocx) {
+        const JSZip = (await import('jszip')).default;
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        const docXmlFile = zip.file('word/document.xml');
+        if (docXmlFile) {
+          let xmlContent = await docXmlFile.async('string');
+
+          // Reemplazo exacto de campos: nombre, dirección y ciudad
+          xmlContent = xmlContent
+            .replace(/\[\s*NOMBRE\s*\]/gi, contratistaNombre)
+            .replace(/\[\s*NOMBRE\s+DEL\s+CONTRATISTA\s*\]/gi, contratistaNombre)
+            .replace(/\[\s*CONTRATISTA\s*\]/gi, contratistaNombre)
+            .replace(/\{\{\s*NOMBRE\s*\}\}/gi, contratistaNombre)
+            .replace(/\{\{\s*CONTRATISTA\s*\}\}/gi, contratistaNombre)
+            .replace(/\[\s*DIRECCI[ÓO]N\s*\]/gi, contratistaDireccion)
+            .replace(/\[\s*DIRECCI[ÓO]N\s+DEL\s+EXPENDIO\s*\]/gi, contratistaDireccion)
+            .replace(/\{\{\s*DIRECCI[ÓO]N\s*\}\}/gi, contratistaDireccion)
+            .replace(/\{\{\s*DIRECCION\s*\}\}/gi, contratistaDireccion)
+            .replace(/\[\s*CIUDAD\s*\]/gi, contratistaMunicipio)
+            .replace(/\[\s*MUNICIPIO\s*\]/gi, contratistaMunicipio)
+            .replace(/\{\{\s*CIUDAD\s*\}\}/gi, contratistaMunicipio)
+            .replace(/\{\{\s*MUNICIPIO\s*\}\}/gi, contratistaMunicipio)
+            .replace(/\[\s*C[ÉE]DULA\s*\]/gi, contratistaCedula)
+            .replace(/\{\{\s*C[ÉE]DULA\s*\}\}/gi, contratistaCedula)
+            .replace(/\[\s*TEL[ÉE]FONO\s*\]/gi, contratistaTelefono)
+            .replace(/\{\{\s*TEL[ÉE]FONO\s*\}\}/gi, contratistaTelefono);
+
+          zip.file('word/document.xml', xmlContent);
+          const outBlob = await zip.generateAsync({
+            type: 'blob',
+            mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          });
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(outBlob);
+          const safeName = contratistaMunicipio.replace(/[^A-Za-z0-9]/g, '_');
+          link.download = `Contrato_Prestacion_Servicios_${safeName}_${contratistaCedula}.docx`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(link.href);
+          return;
+        }
+      }
+
+      // CASO 2: Archivo PDF (.pdf) - TAL CUAL COMO SE SUBE EL MODELO
+      const pdfDoc = await PDFDocument.load(arrayBuffer);
+
+      // Intentar rellenar campos de formulario interactivo si existen
+      let filledInteractive = false;
+      try {
+        const form = pdfDoc.getForm();
+        if (form) {
+          const fields = form.getFields();
+          fields.forEach((field) => {
+            const name = field.getName().toLowerCase();
+            if (
+              name.includes('nombre') ||
+              name.includes('contratista') ||
+              name.includes('name') ||
+              name.includes('representante')
+            ) {
+              try {
+                form.getTextField(field.getName()).setText(contratistaNombre);
+                filledInteractive = true;
+              } catch {}
+            } else if (
+              name.includes('direccion') ||
+              name.includes('dirección') ||
+              name.includes('address') ||
+              name.includes('domicilio')
+            ) {
+              try {
+                form.getTextField(field.getName()).setText(contratistaDireccion);
+                filledInteractive = true;
+              } catch {}
+            } else if (
+              name.includes('ciudad') ||
+              name.includes('municipio') ||
+              name.includes('city') ||
+              name.includes('localidad')
+            ) {
+              try {
+                form.getTextField(field.getName()).setText(contratistaMunicipio);
+                filledInteractive = true;
+              } catch {}
+            } else if (
+              name.includes('cedula') ||
+              name.includes('cédula') ||
+              name.includes('nit') ||
+              name.includes('id') ||
+              name.includes('identificacion')
+            ) {
+              try {
+                form.getTextField(field.getName()).setText(contratistaCedula);
+                filledInteractive = true;
+              } catch {}
+            } else if (
+              name.includes('telefono') ||
+              name.includes('teléfono') ||
+              name.includes('phone') ||
+              name.includes('celular')
+            ) {
+              try {
+                form.getTextField(field.getName()).setText(contratistaTelefono);
+                filledInteractive = true;
+              } catch {}
+            }
+          });
+          if (filledInteractive) {
+            form.flatten();
+          }
+        }
+      } catch (formErr) {
+        console.warn('[pdf-lib] Formulario no interactivo:', formErr);
+      }
+
+      // Si no es interactivo, insertar discretamente los datos en tipografía legal sobria (sin banners invasivos)
+      if (!filledInteractive) {
+        const pages = pdfDoc.getPages();
+        if (pages.length > 0) {
+          const firstPage = pages[0];
+          const lastPage = pages[pages.length - 1];
+          const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+          const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+          // Encabezado legal discreto en primera página (estilo formal sin marcos chillones)
+          const { width: w, height: h } = firstPage.getSize();
+          firstPage.drawText(`CONTRATISTA: ${contratistaNombre}`, {
+            x: 40,
+            y: h - 25,
+            size: 8,
+            font: fontBold,
+            color: rgb(0.12, 0.12, 0.12),
+          });
+          firstPage.drawText(
+            `DIRECCIÓN: ${contratistaDireccion}   |   CIUDAD / MUNICIPIO: ${contratistaMunicipio}   |   C.C.: ${contratistaCedula}`,
+            {
+              x: 40,
+              y: h - 35,
+              size: 7.5,
+              font: fontRegular,
+              color: rgb(0.2, 0.2, 0.2),
+            }
+          );
+
+          // Firma sobria en la página final
+          if (lastPage) {
+            lastPage.drawText(`CONTRATISTA: ${contratistaNombre}`, {
+              x: 45,
+              y: 55,
+              size: 8,
+              font: fontBold,
+              color: rgb(0.12, 0.12, 0.12),
+            });
+            lastPage.drawText(
+              `C.C. ${contratistaCedula}   |   DIRECCIÓN: ${contratistaDireccion}   |   CIUDAD: ${contratistaMunicipio}`,
+              {
+                x: 45,
+                y: 44,
+                size: 7.5,
+                font: fontRegular,
+                color: rgb(0.2, 0.2, 0.2),
+              }
+            );
+          }
+        }
+      }
+
+      const pdfBytes = await pdfDoc.save();
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const safeName = contratistaMunicipio.replace(/[^A-Za-z0-9]/g, '_');
+      link.download = `Contrato_Prestacion_Servicios_${safeName}_${contratistaCedula}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(link.href);
+      return;
+    } catch (err: any) {
+      console.error('[Contrato-Personalización] Error personalizando modelo base, aplicando minuta legal oficial:', err.message);
+    }
+  }
+
   const doc = new jsPDF({
     orientation: 'portrait',
     unit: 'mm',
@@ -345,12 +572,6 @@ export async function generateContratoServiciosPDF(expendio: ExpendioData): Prom
   const pageHeight = 297;
   const marginX = 22;
   const contentWidth = pageWidth - marginX * 2; // 166 mm
-
-  const contratistaNombre = (expendio.encargado || 'CONTRATISTA AUTORIZADO').toUpperCase();
-  const contratistaCedula = (expendio.cedula || 'SIN CÉDULA').toUpperCase();
-  const contratistaMunicipio = (expendio.municipio || expendio.localidad || 'SANTANDER').toUpperCase();
-  const contratistaTelefono = (expendio.telefonoPunto || '').toUpperCase();
-  const contratistaDireccion = (expendio.direccionPunto || '').toUpperCase();
 
   let currentPage = 1;
   const totalPages = 13;

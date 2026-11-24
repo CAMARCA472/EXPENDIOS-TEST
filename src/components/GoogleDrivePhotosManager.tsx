@@ -247,7 +247,7 @@ export const GoogleDrivePhotosManager: React.FC<GoogleDrivePhotosManagerProps> =
 
   const fetchBgSyncStatus = async () => {
     try {
-      const res = await fetch(`/api/admin/google-drive/sync-status?_t=${Date.now()}`);
+      const res = await fetch(`/api/admin/google-drive/sync-status?_t=${Date.now()}`, {  });
       if (res.ok) {
         const data = await res.json();
         if (data.success) {
@@ -284,7 +284,7 @@ export const GoogleDrivePhotosManager: React.FC<GoogleDrivePhotosManagerProps> =
   const fetchCatalog = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/admin/photos/catalog?_t=${Date.now()}`);
+      const res = await fetch(`/api/admin/photos/catalog?_t=${Date.now()}`, {  });
       if (res.ok) {
         const data = await res.json();
         if (data.success && Array.isArray(data.photos)) {
@@ -519,11 +519,11 @@ export const GoogleDrivePhotosManager: React.FC<GoogleDrivePhotosManagerProps> =
                 Archivo Fotográfico en Google Drive
               </h3>
               <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold px-2.5 py-0.5 rounded-full">
-                100% Desacoplado de Firebase
+                Almacenamiento Persistente + Google Drive
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Las fotografías georreferenciadas se guardan en tu cuenta de Google Drive y disco local, sin agotar cuotas de Firestore.
+              Las fotografías georreferenciadas se guardan en almacenamiento persistente con metadata en PostgreSQL y respaldo en Google Drive.
             </p>
           </div>
         </div>

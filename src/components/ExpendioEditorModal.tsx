@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
 import { ExpendioData } from '../types';
 import { Store, Save, X, Building2, User, Phone, MapPin, Mail, CreditCard, ShieldCheck, FileText, Globe } from 'lucide-react';
-import { getAccessToken } from '../lib/googleAuth';
-import { updateSingleExpendioInGoogleSheets } from '../lib/googleSheetsService';
+import {
+  CANONICAL_CENTROS_OPERATIVOS,
+  CANONICAL_CENTROS_ACOPIO,
+} from '../utils/centroOperativoAcopioHelper';
 
 interface ExpendioEditorModalProps {
   expendio?: ExpendioData | null;
@@ -18,10 +20,11 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
   const isEditing = !!expendio;
 
   const [formData, setFormData] = useState<Partial<ExpendioData>>({
+    ...(expendio || {}),
     centroOperativo: expendio?.centroOperativo || 'PO.BUCARAMANGA',
-    centroAcopio: expendio?.centroAcopio || 'SIMITI',
-    localidad: expendio?.localidad || '',
-    municipio: expendio?.municipio || '',
+    centroAcopio: expendio?.centroAcopio || 'Bucaramanga',
+    localidad: expendio?.localidad || expendio?.municipio || '',
+    municipio: expendio?.municipio || expendio?.localidad || '',
     encargado: expendio?.encargado || '',
     cedula: expendio?.cedula || '',
     direccionPunto: expendio?.direccionPunto || '',
@@ -33,15 +36,71 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
     nit: expendio?.nit || '900062917',
     correoElectronico: expendio?.correoElectronico || '',
     observacion: expendio?.observacion || '',
-    valorMensual: expendio?.valorMensual || 0,
-    letreroUrl: expendio?.letreroUrl || '',
-    basculaUrl: expendio?.basculaUrl || '',
-    mataselloUrl: expendio?.mataselloUrl || '',
-    computadorUrl: expendio?.computadorUrl || '',
+    valorMensual: expendio?.valorMensual ?? 0,
+    tieneComputador: expendio?.tieneComputador || 'SI',
+    tieneAviso: expendio?.tieneAviso || 'SI',
+    tieneBascula: expendio?.tieneBascula || 'SI',
+    tieneMatasello: expendio?.tieneMatasello || 'SI',
   });
 
   const [saving, setSaving] = useState<boolean>(false);
+  const [validatingState, setValidatingState] = useState<boolean>(false);
+  const [stateIntegrityInfo, setStateIntegrityInfo] = useState<{
+    valid: boolean;
+    expendiosCount: number;
+    revision: number;
+    masterFile: string;
+  } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
+
+  const ensureAdminToken = async (_forceRefresh = false): Promise<string> => {
+    let existing =
+      sessionStorage.getItem('camarca_token') ||
+      localStorage.getItem('camarca_token') ||
+      '';
+    if (!existing) {
+      try {
+        const s = JSON.parse(localStorage.getItem('camarca_session') || sessionStorage.getItem('camarca_session') || '{}');
+        if (s?.token) existing = s.token;
+      } catch {}
+    }
+    return existing;
+  };
+
+  React.useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        let token = await ensureAdminToken(false);
+        const headers: Record<string, string> = {};
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+          headers['x-session-token'] = token;
+        }
+        let r = await fetch('/api/admin/database/validate-state', { headers });
+        if (r.status === 401 || r.status === 403) {
+          token = await ensureAdminToken(true);
+          if (token) {
+            headers['Authorization'] = `Bearer ${token}`;
+            headers['x-session-token'] = token;
+            r = await fetch('/api/admin/database/validate-state', { headers });
+          }
+        }
+        const res = await r.json();
+        if (active && res?.success && res?.stateReport) {
+          setStateIntegrityInfo({
+            valid: Boolean(res.stateReport.valid),
+            expendiosCount: Number(res.stateReport.expendiosCount) || 0,
+            revision: Number(res.stateReport.currentInMemoryRevision) || 0,
+            masterFile: res.masterFile || 'database/camarca_master_db.json',
+          });
+        }
+      } catch {}
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleChange = (field: keyof ExpendioData, value: any) => {
     setFormData((prev) => ({
@@ -54,43 +113,104 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.localidad || !formData.encargado || !formData.cedula) {
-      setErrorMsg('Los campos Localidad, Encargado y Cédula son obligatorios.');
+    const finalLocalidad = String(formData.localidad || formData.municipio || '').trim();
+    const finalMunicipio = String(formData.municipio || formData.localidad || '').trim();
+    const finalEncargado = String(formData.encargado || '').trim();
+    const finalCedula = String(formData.cedula || '').trim();
+
+    if (!finalLocalidad || !finalEncargado || !finalCedula) {
+      setErrorMsg('Los campos Municipio/Localidad, Encargado y Número de Cédula son obligatorios.');
       return;
     }
 
     setSaving(true);
+    setValidatingState(true);
     setErrorMsg('');
 
     try {
-      const url = isEditing ? `/api/admin/expendios/${expendio.id}` : '/api/admin/expendios';
+      let token = await ensureAdminToken(false);
+
+      const buildHeaders = (t: string): Record<string, string> => {
+        const h: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (t) {
+          h['Authorization'] = `Bearer ${t}`;
+          h['x-session-token'] = t;
+        }
+        return h;
+      };
+
+      // 1. Verificar integridad del estado de la base de datos local ANTES de ejecutar el guardado
+      let preCheckRes = await fetch('/api/admin/database/validate-state', {
+        headers: buildHeaders(token),
+      });
+      if (preCheckRes.status === 401 || preCheckRes.status === 403) {
+        token = await ensureAdminToken(true);
+        preCheckRes = await fetch('/api/admin/database/validate-state', {
+          headers: buildHeaders(token),
+        });
+      }
+      const preCheckData = await preCheckRes.json().catch(() => null);
+      setValidatingState(false);
+
+      if (!preCheckRes.ok || !preCheckData?.success || !preCheckData?.stateReport?.valid) {
+        setErrorMsg(
+          preCheckData?.message ||
+            'No se pudo verificar la integridad previa de la base de datos local (database/camarca_master_db.json).'
+        );
+        setSaving(false);
+        return;
+      }
+
+      const headers = buildHeaders(token);
+
+      const targetId = expendio?.id || expendio?.cedula || expendio?.localidad || '';
+      const url = isEditing
+        ? `/api/admin/expendios/${encodeURIComponent(String(targetId).trim())}`
+        : '/api/admin/expendios';
       const method = isEditing ? 'PUT' : 'POST';
+
+      const payload: Partial<ExpendioData> = {
+        ...formData,
+        localidad: finalLocalidad,
+        municipio: finalMunicipio,
+        encargado: finalEncargado,
+        cedula: finalCedula,
+        direccion: String(formData.direccionPunto || '').trim(),
+        telefono: String(formData.telefonoPunto || '').trim(),
+      };
+      // No enviar cadenas vacías en campos de fotos desde este editor de datos
+      for (const k of ['letreroUrl', 'basculaUrl', 'mataselloUrl', 'computadorUrl', 'fotoAvisoUrl', 'fotoPanoramicaUrl', 'fotoMataselloUrl', 'fotoBasculaUrl', 'fotoContratistaUrl', 'fotoHorarioUrl', 'fotoTarifasUrl'] as const) {
+        if ((payload as any)[k] === '') {
+          delete (payload as any)[k];
+        }
+      }
 
       const res = await fetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
+        headers,
+        body: JSON.stringify(payload),
       });
 
       const data = await res.json();
-      if (data.success) {
+      if (data.success && data.data) {
+        if (data.diskVerification && data.diskVerification.verified === false) {
+          setErrorMsg(
+            `Advertencia: No se pudo confirmar la escritura física en ${data.masterFile || 'database/camarca_master_db.json'}.`
+          );
+          return;
+        }
         onSaveSuccess(data.data, !isEditing);
 
-        // Sincronizar actualización directamente a Google Sheets
-        getAccessToken().then((token) => {
-          if (token && data.data) {
-            updateSingleExpendioInGoogleSheets(token, data.data).catch(() => {});
-          }
-        }).catch(() => {});
 
         onClose();
       } else {
-        setErrorMsg(data.message || 'Error al guardar los datos.');
+        setErrorMsg(data.message || 'Error al guardar los datos en el servidor.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error guardando expendio:', err);
-      setErrorMsg('Error de conexión con el servidor.');
+      setErrorMsg(err?.message || 'Error de conexión con el servidor.');
     } finally {
+      setValidatingState(false);
       setSaving(false);
     }
   };
@@ -108,8 +228,14 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
               <h3 className="text-lg font-bold text-slate-100">
                 {isEditing ? `Editar Expendio: ${expendio.localidad}` : 'Registrar Nuevo Expendio'}
               </h3>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Sincronización directa en tiempo real con la base de datos del sistema
+              <p className="text-xs text-slate-400 mt-0.5 flex items-center gap-2 flex-wrap">
+                <span>Persistencia verificada en <code className="text-emerald-400 font-mono">database/camarca_master_db.json</code></span>
+                {stateIntegrityInfo?.valid && (
+                  <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400 font-semibold">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Integridad OK ({stateIntegrityInfo.expendiosCount} expendios · Rev #{stateIntegrityInfo.revision})
+                  </span>
+                )}
               </p>
             </div>
           </div>
@@ -141,26 +267,30 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
                 <label className="block text-[11px] font-semibold text-slate-300 mb-1">
                   Centro Operativo
                 </label>
-                <input
-                  type="text"
-                  value={formData.centroOperativo || ''}
+                <select
+                  value={formData.centroOperativo || 'PO.BUCARAMANGA'}
                   onChange={(e) => handleChange('centroOperativo', e.target.value)}
-                  placeholder="Ej: PO.BUCARAMANGA"
-                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100"
-                />
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 font-medium focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                >
+                  {CANONICAL_CENTROS_OPERATIVOS.map((co) => (
+                    <option key={co} value={co}>{co}</option>
+                  ))}
+                </select>
               </div>
 
               <div>
                 <label className="block text-[11px] font-semibold text-slate-300 mb-1">
                   Centro de Acopio
                 </label>
-                <input
-                  type="text"
-                  value={formData.centroAcopio || ''}
+                <select
+                  value={formData.centroAcopio || 'Bucaramanga'}
                   onChange={(e) => handleChange('centroAcopio', e.target.value)}
-                  placeholder="Ej: SIMITI"
-                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100"
-                />
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 font-medium focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                >
+                  {CANONICAL_CENTROS_ACOPIO.map((ca) => (
+                    <option key={ca} value={ca}>{ca}</option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -320,7 +450,7 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
                   Correo Electrónico
                 </label>
                 <input
-                  type="email"
+                  type="text"
                   value={formData.correoElectronico || ''}
                   onChange={(e) => handleChange('correoElectronico', e.target.value)}
                   placeholder="ejemplo@expendio.com"
@@ -398,9 +528,9 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
                 </label>
                 <input
                   type="number"
-                  value={formData.valorMensual || 1350000}
+                  value={formData.valorMensual ?? 0}
                   onChange={(e) => handleChange('valorMensual', Number(e.target.value))}
-                  placeholder="1350000"
+                  placeholder="165600"
                   className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 font-mono"
                 />
               </div>
@@ -456,6 +586,12 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
             </div>
           </div>
 
+          {errorMsg && (
+            <div className="p-3 bg-red-950/80 border border-red-700 text-red-200 text-xs font-medium rounded-xl">
+              {errorMsg}
+            </div>
+          )}
+
           {/* Action Buttons */}
           <div className="pt-2 flex items-center justify-end space-x-3">
             <button
@@ -472,7 +608,13 @@ export const ExpendioEditorModal: React.FC<ExpendioEditorModalProps> = ({
               className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-2.5 px-5 rounded-xl text-xs flex items-center space-x-2 shadow-lg transition-all cursor-pointer disabled:opacity-50"
             >
               <Save className="w-4 h-4" />
-              <span>{saving ? 'Guardando...' : 'Guardar y Sincronizar'}</span>
+              <span>
+                {validatingState
+                  ? 'Validando integridad...'
+                  : saving
+                  ? 'Guardando en camarca_master_db.json...'
+                  : 'Guardar y Sincronizar'}
+              </span>
             </button>
           </div>
         </form>

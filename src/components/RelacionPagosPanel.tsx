@@ -4,7 +4,7 @@ import { PagoRelacionItem, CuentaCargadaExpendio, AnalisisIACuentaCobro, CambioI
 import { formatNumberWithDots, formatCuentaBancaria } from '../utils/formatters';
 import { CambiosIntermensualesModal, CambiosIntermensualesBanner } from './CambiosIntermensualesModal';
 import { DiscrepanciasEncargadoModal } from './DiscrepanciasEncargadoModal';
-import { ConfirmarBorradoModal, ADMIN_SECURITY_PASSWORD } from './ConfirmarBorradoModal';
+import { ConfirmarBorradoModal } from './ConfirmarBorradoModal';
 import { DashboardRelacionPagos } from './DashboardRelacionPagos';
 import { ReporteFormalView } from './ReporteFormalView';
 import {
@@ -242,10 +242,10 @@ export const RelacionPagosPanel: React.FC = () => {
       setMesAnteriorInfo(prevInfo);
 
       const [resPagosRaw, resCuentasRaw, resPrevPagosRaw, resExpendiosRaw] = await Promise.all([
-        fetch(`/api/admin/relacion-pagos?mes=${encodeURIComponent(mes)}&anio=${encodeURIComponent(anio)}`),
+        fetch(`/api/admin/relacion-pagos?mes=${encodeURIComponent(mes)}&anio=${encodeURIComponent(anio)}`, {  }),
         fetch(`/api/cuentas-cargadas?periodo=${encodeURIComponent(periodoStr)}`),
-        fetch(`/api/admin/relacion-pagos?mes=${encodeURIComponent(prevInfo.mesAnterior)}&anio=${encodeURIComponent(prevInfo.anioAnterior)}`),
-        fetch(`/api/expendios`),
+        fetch(`/api/admin/relacion-pagos?mes=${encodeURIComponent(prevInfo.mesAnterior)}&anio=${encodeURIComponent(prevInfo.anioAnterior)}`, {  }),
+        fetch(`/api/expendios`, {  }),
       ]);
 
       let currentPagos: PagoRelacionItem[] = [];
@@ -722,22 +722,20 @@ export const RelacionPagosPanel: React.FC = () => {
       setResetErrorMsg('Debe ingresar la contraseña de seguridad para autorizar el reset.');
       return;
     }
-    if (resetPassword !== ADMIN_SECURITY_PASSWORD) {
-      setResetErrorMsg('Contraseña de seguridad incorrecta. Operación no autorizada.');
-      return;
-    }
 
     setResetErrorMsg('');
     setIsResetting(true);
     try {
       const res = await fetch('/api/admin/relacion-pagos/reset', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          },
         body: JSON.stringify({
           modo: resetModo,
           mes,
           anio,
-          password: resetPassword,
+          password: resetPassword.trim(),
         }),
       });
       const data = await res.json();
@@ -1320,7 +1318,7 @@ export const RelacionPagosPanel: React.FC = () => {
                   <td colSpan={10} className="py-12 text-center text-slate-500">
                     <FileSpreadsheet className="w-8 h-8 mx-auto mb-2 opacity-40" />
                     <p className="text-sm font-semibold text-slate-400">
-                      No hay registros de pagos para {mes} {anio}
+                      Sin datos registrados para {mes} {anio}
                     </p>
                     <p className="text-xs text-slate-500 mt-1">
                       Haz clic en "Sincronizar por Municipio con BD" o sube un archivo Excel para cargar la relación.

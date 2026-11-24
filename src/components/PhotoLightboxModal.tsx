@@ -1,3 +1,4 @@
+import { AuthenticatedImage } from "./AuthenticatedImage";
 import React, { useState } from 'react';
 import { X, ZoomIn, ZoomOut, RotateCw, Download, MapPin, User, Building, FileText } from 'lucide-react';
 
@@ -132,7 +133,7 @@ export const PhotoLightboxModal: React.FC<PhotoLightboxModalProps> = ({
               transform: `scale(${zoom}) rotate(${rotation}deg)`,
             }}
           >
-            <img
+            <AuthenticatedImage
               src={imageUrl}
               alt={title}
               className="max-h-[60vh] max-w-full object-contain rounded-lg shadow-2xl border border-slate-800"

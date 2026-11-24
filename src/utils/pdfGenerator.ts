@@ -4,6 +4,7 @@ import html2canvas from 'html2canvas';
 import { CuentaCobroResult, ExpendioData } from '../types';
 import { numeroALetras } from './numeroALetras';
 import { isRealPhoto } from './photoValidation';
+import { generateNoDisponibleSvg } from '../lib/noDisponibleSvg';
 
 function extractMesAno(periodoStr: string) {
   const clean = (periodoStr || '').toUpperCase();
@@ -477,6 +478,82 @@ export async function generateCuentasCobroPDF(
   }
 }
 
+async function renderNoDisponibleSvgToDataUrl(options: {
+  itemSlot: string;
+  municipio: string;
+  cedula: string;
+  motivo?: string;
+}): Promise<string | null> {
+  try {
+    const svgStr = generateNoDisponibleSvg(options);
+    const img = new Image();
+    const svgBlob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    await new Promise((resolve) => {
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = 800;
+    canvas.height = 600;
+    const ctx = canvas.getContext('2d');
+    let dataUrl: string | null = null;
+    if (ctx) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, 800, 600);
+      ctx.drawImage(img, 0, 0, 800, 600);
+      dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+    }
+    URL.revokeObjectURL(url);
+    return dataUrl;
+  } catch {
+    return null;
+  }
+}
+
+async function isLegacyTofuPlaceholderImage(dataUrl: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          if (img.naturalWidth !== 800 || img.naturalHeight !== 600) {
+            resolve(false);
+            return;
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = 800;
+          canvas.height = 600;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(false);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, 800, 600);
+          // En la nueva ilustración existe el banner oscuro #0F172A en (250, 35)
+          const pillPixel = ctx.getImageData(250, 35, 1, 1).data;
+          const p1 = ctx.getImageData(80, 80, 1, 1).data;
+          const p2 = ctx.getImageData(720, 80, 1, 1).data;
+          const p3 = ctx.getImageData(80, 350, 1, 1).data;
+          const isPillWhite = pillPixel[0] > 235 && pillPixel[1] > 235 && pillPixel[2] > 235;
+          const isBgWhite =
+            p1[0] > 240 && p1[1] > 240 && p1[2] > 240 &&
+            p2[0] > 240 && p2[1] > 240 && p2[2] > 240 &&
+            p3[0] > 240 && p3[1] > 240 && p3[2] > 240;
+          resolve(isPillWhite && isBgWhite);
+        } catch {
+          resolve(false);
+        }
+      };
+      img.onerror = () => resolve(false);
+      img.src = dataUrl;
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 async function getBase64ImageFromUrl(imageUrl?: string): Promise<string | null> {
   if (!imageUrl || typeof imageUrl !== 'string' || imageUrl.trim() === '') {
     return null;
@@ -488,8 +565,28 @@ async function getBase64ImageFromUrl(imageUrl?: string): Promise<string | null> 
     return imageUrl;
   }
 
+  let fetchUrl = imageUrl.trim();
+  if (fetchUrl.startsWith('/api/photos/') || fetchUrl.startsWith('/api/expendio/photo/')) {
+    const token =
+      typeof window !== 'undefined'
+        ? sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token')
+        : null;
+    const sep = fetchUrl.includes('?') ? '&' : '?';
+    const tokenParam = token && !fetchUrl.includes('token=') ? `token=${encodeURIComponent(token)}` : '';
+    const cbParam = `_cb=${Date.now()}`;
+    const queryAddon = [tokenParam, cbParam].filter(Boolean).join('&');
+    fetchUrl = `${fetchUrl}${sep}${queryAddon}`;
+  }
+
   try {
-    const res = await fetch(imageUrl, { mode: 'cors' });
+    const res = await fetch(fetchUrl, {
+      mode: 'cors',
+      cache: 'no-store',
+      headers: {
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+      },
+    });
     if (!res.ok) throw new Error('Fetch failed');
     const blob = await res.blob();
     return new Promise((resolve) => {
@@ -499,7 +596,7 @@ async function getBase64ImageFromUrl(imageUrl?: string): Promise<string | null> 
       reader.readAsDataURL(blob);
     });
   } catch {
-    // Fallback: try HTML Image object
+    // Fallback: try HTML Image object with cache-busted URL
     return new Promise((resolve) => {
       try {
         const img = new Image();
@@ -521,7 +618,7 @@ async function getBase64ImageFromUrl(imageUrl?: string): Promise<string | null> 
           }
         };
         img.onerror = () => resolve(null);
-        img.src = imageUrl;
+        img.src = fetchUrl;
       } catch {
         resolve(null);
       }
@@ -530,9 +627,27 @@ async function getBase64ImageFromUrl(imageUrl?: string): Promise<string | null> 
 }
 
 interface PhotoSlotMetadata {
+  slotKey: string;
   title: string;
   subtitle: string;
   url?: string;
+  isNoDisponible?: boolean;
+  motivoNoDisponible?: string;
+}
+
+function extractMotivoNoDisponible(exp: ExpendioData, itemType: 'AVISO' | 'MATASELLO' | 'BASCULA'): string {
+  const obs = ((exp.observaciones || '') + ' ' + (exp.observacion || '')).toUpperCase();
+  if (exp.cedula === '1095910336' && itemType === 'MATASELLO') {
+    return 'NUNCA ENTREGADO AL PUNTO';
+  }
+  const regex = new RegExp(`\\[NO TIENE ${itemType}:\\s*([^\\]]+)\\]`, 'i');
+  const match = obs.match(regex);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+  return itemType === 'BASCULA'
+    ? 'EQUIPO NO DISPONIBLE EN EL PUNTO DE ATENCIÓN'
+    : 'ELEMENTO NO DISPONIBLE EN EL PUNTO DE ATENCIÓN';
 }
 
 function getExpendioPhotoSlots(exp: ExpendioData): PhotoSlotMetadata[] {
@@ -544,36 +659,49 @@ function getExpendioPhotoSlots(exp: ExpendioData): PhotoSlotMetadata[] {
 
   return [
     {
+      slotKey: 'fotoAvisoUrl',
       title: '1. FOTO AVISO',
       subtitle: 'Aviso exterior oficial',
       url: getValidUrl(exp.fotoAvisoUrl, exp.letreroUrl),
+      isNoDisponible: exp.tieneAviso === 'NO',
+      motivoNoDisponible: extractMotivoNoDisponible(exp, 'AVISO'),
     },
     {
+      slotKey: 'fotoPanoramicaUrl',
       title: '2. FOTO PANORÁMICA',
       subtitle: 'Fachada y aviso 4-72 visible',
       url: getValidUrl(exp.fotoPanoramicaUrl),
     },
     {
+      slotKey: 'fotoMataselloUrl',
       title: '3. FOTO MATASELLO',
       subtitle: 'Matasello postal de correspondencia',
       url: getValidUrl(exp.fotoMataselloUrl, exp.mataselloUrl),
+      isNoDisponible: exp.tieneMatasello === 'NO',
+      motivoNoDisponible: extractMotivoNoDisponible(exp, 'MATASELLO'),
     },
     {
+      slotKey: 'fotoBasculaUrl',
       title: '4. FOTO BÁSCULA',
       subtitle: 'Báscula de pesaje calibrada',
       url: getValidUrl(exp.fotoBasculaUrl, exp.basculaUrl),
+      isNoDisponible: exp.tieneBascula === 'NO',
+      motivoNoDisponible: extractMotivoNoDisponible(exp, 'BASCULA'),
     },
     {
+      slotKey: 'fotoContratistaUrl',
       title: '5. FOTO DEL CONTRATISTA',
       subtitle: 'Encargado en el punto de atención',
       url: getValidUrl(exp.fotoContratistaUrl),
     },
     {
+      slotKey: 'fotoHorarioUrl',
       title: '6. FOTO HORARIO',
       subtitle: 'Horario de atención publicado',
       url: getValidUrl(exp.fotoHorarioUrl),
     },
     {
+      slotKey: 'fotoTarifasUrl',
       title: '7. FOTO TARIFAS',
       subtitle: 'Tarifario oficial visible al público',
       url: getValidUrl(exp.fotoTarifasUrl),
@@ -690,8 +818,23 @@ async function renderExpendioPageOnPDF(pdf: jsPDF, exp: ExpendioData, isFirst: b
     pdf.setTextColor(245, 158, 11); // Amber
     pdf.text(slot.title, x + 2.5, y + 3.8);
 
-    // Fetch and render image
-    const imgData = await getBase64ImageFromUrl(slot.url);
+    // Fetch and render image (with automatic fallback/replacement for NO DISPONIBLE illustrations)
+    let imgData = await getBase64ImageFromUrl(slot.url);
+    if (
+      slot.slotKey === 'fotoAvisoUrl' ||
+      slot.slotKey === 'fotoMataselloUrl' ||
+      slot.slotKey === 'fotoBasculaUrl'
+    ) {
+      const isTofu = imgData ? await isLegacyTofuPlaceholderImage(imgData) : false;
+      if (isTofu || (!imgData && slot.isNoDisponible)) {
+        imgData = await renderNoDisponibleSvgToDataUrl({
+          itemSlot: slot.slotKey,
+          municipio: exp.municipio || exp.localidad || 'EXPENDIO',
+          cedula: exp.cedula || '',
+          motivo: slot.motivoNoDisponible,
+        });
+      }
+    }
 
     // Área ampliada de la fotografía aprovechando el espacio liberado por la eliminación del banner
     const imgInnerX = x + 1.2;

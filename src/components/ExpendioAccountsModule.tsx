@@ -344,89 +344,120 @@ export const ExpendioAccountsModule: React.FC<ExpendioAccountsModuleProps> = ({
           </div>
 
           {/* Liquidated Financial Summary Cards */}
-          {cuentaGenerada.data && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className={`p-4 rounded-2xl border-2 ${
-                isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
-              }`}>
-                <span className={`text-[11px] font-black uppercase tracking-wider block ${
-                  isLight ? 'text-slate-800' : 'text-slate-300'
-                }`}>
-                  VALOR BRUTO
-                </span>
-                <p className={`text-2xl font-black mt-1 tracking-tight ${
-                  isLight ? 'text-slate-950' : 'text-white'
-                }`}>
-                  {formatPesos(cuentaGenerada.data.valorBruto)}
-                </p>
-                <span className={`text-[11px] block mt-0.5 font-bold ${
-                  isLight ? 'text-slate-700' : 'text-slate-400'
-                }`}>
-                  Liquidación base pactada
-                </span>
-              </div>
+          {cuentaGenerada.data && (() => {
+            const d = cuentaGenerada.data as any;
+            const cargoBasico = Number(d.cargoBasico ?? d.valorBase ?? 0);
+            const admisionSipost = Number(d.admisionSipost ?? 0);
+            const valorVariable = Number(d.valorVariable ?? 0);
+            const valorBruto = Number(d.pagoTotal ?? d.valorBruto ?? (cargoBasico + admisionSipost + valorVariable));
+            const retefuente = Number(d.retef1 ?? d.retencionValor ?? d.retefuente ?? Math.round(valorBruto * 0.01));
+            const netoPagar = Number(d.valorNeto ?? d.netoPagar ?? (valorBruto - retefuente));
+            const pRet = Number(d.porcentajeRetencion ?? d.porcentajeRetefuente ?? 1);
 
-              <div className={`p-4 rounded-2xl border-2 ${
-                isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
-              }`}>
-                <span className={`text-[11px] font-black uppercase tracking-wider block ${
-                  isLight ? 'text-slate-800' : 'text-slate-300'
+            return (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
+                <div className={`p-4 rounded-2xl border-2 ${
+                  isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
                 }`}>
-                  RETEFUENTE ({cuentaGenerada.data.porcentajeRetefuente || 6}%)
-                </span>
-                <p className={`text-2xl font-black mt-1 tracking-tight ${
-                  isLight ? 'text-red-700' : 'text-red-400'
-                }`}>
-                  - {formatPesos(cuentaGenerada.data.retefuente)}
-                </p>
-                <span className={`text-[11px] block mt-0.5 font-bold ${
-                  isLight ? 'text-slate-700' : 'text-slate-400'
-                }`}>
-                  Retención en la fuente
-                </span>
-              </div>
+                  <span className={`text-[11px] font-black uppercase tracking-wider block ${
+                    isLight ? 'text-slate-800' : 'text-slate-300'
+                  }`}>
+                    CARGO BÁSICO
+                  </span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 tracking-tight ${
+                    isLight ? 'text-slate-950' : 'text-white'
+                  }`}>
+                    {formatPesos(cargoBasico)}
+                  </p>
+                  <span className={`text-[11px] block mt-0.5 font-bold ${
+                    isLight ? 'text-slate-700' : 'text-slate-400'
+                  }`}>
+                    Base mensual expendio
+                  </span>
+                </div>
 
-              <div className={`p-4 rounded-2xl border-2 ${
-                isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
-              }`}>
-                <span className={`text-[11px] font-black uppercase tracking-wider block ${
-                  isLight ? 'text-slate-800' : 'text-slate-300'
+                <div className={`p-4 rounded-2xl border-2 ${
+                  isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
                 }`}>
-                  RETEICA ({cuentaGenerada.data.porcentajeReteica || 0.966}%)
-                </span>
-                <p className={`text-2xl font-black mt-1 tracking-tight ${
-                  isLight ? 'text-red-700' : 'text-red-400'
-                }`}>
-                  - {formatPesos(cuentaGenerada.data.reteica)}
-                </p>
-                <span className={`text-[11px] block mt-0.5 font-bold ${
-                  isLight ? 'text-slate-700' : 'text-slate-400'
-                }`}>
-                  Retención ICA municipal
-                </span>
-              </div>
+                  <span className={`text-[11px] font-black uppercase tracking-wider block ${
+                    isLight ? 'text-slate-800' : 'text-slate-300'
+                  }`}>
+                    SIPOST + VARIABLE
+                  </span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 tracking-tight ${
+                    isLight ? 'text-slate-950' : 'text-white'
+                  }`}>
+                    {formatPesos(admisionSipost + valorVariable)}
+                  </p>
+                  <span className={`text-[11px] block mt-0.5 font-bold ${
+                    isLight ? 'text-slate-700' : 'text-slate-400'
+                  }`}>
+                    Sipost: {formatPesos(admisionSipost)} | Var: {formatPesos(valorVariable)}
+                  </span>
+                </div>
 
-              <div className={`p-4 rounded-2xl border-2 ${
-                isLight ? 'bg-emerald-50 border-emerald-400 shadow-sm' : 'bg-emerald-950/40 border-emerald-600'
-              }`}>
-                <span className={`text-[11px] font-black uppercase tracking-wider block ${
-                  isLight ? 'text-emerald-900' : 'text-emerald-300'
+                <div className={`p-4 rounded-2xl border-2 ${
+                  isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
                 }`}>
-                  TOTAL NETO A PAGAR
-                </span>
-                <p className={`text-2xl font-black mt-1 tracking-tight ${
-                  isLight ? 'text-emerald-950' : 'text-emerald-200'
+                  <span className={`text-[11px] font-black uppercase tracking-wider block ${
+                    isLight ? 'text-slate-800' : 'text-slate-300'
+                  }`}>
+                    PAGO TOTAL BRUTO
+                  </span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 tracking-tight ${
+                    isLight ? 'text-slate-950' : 'text-white'
+                  }`}>
+                    {formatPesos(valorBruto)}
+                  </p>
+                  <span className={`text-[11px] block mt-0.5 font-bold ${
+                    isLight ? 'text-slate-700' : 'text-slate-400'
+                  }`}>
+                    Liquidación oficial cobros
+                  </span>
+                </div>
+
+                <div className={`p-4 rounded-2xl border-2 ${
+                  isLight ? 'bg-white border-slate-300 shadow-sm' : 'bg-slate-900 border-slate-700'
                 }`}>
-                  {formatPesos(cuentaGenerada.data.netoPagar)}
-                </p>
-                <span className={`text-[11px] font-bold block mt-0.5 ${
-                  isLight ? 'text-emerald-900' : 'text-emerald-300'
+                  <span className={`text-[11px] font-black uppercase tracking-wider block ${
+                    isLight ? 'text-slate-800' : 'text-slate-300'
+                  }`}>
+                    RETENCIÓN ({pRet}%)
+                  </span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 tracking-tight ${
+                    isLight ? 'text-red-700' : 'text-red-400'
+                  }`}>
+                    - {formatPesos(retefuente)}
+                  </p>
+                  <span className={`text-[11px] block mt-0.5 font-bold ${
+                    isLight ? 'text-slate-700' : 'text-slate-400'
+                  }`}>
+                    Retención en la fuente 1%
+                  </span>
+                </div>
+
+                <div className={`p-4 rounded-2xl border-2 ${
+                  isLight ? 'bg-emerald-50 border-emerald-400 shadow-sm' : 'bg-emerald-950/40 border-emerald-600'
                 }`}>
-                  Giro a {expendio.banco || 'NEQUI'}
-                </span>
+                  <span className={`text-[11px] font-black uppercase tracking-wider block ${
+                    isLight ? 'text-emerald-900' : 'text-emerald-300'
+                  }`}>
+                    TOTAL NETO A PAGAR
+                  </span>
+                  <p className={`text-xl sm:text-2xl font-black mt-1 tracking-tight ${
+                    isLight ? 'text-emerald-950' : 'text-emerald-200'
+                  }`}>
+                    {formatPesos(netoPagar)}
+                  </p>
+                  <span className={`text-[11px] font-bold block mt-0.5 ${
+                    isLight ? 'text-emerald-900' : 'text-emerald-300'
+                  }`}>
+                    Giro a {expendio.banco || 'NEQUI'}
+                  </span>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Scanner CamScanner Upload Card */}
           <div className={`p-6 rounded-3xl border-2 space-y-4 ${

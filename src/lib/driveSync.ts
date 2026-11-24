@@ -1,5 +1,3 @@
-import { collection, getDocs, updateDoc, doc } from 'firebase/firestore';
-import { db, uploadExpendioPhoto } from './firebase';
 import { getOrCreatePhotosFolder, getOrCreateMunicipioFolder, uploadPhotoToGoogleDrive } from './googleDriveService';
 
 export function getCustomPhotoFileName(slotKey: string, nombreExpendio: string, fecha?: string | Date): string {
@@ -38,7 +36,7 @@ export async function manualDriveBackup(
 ) {
   const folder = await getOrCreatePhotosFolder(accessToken);
   
-  const res = await fetch('/api/expendios');
+  const res = await fetch('/api/expendios', {  });
   const json = await res.json();
   const expendios = json.data || [];
 
@@ -148,7 +146,7 @@ export async function manualDriveRestore(
   const data = await res.json();
   const subfolders = data.files || [];
 
-  const req = await fetch('/api/expendios');
+  const req = await fetch('/api/expendios', {  });
   const json = await req.json();
   const expendiosList = json.data || [];
 
@@ -252,7 +250,7 @@ export async function manualDriveRestore(
       restoredCount++;
     } catch (err) {
       console.error('Error procesando archivo:', fileInfo.name, err);
-      console.log('Failing context:', { fileId: fileInfo.id, fileName: fileInfo.name, folder: fileInfo.folderName, fileName: fileInfo.name });
+      console.log('Failing context:', { fileId: fileInfo.id, fileName: fileInfo.name, folder: fileInfo.folderName });
       errors++;
     }
   }

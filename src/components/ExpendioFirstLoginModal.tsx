@@ -145,16 +145,14 @@ export const ExpendioFirstLoginModal: React.FC<ExpendioFirstLoginModalProps> = (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
             <div>
               <label className="block font-bold text-slate-700 mb-1 tracking-wider uppercase">
-                CÉDULA DE CIUDADANÍA <span className="text-red-500">*</span>
+                CÉDULA DE CIUDADANÍA (DATO MAESTRO)
               </label>
-              <input
-                type="text"
-                value={cedulaInput}
-                onChange={(e) => setCedulaInput(e.target.value.toUpperCase())}
-                className="w-full bg-slate-50 border-2 border-slate-300 focus:border-amber-500 rounded-xl px-3.5 py-2.5 text-slate-900 font-mono font-bold uppercase focus:outline-none focus:bg-white"
-                placeholder="NÚMERO DE CÉDULA..."
-                required
-              />
+              <div className="w-full bg-slate-100 border-2 border-slate-300 rounded-xl px-3.5 py-2.5 text-slate-800 font-mono font-bold uppercase flex items-center justify-between select-none">
+                <span>{cedulaInput || 'CÉDULA REGISTRADA'}</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                  INMUTABLE
+                </span>
+              </div>
             </div>
 
             <div>
@@ -260,9 +258,9 @@ export const ExpendioFirstLoginModal: React.FC<ExpendioFirstLoginModalProps> = (
               CORREO ELECTRÓNICO OFICIAL <span className="text-red-500">*</span>
             </label>
             <input
-              type="email"
+              type="text"
               value={correoElectronico}
-              onChange={(e) => setCorreoElectronico(e.target.value.toUpperCase())}
+              onChange={(e) => setCorreoElectronico(e.target.value.trim().toUpperCase())}
               className="w-full bg-slate-50 border-2 border-slate-300 focus:border-amber-500 rounded-xl px-3.5 py-2.5 text-slate-900 font-semibold uppercase focus:outline-none focus:bg-white"
               placeholder="CORREO@EJEMPLO.COM"
               required

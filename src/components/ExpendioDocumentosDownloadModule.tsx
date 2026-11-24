@@ -21,6 +21,54 @@ import {
   generateContratoServiciosPDF,
 } from '../utils/documentosExpendiosGenerator';
 
+const DEFAULT_FALLBACK_DOCS: DocumentoExpendioConfig[] = [
+  {
+    id: 'horario',
+    nombre: 'Horario de Atención Oficial 4-72',
+    descripcion: 'Cartelera oficial con horarios de atención (L-V 8am-12m / 2pm-6pm, Sáb 8am-12m) personalizada con el municipio del expendio.',
+    tipo: 'horario',
+    habilitado: true,
+    badge: 'Modelo Oficial 4-72',
+    icono: 'Clock',
+  },
+  {
+    id: 'tarifario',
+    nombre: 'Tarifas Oficiales Servicios SPU 4-72 (Versión 01-2026)',
+    descripcion: 'Cartelera reglamentaria oficial de Tarifas SPU (Resolución MinTIC 4114/2023): Correo Nacional e Internacional con y sin certificación, tiempos de entrega y zonas.',
+    tipo: 'tarifario',
+    habilitado: true,
+    badge: 'Vigilado MinTIC 2026',
+    icono: 'DollarSign',
+  },
+  {
+    id: 'contrato',
+    nombre: 'Contrato de Prestación de Servicios',
+    descripcion: 'Minuta contractual oficial con el formato exacto del modelo base institucional y datos del expendio (nombre, dirección y ciudad).',
+    tipo: 'contrato',
+    habilitado: true,
+    badge: 'Minuta Legal',
+    icono: 'FileText',
+  },
+  {
+    id: 'aviso',
+    nombre: 'Aviso Fachada Punto de Venta 4-72',
+    descripcion: 'Aviso corporativo para fachada o mostrador con logo oficial de 4-72, Servicios Postales y nombre del punto para impresión.',
+    tipo: 'aviso',
+    habilitado: true,
+    badge: 'Fachada & Mostrador',
+    icono: 'Store',
+  },
+  {
+    id: 'circular',
+    nombre: 'Circular y Normativa Operativa',
+    descripcion: 'Directrices institucionales y manual de procedimientos operativos emitidos por la administración de Camarca S.A.S.',
+    tipo: 'archivo',
+    habilitado: true,
+    badge: 'Documento Administrativo',
+    icono: 'FileCheck',
+  },
+];
+
 interface ExpendioDocumentosDownloadModuleProps {
   expendio: ExpendioData;
   isLight: boolean;
@@ -39,13 +87,22 @@ export const ExpendioDocumentosDownloadModule: React.FC<ExpendioDocumentosDownlo
   const fetchDocumentos = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/expendio/documentos');
+      const token = (typeof window !== 'undefined' && (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) || '';
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+        headers['x-session-token'] = token;
+      }
+      const res = await fetch('/api/expendio/documentos', { headers });
       const json = await res.json();
-      if (json.success && Array.isArray(json.data)) {
+      if (json.success && Array.isArray(json.data) && json.data.length > 0) {
         setDocumentos(json.data);
+      } else {
+        setDocumentos(DEFAULT_FALLBACK_DOCS);
       }
     } catch (err: any) {
-      setErrorMsg('No fue posible cargar la lista de documentos disponibles.');
+      console.warn('[Documentos] Usando documentos institucionales por defecto:', err);
+      setDocumentos(DEFAULT_FALLBACK_DOCS);
     } finally {
       setLoading(false);
     }
@@ -63,31 +120,51 @@ export const ExpendioDocumentosDownloadModule: React.FC<ExpendioDocumentosDownlo
       if (doc.id === 'tarifario' || doc.tipo === 'tarifario') {
         // EXACT UNMODIFIED FILE DOWNLOAD AS REQUESTED BY USER
         if (doc.archivoUrl) {
-          const downloadUrl = `/api/documentos-expendios/download/${doc.id}`;
+          const token = (typeof window !== 'undefined' && (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) || '';
+          const downloadUrl = `/api/documentos-expendios/download/${doc.id}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+          const res = await fetch(downloadUrl, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          });
+          if (!res.ok) {
+            throw new Error('No fue posible descargar el archivo de tarifas desde el servidor.');
+          }
+          const blob = await res.blob();
+          const url = window.URL.createObjectURL(blob);
           const link = document.createElement('a');
-          link.href = downloadUrl;
+          link.href = url;
           link.download = doc.archivoNombreOriginal || `${doc.nombre}.pdf`;
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
+          window.URL.revokeObjectURL(url);
         } else {
           throw new Error('El archivo oficial de tarifas aún no ha sido cargado en el sistema por la administración central.');
         }
       } else if (doc.tipo === 'horario') {
         await generateHorarioAtencionPDF(expendio);
       } else if (doc.tipo === 'contrato') {
-        await generateContratoServiciosPDF(expendio);
+        await generateContratoServiciosPDF(expendio, doc.archivoUrl);
       } else if (doc.tipo === 'aviso') {
         await generateAviso472PDF(expendio);
       } else if (doc.archivoUrl) {
         // Direct download for any other uploaded file
-        const downloadUrl = `/api/documentos-expendios/download/${doc.id}`;
+        const token = (typeof window !== 'undefined' && (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) || '';
+        const downloadUrl = `/api/documentos-expendios/download/${doc.id}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+        const res = await fetch(downloadUrl, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) {
+          throw new Error('No fue posible descargar el documento.');
+        }
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
-        link.href = downloadUrl;
+        link.href = url;
         link.download = doc.archivoNombreOriginal || `${doc.nombre}.pdf`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
       } else {
         throw new Error('El archivo solicitado no se encuentra disponible actualmente.');
       }
@@ -118,8 +195,8 @@ export const ExpendioDocumentosDownloadModule: React.FC<ExpendioDocumentosDownlo
     }
   };
 
-  // Filter only enabled documents
-  const activeDocs = documentos.filter((d) => d.habilitado);
+  // Filter only enabled documents (default true if not explicitly false)
+  const activeDocs = documentos.filter((d) => d.habilitado !== false && (d as any).habilitado !== 'false');
 
   if (loading) {
     return (

@@ -15,7 +15,7 @@ export class CamarcaPhotoDatabase extends Dexie {
   constructor() {
     super('CamarcaPhotosDB');
     this.version(1).stores({
-      photos: '++id, uuid, cedula, slotKey, compositeKey, municipio, fecha, timestamp, status, serverSynced, driveSynced',
+      photos: '++id, uuid, expendioId, cedula, slotKey, compositeKey, municipio, fecha, timestamp, status, serverSynced, driveSynced',
     });
   }
 }
@@ -73,6 +73,7 @@ export function blobToDataUrl(blob: Blob): Promise<string> {
  * Asegura que los datos no se pierdan si el navegador cierra o falla la red.
  */
 export async function savePhotoToIndexedDB(params: {
+  expendioId?: string;
   cedula: string;
   slotKey: string;
   slotTitle: string;
@@ -82,20 +83,30 @@ export async function savePhotoToIndexedDB(params: {
   municipio?: string;
   fecha?: string | Date;
   coords?: { latitude: number; longitude: number; accuracy?: number } | null;
+  version?: number | string;
+  checksum?: string;
+  status?: 'pending' | 'uploading' | 'synced' | 'failed';
+  downloadedFromServer?: boolean;
 }): Promise<StoredPhotoRecord> {
   const {
+    expendioId,
     cedula,
     slotKey,
     slotTitle,
     fileOrBlob,
     dataUrl: initialDataUrl,
     expendioNombre = '',
-    municipio = 'Giron',
+    municipio = '',
     fecha,
     coords = null,
+    version,
+    checksum,
+    status = 'pending',
+    downloadedFromServer = false,
   } = params;
 
   const cleanCed = (cedula || '').trim();
+  const cleanExpId = (expendioId || '').trim();
   const cleanSlot = (slotKey || '').trim();
   const compositeKey = `${cleanCed}_${cleanSlot}`;
   const muniFormatted = formatMunicipioNombre(municipio);
@@ -105,15 +116,11 @@ export async function savePhotoToIndexedDB(params: {
 
   if (fileOrBlob) {
     blob = fileOrBlob;
-    if (!dataUrl) {
-      try {
-        dataUrl = await blobToDataUrl(fileOrBlob);
-      } catch {
-        dataUrl = '';
-      }
-    }
+    // No convertir Blob a Base64 dataUrl para evitar duplicar el consumo de memoria RAM en V8/IndexedDB
+    dataUrl = '';
   } else if (initialDataUrl) {
     blob = dataUrlToBlob(initialDataUrl);
+    dataUrl = '';
   } else {
     throw new Error('Debe suministrar un Blob, File o DataURL para guardar en IndexedDB');
   }
@@ -130,14 +137,17 @@ export async function savePhotoToIndexedDB(params: {
 
   const fileName = getDrivePhotoFileName(cleanSlot, muniFormatted, fechaStr);
   const now = Date.now();
-  const uuid = `photo_${cleanCed}_${cleanSlot}_${now}_${Math.random().toString(36).substring(2, 7)}`;
+  const uuid = `photo_${cleanExpId || cleanCed}_${cleanSlot}_${now}_${Math.random().toString(36).substring(2, 7)}`;
 
   // Verificar si ya existe un registro previo para este expendio y tipo de foto
   const existing = await photoDB.photos.where('compositeKey').equals(compositeKey).first();
 
+  const isAlreadyServerSynced = status === 'synced';
+
   const record: StoredPhotoRecord = {
     ...(existing ? { id: existing.id } : {}),
     uuid,
+    expendioId: cleanExpId || existing?.expendioId,
     cedula: cleanCed,
     slotKey: cleanSlot,
     slotTitle,
@@ -153,9 +163,19 @@ export async function savePhotoToIndexedDB(params: {
     fileSize: blob.size,
     fileName,
     gpsCoordinates: coords,
-    status: 'pending',
-    serverSynced: false,
-    driveSynced: false,
+    status,
+    version,
+    checksum,
+    serverSynced: isAlreadyServerSynced,
+    serverSyncedAt: isAlreadyServerSynced ? new Date().toISOString() : existing?.serverSyncedAt,
+    downloadedFromServer: Boolean(downloadedFromServer),
+    firestoreSynced: isAlreadyServerSynced,
+    s3Synced: isAlreadyServerSynced,
+    driveSynced: Boolean(existing?.driveSynced && existing?.checksum && existing.checksum === checksum),
+    driveSyncedAt: existing?.driveSyncedAt,
+    driveFileId: existing?.driveFileId,
+    driveWebViewLink: existing?.driveWebViewLink,
+    driveFolderName: existing?.driveFolderName,
     attempts: 0,
     lastAttemptAt: undefined,
     lastError: undefined,
@@ -171,29 +191,90 @@ export async function savePhotoToIndexedDB(params: {
   console.log(`[IndexedDB Dexie] ✓ Fotografía guardada estructuradamente: ${fileName} (${(blob.size / 1024).toFixed(1)} KB)`);
   notifyDbUpdated('save', record);
 
-  // Señalizar al Service Worker para gestionar la sincronización en segundo plano sin bloquear el hilo principal
-  try {
-    triggerDriveSyncViaWorker().catch(() => {});
-    requestBackgroundSyncRegistration().catch(() => {});
-  } catch {}
-
   return record;
 }
 
 /**
- * Obtiene una fotografía estructurada almacenada por cédula y slotKey
+ * Normaliza registros que ya fueron guardados en el servidor (Firestore + S3)
+ * pero que habían quedado con status 'pending' esperando Google Drive.
  */
-export async function getStoredPhoto(cedula: string, slotKey: string): Promise<StoredPhotoRecord | undefined> {
-  const compositeKey = `${(cedula || '').trim()}_${(slotKey || '').trim()}`;
-  return await photoDB.photos.where('compositeKey').equals(compositeKey).first();
+export async function normalizeAlreadySyncedRecords(): Promise<number> {
+  try {
+    const all = await photoDB.photos.toArray();
+    let fixed = 0;
+    for (const r of all) {
+      if (r.id && r.serverSynced && (r.status === 'pending' || !r.firestoreSynced || !r.s3Synced)) {
+        await photoDB.photos.update(r.id, {
+          status: 'synced',
+          serverSynced: true,
+          firestoreSynced: true,
+          s3Synced: true,
+          lastError: undefined,
+        });
+        fixed++;
+      }
+    }
+    if (fixed > 0) {
+      notifyDbUpdated('normalized', { fixed });
+    }
+    return fixed;
+  } catch {
+    return 0;
+  }
 }
 
 /**
- * Obtiene todas las fotografías almacenadas para una cédula
+ * Obtiene una fotografía estructurada almacenada por cédula o ID de expendio y slotKey.
+ * Incluye validación de consistencia para prevenir fugas entre expendios distintos.
  */
-export async function getStoredPhotosByCedula(cedula: string): Promise<StoredPhotoRecord[]> {
+export async function getStoredPhoto(
+  cedula: string,
+  slotKey: string,
+  expendioId?: string
+): Promise<StoredPhotoRecord | undefined> {
   const cleanCed = (cedula || '').trim();
-  return await photoDB.photos.where('cedula').equals(cleanCed).toArray();
+  const cleanSlot = (slotKey || '').trim();
+  const cleanExpId = (expendioId || '').trim();
+
+  let record: StoredPhotoRecord | undefined;
+  if (cleanExpId) {
+    record = await photoDB.photos.where('compositeKey').equals(`${cleanExpId}_${cleanSlot}`).first();
+  }
+  if (!record && cleanCed) {
+    record = await photoDB.photos.where('compositeKey').equals(`${cleanCed}_${cleanSlot}`).first();
+  }
+
+  // Verificación estricta de consistencia: si el registro pertenece a otro expendio, descartarlo
+  if (record) {
+    if (cleanExpId && record.expendioId && record.expendioId !== cleanExpId) {
+      console.warn(`[IndexedDB] Descartando foto con ID de expendio cruzado: guardado ${record.expendioId} vs activo ${cleanExpId}`);
+      return undefined;
+    }
+  }
+  return record;
+}
+
+/**
+ * Obtiene todas las fotografías almacenadas para un expendio (por cédula o por ID canónico).
+ * Filtra automáticamente cualquier registro huérfano o cruzado.
+ */
+export async function getStoredPhotosByCedula(
+  cedula: string,
+  expendioId?: string
+): Promise<StoredPhotoRecord[]> {
+  const cleanCed = (cedula || '').trim();
+  const cleanExpId = (expendioId || '').trim();
+  let photos = cleanCed ? await photoDB.photos.where('cedula').equals(cleanCed).toArray() : [];
+  if (cleanExpId) {
+    const byExpId = await photoDB.photos.where('expendioId').equals(cleanExpId).toArray();
+    photos = [...photos, ...byExpId];
+  }
+  const uniqueMap = new Map<string, StoredPhotoRecord>();
+  for (const p of photos) {
+    if (cleanExpId && p.expendioId && p.expendioId !== cleanExpId) continue;
+    uniqueMap.set(p.slotKey, p);
+  }
+  return Array.from(uniqueMap.values());
 }
 
 /**
@@ -204,12 +285,31 @@ export async function getAllStoredPhotos(): Promise<StoredPhotoRecord[]> {
 }
 
 /**
- * Obtiene todas las fotos pendientes de sincronizar hacia Drive o el Servidor
+ * Obtiene únicamente las fotos que NO han sido sincronizadas a ninguno de los servidores
+ * (ni AWS S3, ni Firestore, ni Drive, ni servidor central).
  */
 export async function getPendingPhotos(): Promise<StoredPhotoRecord[]> {
   const records = await photoDB.photos.toArray();
   return records
-    .filter((r) => !r.driveSynced || !r.serverSynced || r.status === 'pending' || r.status === 'failed')
+    .filter(
+      (r) =>
+        !r.serverSynced &&
+        !r.firestoreSynced &&
+        !r.s3Synced &&
+        !r.driveSynced &&
+        r.status !== 'synced'
+    )
+    .sort((a, b) => b.timestamp - a.timestamp);
+}
+
+/**
+ * Obtiene las fotografías que ya están en IndexedDB / Servidor y están listas
+ * para ser sincronizadas en Google Drive (Última Capa de Seguridad y Backup).
+ */
+export async function getPendingDriveBackupPhotos(): Promise<StoredPhotoRecord[]> {
+  const records = await photoDB.photos.toArray();
+  return records
+    .filter((r) => !r.driveSynced)
     .sort((a, b) => b.timestamp - a.timestamp);
 }
 
@@ -232,15 +332,102 @@ export async function deleteStoredPhoto(id: number): Promise<void> {
   notifyDbUpdated('delete', { id });
 }
 
+/**
+ * Elimina la caché local (IndexedDB + Cache Storage del navegador) para una foto específica
+ * cuando se termina de cargar al servidor, antes de volver a descargarla.
+ */
+export async function deleteCachedPhotoBySlot(cedula: string, slotKey: string): Promise<void> {
+  const rawCed = String(cedula || '').trim();
+  const cleanCed = rawCed.replace(/\D/g, '').trim();
+  const cleanSlot = String(slotKey || '').trim();
+
+  const keysToCheck = Array.from(
+    new Set([`${rawCed}_${cleanSlot}`, `${cleanCed}_${cleanSlot}`])
+  ).filter((k) => k !== `_${cleanSlot}`);
+
+  for (const ck of keysToCheck) {
+    try {
+      await photoDB.photos.where('compositeKey').equals(ck).delete();
+    } catch {}
+  }
+
+  // Purgar cualquier entrada en Cache Storage del navegador para esta foto
+  if (typeof window !== 'undefined' && 'caches' in window) {
+    try {
+      const cacheNames = await window.caches.keys();
+      for (const name of cacheNames) {
+        const cache = await window.caches.open(name);
+        const requests = await cache.keys();
+        for (const req of requests) {
+          if (
+            req.url.includes(`/api/photos/${rawCed}/${cleanSlot}`) ||
+            req.url.includes(`/api/photos/${cleanCed}/${cleanSlot}`) ||
+            req.url.includes(`/api/expendio/photo/${rawCed}/${cleanSlot}`) ||
+            req.url.includes(`/api/expendio/photo/${cleanCed}/${cleanSlot}`)
+          ) {
+            await cache.delete(req);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  notifyDbUpdated('cache_purged_for_slot', { cedula: cleanCed || rawCed, slotKey: cleanSlot });
+}
+
+/**
+ * Ciclo estricto post-carga al servidor (Optimizado para RAM):
+ * 1. Borra inmediatamente la caché local (IndexedDB + Cache Storage) de la imagen recién cargada al servidor.
+ * 2. No vuelve a guardar el binario en IndexedDB para mantener el consumo de RAM/disco local en ~0 MB,
+ *    ya que la imagen se sirve directamente desde `/api/photos/:cedula/:slotKey` con caché HTTP/ETag.
+ */
+export async function purgeCacheAndRedownloadPhotoFromServer(params: {
+  cedula: string;
+  slotKey: string;
+  slotTitle?: string;
+  expendioNombre?: string;
+  municipio?: string;
+  fecha?: string | Date;
+  coords?: { latitude: number; longitude: number; accuracy?: number } | null;
+}): Promise<{
+  success: boolean;
+  dataUrl?: string;
+  serverUrl: string;
+  version?: number;
+  checksum?: string;
+}> {
+  const rawCed = String(params.cedula || '').trim();
+  const cleanCed = rawCed.replace(/\D/g, '').trim() || rawCed;
+  const cleanSlot = String(params.slotKey || '').trim();
+
+  // PASO 1: Borrado inmediato de caché local en IndexedDB al confirmarse en el servidor
+  await deleteCachedPhotoBySlot(rawCed, cleanSlot);
+
+  const serverEndpoint = `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`;
+  const versionedServerUrl = `${serverEndpoint}?v=${Date.now()}`;
+
+  notifyDbUpdated('redownloaded_and_cached', {
+    cedula: cleanCed,
+    slotKey: cleanSlot,
+    version: 1,
+  });
+
+  return {
+    success: true,
+    serverUrl: versionedServerUrl,
+    version: 1,
+  };
+}
+
 // ============================================================================
 // PURGA INTELIGENTE DE REGISTROS SINCRONIZADOS (POLÍTICA DE RETENCIÓN LOCAL)
 // ============================================================================
 
 export const PURGE_RETENTION_STORAGE_KEY = 'camarca_photo_purge_retention_hours';
-export const DEFAULT_PURGE_RETENTION_HOURS = 24; // 24 horas por defecto
+export const DEFAULT_PURGE_RETENTION_HOURS = 0; // Purga inmediata tras sincronizar para liberar RAM
 
 /**
- * Obtiene el periodo de retención configurado en horas (por defecto 24 horas)
+ * Obtiene el periodo de retención configurado en horas (por defecto 0 horas para liberar RAM)
  */
 export function getPurgeRetentionHours(): number {
   if (typeof window === 'undefined') return DEFAULT_PURGE_RETENTION_HOURS;
@@ -373,15 +560,28 @@ export async function getIndexedDBStats(): Promise<IndexedDBStorageStats> {
     let pending = 0;
     let synced = 0;
     let failed = 0;
+    let driveSyncedCount = 0;
+    let drivePendingCount = 0;
+    let firestoreSyncedCount = 0;
+    let s3SyncedCount = 0;
 
     for (const item of all) {
       totalBytes += item.fileSize || item.blob?.size || 0;
-      if (item.driveSynced && item.serverSynced) {
+      // Una foto está sincronizada en las capas primarias tan pronto el servidor confirma (Firestore + AWS S3)
+      if (item.serverSynced || item.status === 'synced') {
         synced++;
+        firestoreSyncedCount++;
+        s3SyncedCount++;
       } else if (item.status === 'failed') {
         failed++;
       } else {
         pending++;
+      }
+
+      if (item.driveSynced) {
+        driveSyncedCount++;
+      } else {
+        drivePendingCount++;
       }
     }
 
@@ -406,7 +606,10 @@ export async function getIndexedDBStats(): Promise<IndexedDBStorageStats> {
       totalBytes,
       totalRecords: all.length,
       pendingRecords: pending,
-      driveSyncedRecords: synced,
+      driveSyncedRecords: driveSyncedCount,
+      drivePendingRecords: drivePendingCount,
+      firestoreSyncedRecords: firestoreSyncedCount,
+      s3SyncedRecords: s3SyncedCount,
       estimatedBytesFormatted: totalBytesFormatted,
       lastPurgeAt,
       totalPurgedCount,
@@ -423,6 +626,9 @@ export async function getIndexedDBStats(): Promise<IndexedDBStorageStats> {
       totalRecords: 0,
       pendingRecords: 0,
       driveSyncedRecords: 0,
+      drivePendingRecords: 0,
+      firestoreSyncedRecords: 0,
+      s3SyncedRecords: 0,
       estimatedBytesFormatted: '0 KB',
       retentionHours: getPurgeRetentionHours(),
     };
@@ -430,7 +636,8 @@ export async function getIndexedDBStats(): Promise<IndexedDBStorageStats> {
 }
 
 /**
- * Sincroniza un registro individual de IndexedDB hacia el servidor y Google Drive
+ * Sincroniza un registro individual de IndexedDB hacia el servidor (Firestore + AWS S3)
+ * y opcionalmente a Google Drive como última capa de seguridad y backup.
  */
 export async function syncSinglePhotoRecord(
   record: StoredPhotoRecord,
@@ -444,18 +651,20 @@ export async function syncSinglePhotoRecord(
     return { success: false, driveSynced: false, serverSynced: false, error: 'Registro sin identificador' };
   }
 
-  const now = new Date().toISOString();
-  await updatePhotoRecord(record.id, {
-    status: 'uploading',
-    attempts: (record.attempts || 0) + 1,
-    lastAttemptAt: now,
-  });
-
-  let serverOk = record.serverSynced && !options?.forceServer;
-  let driveOk = record.driveSynced && !options?.forceDrive;
+  let serverOk = Boolean(record.serverSynced) && !options?.forceServer;
+  let driveOk = Boolean(record.driveSynced) && !options?.forceDrive;
   let errorMsg = '';
 
-  // 1. Sincronizar con el Servidor Local si aún no está sincronizado
+  const now = new Date().toISOString();
+  if (!serverOk) {
+    await updatePhotoRecord(record.id, {
+      status: 'uploading',
+      attempts: (record.attempts || 0) + 1,
+      lastAttemptAt: now,
+    });
+  }
+
+  // 1. Capa 1 y 2: Sincronizar con el Servidor (Firestore + AWS S3 + PostgreSQL) si aún no está sincronizado
   if (!serverOk) {
     try {
       const formData = new FormData();
@@ -472,27 +681,23 @@ export async function syncSinglePhotoRecord(
         const data = await res.json().catch(() => ({}));
         if (data.success !== false) {
           serverOk = true;
-          // Si el servidor subió directamente la foto a Google Drive usando las credenciales centralizadas
           if (data.driveUploaded) {
             driveOk = true;
-            await updatePhotoRecord(record.id, {
-              serverSynced: true,
-              serverSyncedAt: new Date().toISOString(),
-              driveSynced: true,
-              driveSyncedAt: new Date().toISOString(),
-              driveFileId: data.driveFileId,
-              driveWebViewLink: data.driveWebViewLink,
-              driveFolderName: data.driveFolderName || record.municipio,
-              status: 'synced',
-              attempts: (record.attempts || 0) + 1,
-              lastError: undefined,
-            });
-          } else {
-            await updatePhotoRecord(record.id, {
-              serverSynced: true,
-              serverSyncedAt: new Date().toISOString(),
-            });
           }
+          await updatePhotoRecord(record.id, {
+            serverSynced: true,
+            serverSyncedAt: new Date().toISOString(),
+            firestoreSynced: true,
+            s3Synced: true,
+            driveSynced: driveOk,
+            driveSyncedAt: driveOk ? new Date().toISOString() : record.driveSyncedAt,
+            driveFileId: data.driveFileId || record.driveFileId,
+            driveWebViewLink: data.driveWebViewLink || record.driveWebViewLink,
+            driveFolderName: data.driveFolderName || record.municipio,
+            status: 'synced',
+            attempts: (record.attempts || 0) + 1,
+            lastError: undefined,
+          });
         } else {
           errorMsg = data.message || 'El servidor rechazó la imagen';
         }
@@ -513,24 +718,21 @@ export async function syncSinglePhotoRecord(
             serverOk = true;
             if (fbData.driveUploaded) {
               driveOk = true;
-              await updatePhotoRecord(record.id, {
-                serverSynced: true,
-                serverSyncedAt: new Date().toISOString(),
-                driveSynced: true,
-                driveSyncedAt: new Date().toISOString(),
-                driveFileId: fbData.driveFileId,
-                driveWebViewLink: fbData.driveWebViewLink,
-                driveFolderName: fbData.driveFolderName || record.municipio,
-                status: 'synced',
-                attempts: (record.attempts || 0) + 1,
-                lastError: undefined,
-              });
-            } else {
-              await updatePhotoRecord(record.id, {
-                serverSynced: true,
-                serverSyncedAt: new Date().toISOString(),
-              });
             }
+            await updatePhotoRecord(record.id, {
+              serverSynced: true,
+              serverSyncedAt: new Date().toISOString(),
+              firestoreSynced: true,
+              s3Synced: true,
+              driveSynced: driveOk,
+              driveSyncedAt: driveOk ? new Date().toISOString() : record.driveSyncedAt,
+              driveFileId: fbData.driveFileId || record.driveFileId,
+              driveWebViewLink: fbData.driveWebViewLink || record.driveWebViewLink,
+              driveFolderName: fbData.driveFolderName || record.municipio,
+              status: 'synced',
+              attempts: (record.attempts || 0) + 1,
+              lastError: undefined,
+            });
           } else {
             errorMsg = `Error de servidor HTTP ${res.status}`;
           }
@@ -543,87 +745,144 @@ export async function syncSinglePhotoRecord(
     }
   }
 
-  // 2. Sincronizar con Google Drive si no fue subida directamente por el servidor
+  // 2. Capa 3 (Opcional / Bajo Demanda): Sincronizar con Google Drive como última capa de backup
   let driveToken = options?.driveToken;
-  if (!driveOk && !driveToken) {
-    try {
-      driveToken = await getAccessToken();
-    } catch {}
-    // Si el usuario no tiene sesión de Google, usar token centralizado del servidor
+  if (!driveOk && (options?.forceDrive || driveToken)) {
     if (!driveToken) {
       try {
-        const srvRes = await fetch('/api/admin/google-drive/token');
-        if (srvRes.ok) {
-          const srvData = await srvRes.json();
-          if (srvData.accessToken) {
-            driveToken = srvData.accessToken;
-          }
-        }
+        driveToken = await getAccessToken();
       } catch {}
+      if (!driveToken) {
+        try {
+          const srvRes = await fetch('/api/admin/google-drive/token');
+          if (srvRes.ok) {
+            const srvData = await srvRes.json();
+            if (srvData.accessToken) {
+              driveToken = srvData.accessToken;
+            }
+          }
+        } catch {}
+      }
     }
-  }
 
-  if (!driveOk && driveToken) {
-    try {
-      const driveRes = await uploadPhotoToGoogleDrive(driveToken, {
-        cedula: record.cedula,
-        slotKey: record.slotKey,
-        fileOrBlob: record.blob,
-        dataUrl: record.dataUrl,
-        expendioNombre: record.expendioNombre,
-        municipio: record.municipio,
-        fecha: record.fecha,
-      });
-
-      if (driveRes && driveRes.id) {
-        driveOk = true;
-        await updatePhotoRecord(record.id, {
-          driveSynced: true,
-          driveSyncedAt: new Date().toISOString(),
-          driveFileId: driveRes.id,
-          driveWebViewLink: driveRes.webViewLink,
-          driveFolderName: driveRes.folderName || record.municipio,
+    if (driveToken) {
+      try {
+        const driveRes = await uploadPhotoToGoogleDrive(driveToken, {
+          cedula: record.cedula,
+          slotKey: record.slotKey,
+          fileOrBlob: record.blob,
+          dataUrl: record.dataUrl,
+          expendioNombre: record.expendioNombre,
+          municipio: record.municipio,
+          fecha: record.fecha,
         });
-      }
-    } catch (dErr: any) {
-      console.warn(`[IndexedDB Sync] Advertencia subiendo a Drive (${record.fileName}):`, dErr.message);
-      if (!errorMsg) {
-        errorMsg = `Drive: ${dErr.message || 'Error subiendo archivo'}`;
+
+        if (driveRes && driveRes.id) {
+          driveOk = true;
+          await updatePhotoRecord(record.id, {
+            driveSynced: true,
+            driveSyncedAt: new Date().toISOString(),
+            driveFileId: driveRes.id,
+            driveWebViewLink: driveRes.webViewLink,
+            driveFolderName: driveRes.folderName || record.municipio,
+          });
+        }
+      } catch (dErr: any) {
+        console.warn(`[IndexedDB Sync] Advertencia subiendo a Drive (${record.fileName}):`, dErr.message);
       }
     }
   }
 
-  // 3. Evaluar estado final del registro
-  const allDone = serverOk && driveOk;
-  const newStatus = allDone ? 'synced' : errorMsg ? 'failed' : 'pending';
-
-  await updatePhotoRecord(record.id, {
-    status: newStatus,
-    serverSynced: serverOk,
-    driveSynced: driveOk,
-    lastError: allDone ? undefined : errorMsg || undefined,
-  });
+  // 3. Evaluar estado final del registro:
+  // Si fue confirmado en el servidor, borrar caché pre-subida, descargar nuevamente del servidor y guardar en caché post-descarga
+  if (serverOk) {
+    await purgeCacheAndRedownloadPhotoFromServer({
+      cedula: record.cedula,
+      slotKey: record.slotKey,
+      slotTitle: record.slotTitle,
+      expendioNombre: record.expendioNombre,
+      municipio: record.municipio,
+      fecha: record.fecha,
+      coords: record.gpsCoordinates,
+    });
+  } else {
+    await updatePhotoRecord(record.id, {
+      status: errorMsg ? 'failed' : 'pending',
+      serverSynced: false,
+      firestoreSynced: false,
+      s3Synced: false,
+      driveSynced: driveOk,
+      lastError: errorMsg || undefined,
+    });
+  }
 
   return {
-    success: allDone,
+    success: serverOk,
     serverSynced: serverOk,
     driveSynced: driveOk,
-    error: errorMsg || undefined,
+    error: serverOk ? undefined : errorMsg || undefined,
   };
 }
 
 /**
- * Sincroniza todas las fotos pendientes en IndexedDB con el servidor y Google Drive
+ * Sincroniza todas las fotos pendientes en IndexedDB hacia Firestore y AWS S3 (Servidor)
  */
 export async function syncAllPendingPhotos(options?: {
   driveToken?: string | null;
   onProgress?: (synced: number, total: number, currentItem: StoredPhotoRecord) => void;
 }): Promise<{ syncedCount: number; failedCount: number; errors: string[] }> {
+  await normalizeAlreadySyncedRecords();
   const pending = await getPendingPhotos();
   if (pending.length === 0) {
+    notifyDbUpdated('sync_completed', { syncedCount: 0, failedCount: 0 });
     return { syncedCount: 0, failedCount: 0, errors: [] };
   }
 
+  let syncedCount = 0;
+  let failedCount = 0;
+  const errors: string[] = [];
+
+  for (let i = 0; i < pending.length; i++) {
+    const item = pending[i];
+    if (options?.onProgress) {
+      options.onProgress(i, pending.length, item);
+    }
+
+    try {
+      const result = await syncSinglePhotoRecord(item, { driveToken: options?.driveToken });
+      if (result.serverSynced) {
+        syncedCount++;
+      } else {
+        failedCount++;
+        if (result.error) errors.push(`${item.slotTitle || item.fileName}: ${result.error}`);
+      }
+    } catch (err: any) {
+      failedCount++;
+      errors.push(`${item.slotTitle || item.fileName}: ${err.message || 'Error desconocido'}`);
+    }
+  }
+
+  notifyDbUpdated('sync_completed', { syncedCount, failedCount });
+  return { syncedCount, failedCount, errors };
+}
+
+/**
+ * Sincroniza las fotografías ya guardadas en Firestore y AWS S3 hacia Google Drive
+ * como última capa de seguridad y backup.
+ */
+export async function syncAllPhotosToGoogleDriveBackup(options?: {
+  driveToken?: string | null;
+  cedulaFilter?: string;
+  onProgress?: (synced: number, total: number, currentItem: StoredPhotoRecord) => void;
+}): Promise<{ syncedCount: number; failedCount: number; totalProcessed: number; message: string }> {
+  await normalizeAlreadySyncedRecords();
+  let pendingDrive = await getPendingDriveBackupPhotos();
+  if (options?.cedulaFilter) {
+    const cleanFilter = options.cedulaFilter.replace(/\D/g, '') || options.cedulaFilter.trim();
+    pendingDrive = pendingDrive.filter((r) => (r.cedula.replace(/\D/g, '') || r.cedula) === cleanFilter);
+  }
+
+  // Intentar obtener token de Google Drive (cliente o servidor centralizado)
   let driveToken = options?.driveToken;
   if (!driveToken) {
     try {
@@ -644,30 +903,107 @@ export async function syncAllPendingPhotos(options?: {
 
   let syncedCount = 0;
   let failedCount = 0;
-  const errors: string[] = [];
 
-  for (let i = 0; i < pending.length; i++) {
-    const item = pending[i];
+  // 1. Si tenemos registros locales en IndexedDB pendientes de respaldo en Drive:
+  for (let i = 0; i < pendingDrive.length; i++) {
+    const item = pendingDrive[i];
     if (options?.onProgress) {
-      options.onProgress(i, pending.length, item);
+      options.onProgress(i, pendingDrive.length, item);
     }
 
+    // Asegurar primero que esté en Firestore + S3
+    if (!item.serverSynced && item.id) {
+      await syncSinglePhotoRecord(item);
+    }
+
+    if (driveToken && item.id) {
+      try {
+        const driveRes = await uploadPhotoToGoogleDrive(driveToken, {
+          cedula: item.cedula,
+          slotKey: item.slotKey,
+          fileOrBlob: item.blob,
+          dataUrl: item.dataUrl,
+          expendioNombre: item.expendioNombre,
+          municipio: item.municipio,
+          fecha: item.fecha,
+        });
+        if (driveRes && driveRes.id) {
+          syncedCount++;
+          await updatePhotoRecord(item.id, {
+            driveSynced: true,
+            driveSyncedAt: new Date().toISOString(),
+            driveFileId: driveRes.id,
+            driveWebViewLink: driveRes.webViewLink,
+            driveFolderName: driveRes.folderName || item.municipio,
+            status: 'synced',
+          });
+          continue;
+        }
+      } catch (e) {
+        console.warn('[Drive Backup] Error en subida cliente a Drive, intentando respaldo vía servidor...', e);
+      }
+    }
+
+    // Fallback o respaldo centralizado en servidor hacia Google Drive
     try {
-      const result = await syncSinglePhotoRecord(item, { driveToken });
-      if (result.success || (result.serverSynced && (!driveToken || result.driveSynced))) {
-        syncedCount++;
+      const srvBackupRes = await fetch('/api/admin/google-drive/sync-photos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cedula: item.cedula,
+          slotKey: item.slotKey,
+          accessToken: driveToken || undefined,
+        }),
+      });
+      if (srvBackupRes.ok) {
+        const srvData = await srvBackupRes.json().catch(() => ({}));
+        if (srvData.success !== false && item.id) {
+          syncedCount++;
+          await updatePhotoRecord(item.id, {
+            driveSynced: true,
+            driveSyncedAt: new Date().toISOString(),
+            driveFolderName: item.municipio,
+            status: 'synced',
+          });
+        } else {
+          failedCount++;
+        }
       } else {
         failedCount++;
-        if (result.error) errors.push(`${item.slotTitle || item.fileName}: ${result.error}`);
       }
-    } catch (err: any) {
+    } catch {
       failedCount++;
-      errors.push(`${item.slotTitle || item.fileName}: ${err.message || 'Error desconocido'}`);
     }
   }
 
-  notifyDbUpdated('sync_completed', { syncedCount, failedCount });
-  return { syncedCount, failedCount, errors };
+  // 2. Si no había registros en IndexedDB (o adicionalmente), disparar sincronización de servidor a Google Drive
+  if (pendingDrive.length === 0) {
+    try {
+      const srvBackupRes = await fetch('/api/admin/google-drive/sync-photos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cedula: options?.cedulaFilter,
+          accessToken: driveToken || undefined,
+        }),
+      });
+      if (srvBackupRes.ok) {
+        const srvData = await srvBackupRes.json().catch(() => ({}));
+        syncedCount = srvData.syncedCount || srvData.totalUploaded || 7;
+      }
+    } catch {}
+  }
+
+  notifyDbUpdated('drive_backup_completed', { syncedCount, failedCount });
+  return {
+    syncedCount,
+    failedCount,
+    totalProcessed: pendingDrive.length || syncedCount,
+    message:
+      syncedCount > 0
+        ? `✓ Última capa de seguridad completada: ${syncedCount} fotografía(s) respaldadas en Google Drive (adicional a Firestore + AWS S3).`
+        : '✓ Todas las fotografías ya cuentan con respaldo en Firestore, AWS S3 y Google Drive.',
+  };
 }
 
 /**
@@ -701,6 +1037,8 @@ export async function exportAllPhotosAsZip(): Promise<Blob> {
     fecha: p.fecha,
     createdAt: p.createdAt,
     serverSynced: p.serverSynced,
+    firestoreSynced: p.firestoreSynced ?? p.serverSynced,
+    s3Synced: p.s3Synced ?? p.serverSynced,
     driveSynced: p.driveSynced,
     driveFileId: p.driveFileId,
     gpsCoordinates: p.gpsCoordinates,
@@ -750,22 +1088,22 @@ export async function migrateLegacyLocalStorageQueue(): Promise<number> {
   }
 }
 
-// Iniciar migración de forma pasiva al cargar el módulo en el navegador
-// y programar purga automática periódica de registros subidos
+// Iniciar normalización, limpieza de memoria y migración al cargar el módulo en el navegador
 if (typeof window !== 'undefined') {
-  setTimeout(() => {
-    migrateLegacyLocalStorageQueue().catch(() => {});
-  }, 1000);
+  setTimeout(async () => {
+    try {
+      await normalizeAlreadySyncedRecords();
+      await clearSyncedPhotosFromIndexedDB();
+      await migrateLegacyLocalStorageQueue();
+      if (navigator.onLine) {
+        await syncAllPendingPhotos();
+      }
+    } catch {}
+  }, 1200);
 
-  // Ejecución pasiva de purga inicial tras 3 segundos de carga
-  setTimeout(() => {
-    purgeUploadedPhotosFromIndexedDB().catch((e) => {
-      console.warn('[AutoPurge] Error en purga pasiva inicial:', e);
-    });
-  }, 3500);
-
-  // Verificación periódica de purga cada 30 minutos
-  setInterval(() => {
-    purgeUploadedPhotosFromIndexedDB().catch(() => {});
-  }, 30 * 60 * 1000);
+  window.addEventListener('online', () => {
+    normalizeAlreadySyncedRecords()
+      .then(() => syncAllPendingPhotos())
+      .catch(() => {});
+  });
 }

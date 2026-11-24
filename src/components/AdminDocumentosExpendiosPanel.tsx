@@ -60,11 +60,27 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
 
   const totalExpendios = expendios.length > 0 ? expendios.length : 177;
 
+  // Helper to ensure authorization headers are always sent
+  const getAdminAuthHeaders = (extraHeaders: Record<string, string> = {}): Record<string, string> => {
+    const token =
+      (typeof window !== 'undefined' &&
+        (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) ||
+      '';
+    const headers: Record<string, string> = { ...extraHeaders };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+      headers['x-session-token'] = token;
+    }
+    return headers;
+  };
+
   // Fetch documentos config
   const fetchDocumentos = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/admin/documentos-expendios');
+      const res = await fetch('/api/admin/documentos-expendios', {
+        headers: getAdminAuthHeaders(),
+      });
       const json = await res.json();
       if (json.success && Array.isArray(json.data)) {
         setDocumentos(json.data);
@@ -95,7 +111,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     try {
       const res = await fetch('/api/admin/documentos-expendios/bulk', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           id: doc.id,
           habilitar: nuevoEstado,
@@ -114,7 +130,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
         // Fallback a ruta standard
         const res2 = await fetch('/api/admin/documentos-expendios', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             id: doc.id,
             habilitado: nuevoEstado,
@@ -155,7 +171,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     try {
       const res = await fetch('/api/admin/documentos-expendios/bulk', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ action: 'enable_all' }),
       });
       const json = await res.json();
@@ -188,7 +204,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     try {
       const res = await fetch('/api/admin/documentos-expendios/bulk', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ action: 'disable_all' }),
       });
       const json = await res.json();
@@ -225,7 +241,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     try {
       const res = await fetch('/api/admin/documentos-expendios', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           id,
           nombre: editNombre.trim(),
@@ -261,6 +277,7 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     try {
       const res = await fetch('/api/admin/documentos-expendios/upload', {
         method: 'POST',
+        headers: getAdminAuthHeaders(),
         body: formData,
       });
       const json = await res.json();
@@ -283,23 +300,40 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
   };
 
   // Descargar archivo original exacto sin modificaciones
-  const handleDownloadOriginalFile = (doc: DocumentoExpendioConfig) => {
+  const handleDownloadOriginalFile = async (doc: DocumentoExpendioConfig) => {
     if (doc.archivoUrl) {
-      const downloadUrl = `/api/documentos-expendios/download/${doc.id}`;
-      const link = document.createElement('a');
-      link.href = downloadUrl;
-      link.download = doc.archivoNombreOriginal || `${doc.nombre}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      showNotification(
-        'success',
-        `✓ Descargando archivo original exacto: "${doc.archivoNombreOriginal || doc.nombre}" (sin modificaciones).`
-      );
+      try {
+        const token =
+          (typeof window !== 'undefined' &&
+            (sessionStorage.getItem('camarca_token') || localStorage.getItem('camarca_token'))) ||
+          '';
+        const downloadUrl = `/api/documentos-expendios/download/${doc.id}${
+          token ? `?token=${encodeURIComponent(token)}` : ''
+        }`;
+        const res = await fetch(downloadUrl, { headers: getAdminAuthHeaders() });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = doc.archivoNombreOriginal || `${doc.nombre}.pdf`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+        showNotification(
+          'success',
+          `✓ Descargando archivo original exacto: "${doc.archivoNombreOriginal || doc.nombre}" (sin modificaciones).`
+        );
+      } catch (err: any) {
+        showNotification('error', 'Error descargando archivo original: ' + err.message);
+      }
     } else {
       showNotification(
         'error',
-        'Aún no se ha cargado el archivo oficial de tarifas. Por favor utiliza el botón "Cargar Archivo".'
+        'Aún no se ha cargado el archivo oficial. Por favor utiliza el botón "Cargar Archivo".'
       );
     }
   };
@@ -323,31 +357,28 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
     }
 
     const expId = targetExpId || selectedExpendioDemo;
-    const demoExp = (expendios.find((e) => e.id === expId) || expendios[0] || {
-      id: 'demo-1',
-      municipio: 'ARAUCA',
-      encargado: 'JORGE ANDRES LOPEZ PATIÑO',
-      cedula: '88.123.456',
-      telefonoPunto: '3151234567',
-      direccionPunto: 'Carrera 20 # 18 - 45 Centro',
-      localidad: 'ARAUCA',
-      centroOperativo: 'ARAUCA',
-    }) as ExpendioData;
+    const targetExp = expendios.find((e) => e.id === expId) || expendios[0];
+
+    if (!targetExp) {
+      showNotification('error', 'Sin datos registrados. Por favor registre o cargue expendios reales para generar el documento.');
+      setTestModalDoc(null);
+      return;
+    }
 
     setIsGeneratingDemo(true);
     try {
       if (testModalDoc.tipo === 'horario') {
-        await generateHorarioAtencionPDF(demoExp);
-        showNotification('success', `✓ PDF de Horario 4-72 generado de muestra para "${demoExp.municipio}".`);
+        await generateHorarioAtencionPDF(targetExp);
+        showNotification('success', `✓ PDF de Horario 4-72 generado para "${targetExp.municipio}".`);
       } else if (testModalDoc.tipo === 'contrato') {
-        await generateContratoServiciosPDF(demoExp);
+        await generateContratoServiciosPDF(targetExp, testModalDoc.archivoUrl);
         showNotification(
           'success',
-          `✓ Contrato (13 páginas) generado de muestra con datos de "${demoExp.encargado}".`
+          `✓ Contrato (13 páginas) generado con datos de "${targetExp.encargado}".`
         );
       } else if (testModalDoc.tipo === 'aviso') {
-        await generateAviso472PDF(demoExp);
-        showNotification('success', `✓ Aviso de Fachada generado de muestra para "${demoExp.municipio}".`);
+        await generateAviso472PDF(targetExp);
+        showNotification('success', `✓ Aviso de Fachada generado para "${targetExp.municipio}".`);
       } else if (testModalDoc.archivoUrl) {
         window.open(testModalDoc.archivoUrl, '_blank');
       } else {
@@ -707,6 +738,34 @@ export const AdminDocumentosExpendiosPanel: React.FC<AdminDocumentosExpendiosPan
                           {doc.archivoUrl
                             ? 'Los expendios descargarán TAL CUAL este mismo archivo original sin modificaciones ni alteraciones en el documento.'
                             : 'No se ha cargado el archivo de tarifas. Por favor carga el documento oficial (PDF) para que los expendios puedan descargarlo tal cual.'}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* CAJA ESPECIAL PARA CONTRATO: MODELO BASE TAL CUAL */}
+                {(doc.id === 'contrato' || doc.tipo === 'contrato') && (
+                  <div
+                    className={`my-2 p-3 rounded-xl border ${
+                      doc.archivoUrl
+                        ? 'bg-blue-50/80 dark:bg-blue-950/30 border-blue-300 dark:border-blue-700 text-blue-950 dark:text-blue-200'
+                        : 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200'
+                    }`}
+                  >
+                    <div className="flex items-start space-x-2.5">
+                      <FileText className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />
+                      <div className="text-xs space-y-1">
+                        <div className="font-bold text-slate-900 dark:text-slate-100 flex items-center space-x-1.5">
+                          <span>Modelo Base Oficial de Contrato</span>
+                          <span className="text-[10px] px-1.5 py-0.2 rounded-sm bg-blue-200 dark:bg-blue-900 text-blue-900 dark:text-blue-100 font-extrabold">
+                            Personalización Dinámica
+                          </span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-slate-600 dark:text-slate-300">
+                          {doc.archivoUrl
+                            ? 'El contrato mantendrá TAL CUAL este archivo modelo cargado; únicamente se sustituyen de forma dinámica el nombre del encargado, la dirección y la ciudad correspondientes a cada expendio.'
+                            : 'Puede cargar el archivo modelo base (PDF o DOCX). El sistema mantendrá tal cual el modelo y únicamente cambiará el nombre, dirección y ciudad del expendio al descargar.'}
                         </p>
                       </div>
                     </div>

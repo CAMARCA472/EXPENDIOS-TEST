@@ -74,7 +74,7 @@ export const TrazabilidadExpendiosPanel: React.FC<TrazabilidadExpendiosPanelProp
 
   const fetchInternalExpendios = async () => {
     try {
-      const res = await fetch('/api/expendios');
+      const res = await fetch('/api/expendios', {  });
       const data = await res.json();
       if (data.success && Array.isArray(data.data)) {
         setInternalExpendios(data.data);
@@ -88,7 +88,7 @@ export const TrazabilidadExpendiosPanel: React.FC<TrazabilidadExpendiosPanelProp
   const fetchTrazabilidad = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/admin/trazabilidad');
+      const res = await fetch('/api/admin/trazabilidad', {  });
       const data = await res.json();
       if (data.success && Array.isArray(data.data)) {
         setTrazabilidadList(data.data);
@@ -202,8 +202,10 @@ export const TrazabilidadExpendiosPanel: React.FC<TrazabilidadExpendiosPanelProp
     try {
       const res = await fetch('/api/admin/trazabilidad-all', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        headers: {
+          'Content-Type': 'application/json',
+          },
+        body: JSON.stringify({ password: password.trim() }),
       });
       const data = await res.json();
       if (data.success) {
@@ -813,7 +815,7 @@ export const TrazabilidadExpendiosPanel: React.FC<TrazabilidadExpendiosPanelProp
         </div>
       )}
 
-      {/* Modal de Borrado Seguro con Contraseña Maestra (Camarca.2023*) para Vaciar Toda la Trazabilidad */}
+      {/* Modal de Borrado Seguro con Contraseña Maestra para Vaciar Toda la Trazabilidad */}
       {showClearAllModal && (
         <ConfirmarBorradoModal
           isOpen={showClearAllModal}

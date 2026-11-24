@@ -43,7 +43,7 @@ export const PeriodoDescargaConfigCard: React.FC<PeriodoDescargaConfigCardProps>
   const fetchConfig = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store' });
+      const res = await fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store',  });
       const data = await res.json();
       if (data.success && data.data) {
         setConfig(data.data);

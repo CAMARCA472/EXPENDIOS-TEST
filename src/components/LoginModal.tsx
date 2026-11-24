@@ -11,15 +11,22 @@ import {
   CheckCircle2, 
   ChevronRight,
   HelpCircle,
-  Sparkles
+  Sparkles,
+  Lock,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 interface LoginModalProps {
   onLoginSuccess: (session: UserSession) => void;
+  onClearNotice?: () => void;
 }
 
-export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
+export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess, onClearNotice }) => {
   const [inputVal, setInputVal] = useState<string>('');
+  const [adminPassword, setAdminPassword] = useState<string>('');
+  const [showPassword, setShowPassword] = useState<boolean>(false);
+  const [passwordStepRequired, setPasswordStepRequired] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [showWhatsAppHelp, setShowWhatsAppHelp] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
@@ -27,11 +34,29 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
   // Role selector step for Super-Admin ID 1094269932
   const [pendingAdminUser, setPendingAdminUser] = useState<UserSession | null>(null);
 
+  const trimmed = inputVal.trim().toLowerCase();
+  const normalizedDigits = inputVal.replace(/\D/g, '');
+  const isTextAdmin = trimmed === 'admin' || trimmed === 'administrador';
+  const isAdminCedulaTyped =
+    normalizedDigits === '1094269932' ||
+    normalizedDigits === '9005042417' ||
+    normalizedDigits === '900504241' ||
+    isTextAdmin ||
+    passwordStepRequired;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanId = inputVal.trim();
+    if (onClearNotice) onClearNotice();
+    const cleanId = isTextAdmin ? '1094269932' : inputVal.trim();
     if (!cleanId) {
       setErrorMsg('Por favor ingresa tu número de Cédula o NIT de acceso.');
+      setShowWhatsAppHelp(false);
+      return;
+    }
+
+    if (isAdminCedulaTyped && !adminPassword.trim()) {
+      setPasswordStepRequired(true);
+      setErrorMsg('Por seguridad, ingresa tu contraseña adicional de Administrador.');
       setShowWhatsAppHelp(false);
       return;
     }
@@ -41,28 +66,80 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
     setShowWhatsAppHelp(false);
 
     try {
-      const res = await fetch('/api/auth/login', {
+      // Borrar caché antes de iniciar sesión
+      if (typeof window !== 'undefined' && typeof (window as any).clearAppCache === 'function') {
+        try {
+          await (window as any).clearAppCache();
+        } catch {}
+      }
+
+      let res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
+          cedula: cleanId,
           passwordOrCedula: cleanId,
+          adminPassword: adminPassword.trim(),
         }),
       });
 
-      const data = await res.json();
+      let data = await res.json().catch(() => null);
+
+      // Reintento resiliente si la conexión fue interceptada por proxy o reinicio temporal
+      if (!data || data.error === 'INVALID_JSON_RESPONSE') {
+        await new Promise((r) => setTimeout(r, 450));
+        res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            cedula: cleanId,
+            passwordOrCedula: cleanId,
+            adminPassword: adminPassword.trim(),
+          }),
+        });
+        data = await res.json().catch(() => null);
+      }
+
+      if (!data) {
+        throw new Error('Sin respuesta del servidor');
+      }
 
       if (data.success && data.user) {
-        // If it's the Admin ID 1094269932, prompt to choose module
-        if (cleanId === '1094269932' || data.isMultiRoleAdmin || data.canSelectRole) {
+        if (onClearNotice) onClearNotice();
+        if (data.token) {
+          sessionStorage.setItem('camarca_token', data.token);
+          localStorage.setItem('camarca_token', data.token);
+        }
+        sessionStorage.setItem('camarca_id', data.user.cedulaOrNit || cleanId);
+        sessionStorage.setItem('camarca_role', data.user.role || 'expendio');
+
+        // Super-Admin 1094269932 can choose role; Clean Admin 9005042417 goes straight to clean Admin panel
+        if (!data.isCleanAdmin && (normalizedDigits === '1094269932' || isTextAdmin || data.isMultiRoleAdmin || data.canSelectRole)) {
           setPendingAdminUser(data.user);
         } else {
-          onLoginSuccess(data.user);
+          await onLoginSuccess(data.user);
         }
       } else {
-        setErrorMsg(
-          data.message || 'No se encontró ningún registro para el número ingresado. Verifica tus datos o contáctate con el administrador.'
-        );
-        setShowWhatsAppHelp(true);
+        if (data.error === 'INVALID_JSON_RESPONSE') {
+          setErrorMsg('El servidor está inicializando la sesión. Por favor pulsa Ingresar nuevamente.');
+          setShowWhatsAppHelp(false);
+        } else if (data.requiresPassword) {
+          setPasswordStepRequired(true);
+          setErrorMsg(data.message || 'Por seguridad, ingresa la contraseña de administrador.');
+          setShowWhatsAppHelp(false);
+        } else if (data.inconsistencia || data.error === 'CEDULA_DUPLICADA_INCONSISTENCIA') {
+          setErrorMsg(
+            data.message + (data.detalles ? ` ${data.detalles}` : '')
+          );
+          setShowWhatsAppHelp(true);
+        } else {
+          setErrorMsg(
+            data.message || 'No se encontró ningún registro para el número de cédula ingresado. Verifica tus datos o contáctate con el administrador.'
+          );
+          setShowWhatsAppHelp(true);
+        }
       }
     } catch (err) {
       console.error('Error durante el inicio de sesión:', err);
@@ -73,13 +150,18 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
     }
   };
 
-  const handleSelectRole = (chosenRole: Role) => {
+  const handleSelectRole = async (chosenRole: Role) => {
     if (!pendingAdminUser) return;
+    if (chosenRole === 'expendio' && typeof window !== 'undefined' && typeof (window as any).clearAppCache === 'function') {
+      try {
+        await (window as any).clearAppCache();
+      } catch {}
+    }
     const finalSession: UserSession = {
       ...pendingAdminUser,
       role: chosenRole,
     };
-    onLoginSuccess(finalSession);
+    await onLoginSuccess(finalSession);
   };
 
   const whatsappMessage = encodeURIComponent(
@@ -235,22 +317,63 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
             <form onSubmit={handleSubmit} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1.5">
-                  Número de Identificación / Cédula / NIT
+                  Cédula / NIT
                 </label>
                 <input
                   type="text"
                   value={inputVal}
-                  onChange={(e) => setInputVal(e.target.value)}
-                  placeholder="Ej: Ingrese su número de Cédula o NIT"
+                  onChange={(e) => {
+                    setInputVal(e.target.value);
+                    const valTrim = e.target.value.trim().toLowerCase();
+                    const isTextAdm = valTrim === 'admin' || valTrim === 'administrador';
+                    const nextDigits = e.target.value.replace(/\D/g, '');
+                    if (
+                      !isTextAdm &&
+                      nextDigits !== '1094269932' &&
+                      nextDigits !== '9005042417' &&
+                      nextDigits !== '900504241'
+                    ) {
+                      setPasswordStepRequired(false);
+                      setAdminPassword('');
+                    }
+                  }}
+                  placeholder="Ingrese su número de Cédula"
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent font-mono shadow-inner"
                   autoFocus
                 />
               </div>
 
+              {isAdminCedulaTyped && (
+                <div className="animate-in fade-in duration-150 space-y-1.5 p-3.5 rounded-xl bg-amber-500/5 border border-amber-500/30">
+                  <label className="flex items-center space-x-1.5 text-xs font-bold text-amber-300">
+                    <Lock className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Contraseña Adicional de Administrador</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={adminPassword}
+                      onChange={(e) => setAdminPassword(e.target.value)}
+                      placeholder="Ingrese la contraseña de administrador"
+                      className="w-full bg-slate-950 border border-amber-500/40 rounded-xl pl-4 pr-10 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent font-mono shadow-inner"
+                      autoFocus
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((prev) => !prev)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-amber-300 cursor-pointer"
+                      title={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-3.5 px-4 rounded-xl shadow-lg transition-all flex items-center justify-center space-x-2 cursor-pointer active:scale-[0.99] disabled:opacity-75"
+                className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-3.5 px-4 rounded-xl shadow-lg transition-all flex items-center justify-center space-x-2 cursor-pointer active:scale-[0.99] disabled:opacity-75 tracking-wider uppercase"
               >
                 {loading ? (
                   <span className="font-bold flex items-center justify-center space-x-2">
@@ -258,7 +381,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
                   </span>
                 ) : (
                   <>
-                    <span>Ingresar al Sistema</span>
+                    <span>INGRESAR</span>
                     <ArrowRight className="w-4 h-4" />
                   </>
                 )}

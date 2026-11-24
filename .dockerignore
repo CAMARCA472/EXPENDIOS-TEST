@@ -1,0 +1,16 @@
+.git
+.aistudio
+node_modules
+dist
+data
+database
+uploads
+public/assets/aistudio
+.env
+.env.*
+!.env.example
+spa.traineddata
+*.zip
+*.tar.gz
+*.tmp
+*.log

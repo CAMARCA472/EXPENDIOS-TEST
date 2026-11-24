@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import { ExpendioData, HistorialItem, CuentaCobroParams, CuentaCobroResult, ResumenFinancieroCuentas, SystemConfig } from '../types';
 import { generateCuentasCobroPDF, generateReporteFotograficoPDF, generateReporteFotograficoZip } from '../utils/pdfGenerator';
 import { formatPesos, formatNumberWithDots } from '../utils/formatters';
+import { isRealPhoto } from '../utils/photoValidation';
 import { numeroALetras } from '../utils/numeroALetras';
 import { CuentaCobroDocument } from './CuentaCobroDocument';
 import { ExpendioEditorModal } from './ExpendioEditorModal';
@@ -18,27 +19,38 @@ import { CargarGenerarModal, CargarGenerarConfig } from './CargarGenerarModal';
 import { DiscrepanciasEncargadoModal } from './DiscrepanciasEncargadoModal';
 import { ConfirmarBorradoModal } from './ConfirmarBorradoModal';
 import { ConciliacionCuentasAIModal } from './ConciliacionCuentasAIModal';
+import { PreviewCuentaConciliacionModal } from './PreviewCuentaConciliacionModal';
+import { IndexedDBNetworkDebuggerModal } from './IndexedDBNetworkDebuggerModal';
 import { CopiaSeguridadModal } from './CopiaSeguridadModal';
 import { ErrorBoundary } from './ErrorBoundary';
 import { EliminarBaseDatosModal } from './EliminarBaseDatosModal';
+import { ResetTotalModal } from './ResetTotalModal';
+import { AdminErrorCenterModal } from './AdminErrorCenterModal';
 import { AdminMetricasView } from './AdminMetricasView';
+import { normalizeCentroAcopio, normalizeCentroOperativo } from '../utils/centroOperativoAcopioHelper';
 import { AdminDocumentosExpendiosPanel } from './AdminDocumentosExpendiosPanel';
-import { GoogleSheetsDatabaseManager } from './GoogleSheetsDatabaseManager';
 import { EstadoConexion, notifyReportSaved } from './EstadoConexion';
+import { AwsS3ConnectionStatusPanel } from './AwsS3ConnectionStatusPanel';
+import { GoogleDrivePhotoBackupModule } from './GoogleDrivePhotoBackupModule';
 import { useAutoBackupGoogleDrive } from '../hooks/useAutoBackupGoogleDrive';
 import { DiscrepanciaEncargadoItem, ResolucionDiscrepanciasModo } from '../types';
+import { downloadAuthenticatedFile } from '../utils/downloadHelper';
 import {
   Activity,
+  Bot,
+  FileCheck,
   FileCheck2,
   History,
   Camera,
   Download,
+
   Filter,
   CheckCircle2,
   Calendar,
   Building2,
   FileSpreadsheet,
   FolderDown,
+  FolderArchive,
   RefreshCw,
   Search,
   Sparkles,
@@ -49,6 +61,7 @@ import {
   FileUp,
   AlertCircle,
   AlertTriangle,
+  Loader2,
   Edit3,
   Trash2,
   Plus,
@@ -72,9 +85,13 @@ import {
   Receipt,
   FileArchive,
   Cloud,
+  Server,
+  Zap,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  RotateCcw,
 } from 'lucide-react';
-
-import { FirebaseHealthCheck } from './FirebaseHealthCheck';
 
 // Meses y Años estándar para el sistema
 const MESES_SISTEMA = [
@@ -97,9 +114,18 @@ const ANIOS_SISTEMA = [
   '2031', '2032', '2033', '2034', '2035', '2036', '2037', '2038', '2039', '2040'
 ];
 
-export const AdminPanel: React.FC = () => {
+interface AdminPanelProps {
+  session?: any;
+}
+
+export const AdminPanel: React.FC<AdminPanelProps> = ({ session }) => {
+  const isCleanAdmin = Boolean(
+    session?.isCleanAdmin ||
+      String(session?.cedulaOrNit || '').replace(/\D/g, '') === '9005042417' ||
+      String(session?.cedulaOrNit || '').replace(/\D/g, '') === '900504241'
+  );
   const [activeTab, setActiveTab] = useState<
-    'expendios' | 'cobros' | 'pagos' | 'historial' | 'fotos' | 'trazabilidad' | 'metricas' | 'documentos' | 'sheets'
+    'expendios' | 'cobros' | 'pagos' | 'historial' | 'fotos' | 'trazabilidad' | 'metricas' | 'documentos'
   >('expendios');
   const [expendios, setExpendios] = useState<ExpendioData[]>([]);
   const [selectedFotoExpendioId, setSelectedFotoExpendioId] = useState<string>('');
@@ -110,9 +136,65 @@ export const AdminPanel: React.FC = () => {
   const [showEditorModal, setShowEditorModal] = useState<boolean>(false);
   const [showExcelModal, setShowExcelModal] = useState<boolean>(false);
   const [showAIConciliacionModal, setShowAIConciliacionModal] = useState<boolean>(false);
+  const [previewConciliacionData, setPreviewConciliacionData] = useState<{
+    isOpen: boolean;
+    cuentas: CuentaCobroResult[];
+    initialIndex: number;
+  } | null>(null);
+  const [showIDBDebuggerModal, setShowIDBDebuggerModal] = useState<boolean>(false);
   const [showCopiaSeguridadModal, setShowCopiaSeguridadModal] = useState<boolean>(false);
-  const [copiaSeguridadInitialTab, setCopiaSeguridadInitialTab] = useState<'cloudFirestore' | 'googleSheets' | 'export' | 'import' | 'snapshots' | 'googleDrive' | 'ambienteSync'>('googleSheets');
+  const [copiaSeguridadInitialTab, setCopiaSeguridadInitialTab] = useState<'cloudSql' | 'export' | 'import' | 'snapshots' | 'googleDrive' | 'ambienteSync'>('cloudSql');
   const [showEliminarBaseDatosModal, setShowEliminarBaseDatosModal] = useState<boolean>(false);
+  const [showResetTotalModal, setShowResetTotalModal] = useState<boolean>(false);
+  const [showErrorCenterModal, setShowErrorCenterModal] = useState<boolean>(false);
+  const [storageSummary, setStorageSummary] = useState<{
+    firebaseStatus?: string;
+    firebaseUsedGB?: string;
+    firebaseQuotaGB?: string;
+    firebaseQuotaPercent?: string;
+    firebaseQuotaState?: string;
+    firebaseFreeTier?: string;
+    firebasePercent?: string;
+    firebaseOpsReads?: string;
+    s3Status?: string;
+    s3UsedMB?: string;
+    s3Quota?: string;
+    s3OpsReads?: string;
+  } | null>(null);
+
+  const [showS3StatusPanel, setShowS3StatusPanel] = useState<boolean>(!isCleanAdmin);
+  const [isSyncingS3Photos, setIsSyncingS3Photos] = useState<boolean>(false);
+
+  const fetchStorageSummary = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/admin/photo-storage/stats?_t=${Date.now()}`, {
+        headers: { 'Cache-Control': 'no-store' },
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success) {
+          setStorageSummary(json);
+        }
+      }
+    } catch {}
+  }, []);
+
+  const handleSyncPhotosToS3 = useCallback(async () => {
+    setIsSyncingS3Photos(true);
+    try {
+      const res = await fetch('/api/admin/photo-storage/force-sync-local-photos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const json = await res.json();
+      if (json.success) {
+        setSyncStatusMsg(json.message || '✓ Fotografías sincronizadas con el bucket AWS S3 exitosamente.');
+        await fetchStorageSummary();
+      }
+    } catch {} finally {
+      setIsSyncingS3Photos(false);
+    }
+  }, [fetchStorageSummary]);
 
   // Auto Backup Google Drive (Cada 10 minutos)
   const {
@@ -143,6 +225,74 @@ export const AdminPanel: React.FC = () => {
   const [searchFotoExpendioTerm, setSearchFotoExpendioTerm] = useState<string>('');
   const [generandoPDFTodos, setGenerandoPDFTodos] = useState<boolean>(false);
   const [generandoZipTodos, setGenerandoZipTodos] = useState<boolean>(false);
+
+  // Sorting and Filtering for Expendios in Admin
+  const [expendioSortField, setExpendioSortField] = useState<
+    | 'centroOperativo'
+    | 'centroAcopio'
+    | 'localidad'
+    | 'encargado'
+    | 'cedula'
+    | 'direccionPunto'
+    | 'telefonoPunto'
+    | 'letrero'
+    | 'bascula'
+    | 'matasello'
+    | 'usuarioSipost'
+    | 'computador'
+    | 'internet'
+    | 'nit'
+    | 'cuentaBancaria'
+    | 'correoElectronico'
+    | 'observacion'
+    | 'fechaUltimaActualizacion'
+    | null
+  >('encargado');
+  const [expendioSortDirection, setExpendioSortDirection] = useState<'asc' | 'desc' | null>('asc');
+  const [filterCentroOperativo, setFilterCentroOperativo] = useState<string>('TODOS');
+  const [filterCentroAcopio, setFilterCentroAcopio] = useState<string>('TODOS');
+  const [filterLocalidad, setFilterLocalidad] = useState<string>('TODOS');
+  const [openFilterDropdown, setOpenFilterDropdown] = useState<string | null>(null);
+  const adminDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Selector de Año, Mes y Centro Operativo para el Nuevo Informe Consolidado de Excel
+  const defaultCurrentYearStr = String(Math.max(2026, new Date().getFullYear()));
+  const [informeAnio, setInformeAnio] = useState<string>(defaultCurrentYearStr);
+  const [informeMes, setInformeMes] = useState<string>('TODOS');
+  const [informeCentroOp, setInformeCentroOp] = useState<string>('TODOS');
+  const [showInformeSelector, setShowInformeSelector] = useState<boolean>(false);
+  const [descargandoInformeConsolidado, setDescargandoInformeConsolidado] = useState<boolean>(false);
+  const [descargandoExcelExpendios, setDescargandoExcelExpendios] = useState<boolean>(false);
+
+  const handleDescargarInformeConsolidado = async () => {
+    const endpoint = `/api/admin/export-informe-consolidado-excel?anio=${encodeURIComponent(informeAnio)}&mes=${encodeURIComponent(informeMes)}&centroOperativo=${encodeURIComponent(informeCentroOp)}`;
+    const filename = `Informe_Consolidado_Expendios_${informeAnio}_${informeMes !== 'TODOS' ? informeMes + '_' : ''}${informeCentroOp !== 'TODOS' ? informeCentroOp + '_' : ''}${new Date().toISOString().split('T')[0]}.xlsx`;
+    await downloadAuthenticatedFile(endpoint, filename, {
+      onStart: () => setDescargandoInformeConsolidado(true),
+      onSuccess: () => setDescargandoInformeConsolidado(false),
+      onError: () => setDescargandoInformeConsolidado(false),
+    });
+  };
+
+  const handleExportarExcelExpendios = async () => {
+    await downloadAuthenticatedFile('/api/cliente/export-excel', 'Consolidado_Expendios_472.xlsx', {
+      onStart: () => setDescargandoExcelExpendios(true),
+      onSuccess: () => setDescargandoExcelExpendios(false),
+      onError: () => setDescargandoExcelExpendios(false),
+    });
+  };
+
+  // Close admin dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (adminDropdownRef.current && !adminDropdownRef.current.contains(event.target as Node)) {
+        setOpenFilterDropdown(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   const [previewPhotoModal, setPreviewPhotoModal] = useState<{
     url: string;
     title: string;
@@ -341,7 +491,7 @@ export const AdminPanel: React.FC = () => {
   } | null>(null);
   const [resolviendoDiscrepancias, setResolviendoDiscrepancias] = useState<boolean>(false);
 
-  // Modal de Borrado Seguro con Contraseña Maestra (Camarca.2023*)
+  // Modal de Borrado Seguro con Contraseña Maestra de Seguridad
   const [borradoModalConfig, setBorradoModalConfig] = useState<{
     isOpen: boolean;
     tipo: 'expendios' | 'historial';
@@ -356,58 +506,78 @@ export const AdminPanel: React.FC = () => {
   const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null);
   const [guardandoPeriodoDescarga, setGuardandoPeriodoDescarga] = useState<boolean>(false);
 
+  // Helper seguro para procesar respuestas de API sin lanzar errores si el servidor devuelve HTML
+  const safeFetchJson = async (res: Response) => {
+    try {
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        return { success: false, message: `Respuesta no JSON (${res.status})` };
+      }
+      return await res.json();
+    } catch {
+      return { success: false, message: 'Error procesando respuesta JSON' };
+    }
+  };
+
   // Load initial data
   const fetchData = async () => {
     setLoading(true);
     try {
+      const activeToken =
+        session?.token ||
+        sessionStorage.getItem('camarca_token') ||
+        localStorage.getItem('camarca_token');
+      const authHeaders: Record<string, string> = activeToken
+        ? { Authorization: `Bearer ${activeToken}`, 'x-session-token': activeToken }
+        : {};
+
       const [resExp, resHist, resPagos, resConfig, resMonitoring] = await Promise.all([
-        fetch(`/api/expendios?_t=${Date.now()}`, { cache: 'no-store' }),
-        fetch(`/api/admin/historial?_t=${Date.now()}`, { cache: 'no-store' }),
-        fetch(`/api/admin/relacion-pagos?_t=${Date.now()}`, { cache: 'no-store' }),
-        fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store' }),
-        fetch(`/api/system/sync-monitoring?_t=${Date.now()}`, { cache: 'no-store' })
+        fetch(`/api/expendios?_t=${Date.now()}`, { cache: 'no-store', headers: authHeaders }),
+        fetch(`/api/admin/historial?_t=${Date.now()}`, { cache: 'no-store', headers: authHeaders }),
+        fetch(`/api/admin/relacion-pagos?_t=${Date.now()}`, { cache: 'no-store', headers: authHeaders }),
+        fetch(`/api/config?_t=${Date.now()}`, { cache: 'no-store', headers: authHeaders }),
+        fetch(`/api/system/sync-monitoring?_t=${Date.now()}`, { cache: 'no-store', headers: authHeaders })
       ]);
-      const dataExp = await resExp.json();
-      const dataHist = await resHist.json();
-      const dataPagos = await resPagos.json();
-      const dataConfig = await resConfig.json();
-      const dataMonitoring = await resMonitoring.json();
 
-      let finalExpendios = dataExp.success ? dataExp.data : [];
-      let finalHistorial = dataHist.success ? dataHist.data : [];
+      if (resExp.status === 401) {
+        window.dispatchEvent(
+          new CustomEvent('camarca_session_expired', {
+            detail: {
+              reason: 'Tu sesión ha expirado por seguridad. Por favor ingresa nuevamente tu número de cédula para acceder.',
+            },
+          })
+        );
+        return;
+      }
 
-      // Lógica de verificación contra la base de datos central
-      if (dataMonitoring.success && dataMonitoring.firestore) {
-         const cloudCount = dataMonitoring.firestore.totalExpendiosCloud || 0;
-         const localCount = finalExpendios.length;
-         const localDbSizeBytes = dataMonitoring.firestore.localDbSizeBytes || 0;
-         
-         // Validar el tamaño del archivo almacenado: 
-         // El archivo base (congelado) con 170 expendios pesa menos de 1 MB (~954 KB).
-         // Solo forzamos el re-fetch si detectamos que estamos en esa versión base "dormida"
-         // para no bloquear la restauración manual de snapshots que puedan tener un tamaño válido (> 1 MB) pero un conteo distinto.
-         if (cloudCount > 0 && cloudCount !== localCount && localDbSizeBytes < 1000000) {
-            console.warn(`[Verificación] Desajuste detectado y tamaño de archivo sospechoso (${localDbSizeBytes} bytes). Local: ${localCount}, Nube: ${cloudCount}. Forzando re-fetch (restore)...`);
-            try {
-               const restoreRes = await fetch('/api/admin/cloud-restore-now', { method: 'POST' });
-               const restoreData = await restoreRes.json();
-               if (restoreData.success) {
-                  // Fetch again to get the restored data
-                  const [newExp, newHist] = await Promise.all([
-                     fetch(`/api/expendios?_t=${Date.now()}`, { cache: 'no-store' }),
-                     fetch(`/api/admin/historial?_t=${Date.now()}`, { cache: 'no-store' })
-                  ]);
-                  const newDataExp = await newExp.json();
-                  const newDataHist = await newHist.json();
-                  if (newDataExp.success) finalExpendios = newDataExp.data;
-                  if (newDataHist.success) finalHistorial = newDataHist.data;
-                  
-                  setSyncStatusMsg(`Verificación automática: Base de datos sincronizada correctamente desde la nube (${cloudCount} expendios).`);
-                  setTimeout(() => setSyncStatusMsg(''), 6000);
-               }
-            } catch (e) {
-               console.error('Error durante el re-fetch forzado:', e);
-            }
+      const dataExp = await safeFetchJson(resExp);
+      const dataHist = await safeFetchJson(resHist);
+      const dataPagos = await safeFetchJson(resPagos);
+      const dataConfig = await safeFetchJson(resConfig);
+      const dataMonitoring = await safeFetchJson(resMonitoring);
+
+      let finalExpendios = dataExp.success && Array.isArray(dataExp.data) ? dataExp.data : [];
+      let finalHistorial = dataHist.success && Array.isArray(dataHist.data) ? dataHist.data : [];
+
+      // Si por alguna razón /api/expendios retornó 0 pero hay sesión activa, consultar /api/admin/expendios como respaldo
+      if (finalExpendios.length === 0) {
+        try {
+          const resFallback = await fetch(`/api/admin/expendios?_t=${Date.now()}`, {
+            headers: authHeaders,
+            cache: 'no-store',
+          });
+          const dataFallback = await safeFetchJson(resFallback);
+          if (dataFallback.success && Array.isArray(dataFallback.data) && dataFallback.data.length > 0) {
+            finalExpendios = dataFallback.data;
+          }
+        } catch {}
+      }
+
+      // Verificación de datos cargados
+      if (dataMonitoring.success && dataMonitoring.database) {
+         const dbCount = dataMonitoring.database.totalExpendios || 0;
+         if (dbCount > 0 && finalExpendios.length === 0) {
+            console.log(`[AdminPanel] Cargados ${dbCount} expendios desde PostgreSQL.`);
          }
       }
 
@@ -436,7 +606,7 @@ export const AdminPanel: React.FC = () => {
     try {
       const res = await fetch('/api/admin/config/periodo-descarga', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', },
         body: JSON.stringify({
           periodoHabilitadoDescarga: nuevoPeriodo.trim().toUpperCase(),
           descargaHabilitada: habilitada,
@@ -467,6 +637,7 @@ export const AdminPanel: React.FC = () => {
 
   useEffect(() => {
     fetchData();
+    fetchStorageSummary();
   }, []);
 
   // Modal opener for Generation or Excel Upload
@@ -498,7 +669,7 @@ export const AdminPanel: React.FC = () => {
       if (cargarGenerarMode === 'auto') {
         const res = await fetch('/api/admin/cuentas-cobro', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', },
           body: JSON.stringify({
             aplicarGrossUp: config.aplicarGrossUp,
             modificarValorInicialRetencion: Number(config.modificarValorInicialRetencion),
@@ -512,7 +683,7 @@ export const AdminPanel: React.FC = () => {
         const data = await res.json();
         if (data.success) {
           // Always refresh history
-          const resHist = await fetch('/api/admin/historial');
+          const resHist = await fetch('/api/admin/historial', {  });
           const dataHist = await resHist.json();
           if (dataHist.success) setHistorial(dataHist.data);
 
@@ -575,7 +746,7 @@ export const AdminPanel: React.FC = () => {
 
         if (data.success) {
           // Refresh history
-          const resHist = await fetch('/api/admin/historial');
+          const resHist = await fetch('/api/admin/historial', {  });
           const dataHist = await resHist.json();
           if (dataHist.success) setHistorial(dataHist.data);
 
@@ -642,13 +813,13 @@ export const AdminPanel: React.FC = () => {
       if (data.success) {
         // Refresh master expendios list if database was updated
         if (modo === 'actualizar_bd') {
-          const resExp = await fetch('/api/expendios');
+          const resExp = await fetch('/api/expendios', {  });
           const dataExp = await resExp.json();
           if (dataExp.success) setExpendios(dataExp.data);
         }
 
         // Refresh history
-        const resHist = await fetch('/api/admin/historial');
+        const resHist = await fetch('/api/admin/historial', {  });
         const dataHist = await resHist.json();
         if (dataHist.success) setHistorial(dataHist.data);
 
@@ -698,7 +869,7 @@ export const AdminPanel: React.FC = () => {
       const activePeriod = cuentasGeneradas[0]?.periodo || periodo;
       const res = await fetch('/api/admin/relacion-pagos/sync-from-cuentas-cobro', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', },
         body: JSON.stringify({
           cuentas: cuentasGeneradas,
           periodo: activePeriod,
@@ -707,7 +878,7 @@ export const AdminPanel: React.FC = () => {
       const data = await res.json();
       if (data.success) {
         // Refresh history
-        const resHist = await fetch('/api/admin/historial');
+        const resHist = await fetch('/api/admin/historial', {  });
         const dataHist = await resHist.json();
         if (dataHist.success) setHistorial(dataHist.data);
 
@@ -989,11 +1160,24 @@ export const AdminPanel: React.FC = () => {
     if (!borradoModalConfig) return;
     setIsBorradoProcessing(true);
     try {
+      const sessionRaw = localStorage.getItem('camarca_session');
+      let currentRole = sessionStorage.getItem('camarca_role') || '';
+      let currentCedula = sessionStorage.getItem('camarca_cedula') || sessionStorage.getItem('camarca_id') || '';
+      if (sessionRaw) {
+        try {
+          const parsed = JSON.parse(sessionRaw);
+          if (parsed.role) currentRole = parsed.role;
+          if (parsed.cedulaOrNit) currentCedula = parsed.cedulaOrNit;
+        } catch {}
+      }
+
       if (borradoModalConfig.tipo === 'expendios') {
         const res = await fetch('/api/admin/clear-database', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password }),
+          headers: {
+            'Content-Type': 'application/json',
+            },
+          body: JSON.stringify({ password: password.trim() }),
         });
         const data = await res.json();
         if (data.success) {
@@ -1008,8 +1192,10 @@ export const AdminPanel: React.FC = () => {
       } else if (borradoModalConfig.tipo === 'historial') {
         const res = await fetch('/api/admin/historial-all', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password }),
+          headers: {
+            'Content-Type': 'application/json',
+            },
+          body: JSON.stringify({ password: password.trim() }),
         });
         const data = await res.json();
         if (data.success) {
@@ -1048,7 +1234,7 @@ export const AdminPanel: React.FC = () => {
         if (ids.length > 0) {
           await fetch('/api/admin/historial/delete-batch', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', },
             body: JSON.stringify({ ids }),
           });
         }
@@ -1060,7 +1246,7 @@ export const AdminPanel: React.FC = () => {
         if (ids.length > 0) {
           await fetch('/api/admin/historial/delete-batch', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', },
             body: JSON.stringify({ ids }),
           });
         }
@@ -1085,7 +1271,7 @@ export const AdminPanel: React.FC = () => {
       } else if (deleteConfirmModal.type === 'batch') {
         const res = await fetch('/api/admin/historial/delete-batch', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', },
           body: JSON.stringify({ ids: selectedHistorialIds }),
         });
         const data = await res.json();
@@ -1095,7 +1281,7 @@ export const AdminPanel: React.FC = () => {
       }
 
       // Re-fetch updated historial
-      const resHist = await fetch('/api/admin/historial');
+      const resHist = await fetch('/api/admin/historial', {  });
       const dataHist = await resHist.json();
       if (dataHist.success) {
         setHistorial(dataHist.data);
@@ -1248,7 +1434,7 @@ export const AdminPanel: React.FC = () => {
         if (targetId) {
           await fetch(`/api/admin/historial/${encodeURIComponent(targetId)}`, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', },
             body: JSON.stringify({
               ...editForm,
               cargoBasico: cargo,
@@ -1262,7 +1448,7 @@ export const AdminPanel: React.FC = () => {
       } else if (editingCuentaItem.source === 'historial' && editingCuentaItem.historialId) {
         const res = await fetch(`/api/admin/historial/${editingCuentaItem.historialId}`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', },
           body: JSON.stringify({
             ...editForm,
             cargoBasico: cargo,
@@ -1274,7 +1460,7 @@ export const AdminPanel: React.FC = () => {
         });
         const data = await res.json();
         if (data.success) {
-          const resHist = await fetch('/api/admin/historial');
+          const resHist = await fetch('/api/admin/historial', {  });
           const dataHist = await resHist.json();
           if (dataHist.success) setHistorial(dataHist.data);
         }
@@ -1296,7 +1482,7 @@ export const AdminPanel: React.FC = () => {
       notifyReportSaved(
         `Reporte Fotográfico PDF (${expendios.length} Expendios)`,
         'fotos',
-        'Generado y respaldado en Google Cloud Firestore y Storage'
+        'Generado y respaldado en PostgreSQL y almacenamiento persistente'
       );
     } catch (err) {
       console.error('Error generando reporte fotográfico:', err);
@@ -1343,9 +1529,21 @@ export const AdminPanel: React.FC = () => {
   };
 
   const handleSaveExpendioSuccess = (updatedOrNewItem: ExpendioData, isNew: boolean) => {
+    setExpendios((prev) => {
+      if (isNew) {
+        return [updatedOrNewItem, ...prev];
+      }
+      const idx = prev.findIndex((e) => e.id === updatedOrNewItem.id);
+      if (idx !== -1) {
+        const next = [...prev];
+        next[idx] = updatedOrNewItem;
+        return next;
+      }
+      return prev;
+    });
     setSyncStatusMsg(
-      `✓ ${isNew ? 'Nuevo expendio' : 'Expendio'} "${updatedOrNewItem.localidad}" ${
-        isNew ? 'registrado' : 'actualizado'
+      `✓ ${isNew ? 'Nuevo expendio' : 'Expendio'} "${updatedOrNewItem.localidad || updatedOrNewItem.municipio}" (CC: ${updatedOrNewItem.cedula}) ${
+        isNew ? 'registrado' : 'actualizado y sincronizado'
       } con éxito en el sistema.`
     );
     fetchData();
@@ -1363,20 +1561,218 @@ export const AdminPanel: React.FC = () => {
     });
   };
 
-  // Filtered Expendios for Expendio Tab
-  const expendiosFiltrados = expendios.filter((e) => {
-    if (!searchExpendioTerm) return true;
-    const term = searchExpendioTerm.toLowerCase();
-    return (
-      (e.localidad || '').toLowerCase().includes(term) ||
-      (e.municipio || '').toLowerCase().includes(term) ||
-      (e.encargado || '').toLowerCase().includes(term) ||
-      (e.cedula || '').includes(term) ||
-      (e.direccionPunto || '').toLowerCase().includes(term) ||
-      (e.usuarioSipost || '').toLowerCase().includes(term) ||
-      (e.centroOperativo || '').toLowerCase().includes(term)
-    );
-  });
+  // Extract unique filter lists for Admin Expendios
+  const uniqueCentrosOperativos = React.useMemo(() => {
+    const set = new Set<string>();
+    expendios.forEach((e) => {
+      if (e.centroOperativo && e.centroOperativo.trim()) {
+        set.add(e.centroOperativo.trim());
+      }
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+  }, [expendios]);
+
+  const uniqueCentrosAcopio = React.useMemo(() => {
+    const set = new Set<string>();
+    expendios.forEach((e) => {
+      if (e.centroAcopio && e.centroAcopio.trim()) {
+        set.add(e.centroAcopio.trim());
+      }
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+  }, [expendios]);
+
+  const uniqueLocalidades = React.useMemo(() => {
+    const set = new Set<string>();
+    expendios.forEach((e) => {
+      if (e.localidad && e.localidad.trim()) {
+        set.add(e.localidad.trim());
+      }
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b, 'es', { sensitivity: 'base' }));
+  }, [expendios]);
+
+  const handleExpendioSort = (field: any) => {
+    if (!field) return;
+    if (expendioSortField === field) {
+      setExpendioSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setExpendioSortField(field);
+      setExpendioSortDirection('asc');
+    }
+  };
+
+  const [expendioCurrentPage, setExpendioCurrentPage] = useState<number>(1);
+  const [expendioPageSize, setExpendioPageSize] = useState<number>(25);
+
+  const resetAdminExpendioFilters = () => {
+    setSearchExpendioTerm('');
+    setFilterCentroOperativo('TODOS');
+    setFilterCentroAcopio('TODOS');
+    setFilterLocalidad('TODOS');
+    setExpendioSortField('encargado');
+    setExpendioSortDirection('asc');
+    setOpenFilterDropdown(null);
+    setExpendioCurrentPage(1);
+  };
+
+  useEffect(() => {
+    setExpendioCurrentPage(1);
+  }, [searchExpendioTerm, filterCentroOperativo, filterCentroAcopio, filterLocalidad, expendioSortField, expendioSortDirection]);
+
+  // Filtered & Sorted Expendios for Expendios Tab in Admin
+  const expendiosFiltrados = React.useMemo(() => {
+    let list = expendios.filter((e) => {
+      if (searchExpendioTerm) {
+        const term = searchExpendioTerm.toLowerCase();
+        const matchesSearch =
+          (e.localidad || '').toLowerCase().includes(term) ||
+          (e.municipio || '').toLowerCase().includes(term) ||
+          (e.encargado || '').toLowerCase().includes(term) ||
+          (e.cedula || '').includes(term) ||
+          (e.direccionPunto || '').toLowerCase().includes(term) ||
+          (e.telefonoPunto || '').includes(term) ||
+          (e.usuarioSipost || '').toLowerCase().includes(term) ||
+          (e.centroOperativo || '').toLowerCase().includes(term) ||
+          (e.centroAcopio || '').toLowerCase().includes(term) ||
+          (e.nit || '').includes(term) ||
+          (e.correoElectronico || '').toLowerCase().includes(term);
+        if (!matchesSearch) return false;
+      }
+
+      if (filterCentroOperativo !== 'TODOS' && (e.centroOperativo || '').trim() !== filterCentroOperativo) {
+        return false;
+      }
+      if (filterCentroAcopio !== 'TODOS' && (e.centroAcopio || '').trim() !== filterCentroAcopio) {
+        return false;
+      }
+      if (filterLocalidad !== 'TODOS' && (e.localidad || '').trim() !== filterLocalidad) {
+        return false;
+      }
+
+      return true;
+    });
+
+    if (expendioSortField && expendioSortDirection) {
+      const dir = expendioSortDirection;
+      list = [...list].sort((a, b) => {
+        let valA: any = '';
+        let valB: any = '';
+
+        switch (expendioSortField) {
+          case 'centroOperativo':
+            valA = a.centroOperativo || normalizeCentroOperativo(a.centroOperativo, a.localidad) || '';
+            valB = b.centroOperativo || normalizeCentroOperativo(b.centroOperativo, b.localidad) || '';
+            break;
+          case 'centroAcopio':
+            valA = a.centroAcopio || normalizeCentroAcopio(a.centroAcopio, a.localidad) || '';
+            valB = b.centroAcopio || normalizeCentroAcopio(b.centroAcopio, b.localidad) || '';
+            break;
+          case 'localidad':
+            valA = a.localidad || '';
+            valB = b.localidad || '';
+            break;
+          case 'encargado':
+            valA = a.encargado || '';
+            valB = b.encargado || '';
+            break;
+          case 'cedula':
+            valA = a.cedula || '';
+            valB = b.cedula || '';
+            break;
+          case 'direccionPunto':
+            valA = a.direccionPunto || '';
+            valB = b.direccionPunto || '';
+            break;
+          case 'telefonoPunto':
+            valA = a.telefonoPunto || '';
+            valB = b.telefonoPunto || '';
+            break;
+          case 'letrero':
+            valA = (isRealPhoto(a.letreroUrl) || isRealPhoto(a.fotoAvisoUrl)) ? 'CARGADO' : 'PENDIENTE';
+            valB = (isRealPhoto(b.letreroUrl) || isRealPhoto(b.fotoAvisoUrl)) ? 'CARGADO' : 'PENDIENTE';
+            break;
+          case 'bascula':
+            valA = (isRealPhoto(a.basculaUrl) || isRealPhoto(a.fotoBasculaUrl)) ? 'CARGADO' : 'PENDIENTE';
+            valB = (isRealPhoto(b.basculaUrl) || isRealPhoto(b.fotoBasculaUrl)) ? 'CARGADO' : 'PENDIENTE';
+            break;
+          case 'matasello':
+            valA = (isRealPhoto(a.mataselloUrl) || isRealPhoto(a.fotoMataselloUrl)) ? 'CARGADO' : 'PENDIENTE';
+            valB = (isRealPhoto(b.mataselloUrl) || isRealPhoto(b.fotoMataselloUrl)) ? 'CARGADO' : 'PENDIENTE';
+            break;
+          case 'usuarioSipost':
+            valA = a.usuarioSipost || '';
+            valB = b.usuarioSipost || '';
+            break;
+          case 'computador':
+            valA = a.tieneComputador || (a.computadorUrl ? 'SI' : 'NO');
+            valB = b.tieneComputador || (b.computadorUrl ? 'SI' : 'NO');
+            break;
+          case 'internet':
+            valA = a.internet || '';
+            valB = b.internet || '';
+            break;
+          case 'nit':
+            valA = a.nit || '';
+            valB = b.nit || '';
+            break;
+          case 'cuentaBancaria':
+            valA = a.cuentaBancaria || '';
+            valB = b.cuentaBancaria || '';
+            break;
+          case 'correoElectronico':
+            valA = a.correoElectronico || '';
+            valB = b.correoElectronico || '';
+            break;
+          case 'observacion':
+            valA = a.observacion || '';
+            valB = b.observacion || '';
+            break;
+          case 'fechaUltimaActualizacion':
+            valA = a.fechaUltimaActualizacion || '';
+            valB = b.fechaUltimaActualizacion || '';
+            break;
+          default:
+            valA = (a as any)[expendioSortField] || '';
+            valB = (b as any)[expendioSortField] || '';
+            break;
+        }
+
+        const strA = String(valA).trim();
+        const strB = String(valB).trim();
+        if (!strA && strB) return 1;
+        if (strA && !strB) return -1;
+        if (!strA && !strB) return 0;
+
+        const digitsA = strA.replace(/\D/g, '');
+        const digitsB = strB.replace(/\D/g, '');
+        if (digitsA && digitsB && digitsA.length === strA.length && digitsB.length === strB.length) {
+          const numA = Number(digitsA);
+          const numB = Number(digitsB);
+          if (!isNaN(numA) && !isNaN(numB)) {
+            return dir === 'asc' ? numA - numB : numB - numA;
+          }
+        }
+
+        const comp = strA.localeCompare(strB, 'es', { numeric: true, sensitivity: 'base' });
+        return dir === 'asc' ? comp : -comp;
+      });
+    }
+
+    return list;
+  }, [expendios, searchExpendioTerm, filterCentroOperativo, filterCentroAcopio, filterLocalidad, expendioSortField, expendioSortDirection]);
+
+  const totalExpendioPages = React.useMemo(() => {
+    if (expendioPageSize <= 0) return 1;
+    return Math.max(1, Math.ceil(expendiosFiltrados.length / expendioPageSize));
+  }, [expendiosFiltrados.length, expendioPageSize]);
+
+  const expendiosPaginados = React.useMemo(() => {
+    if (expendioPageSize <= 0) return expendiosFiltrados;
+    const safePage = Math.min(Math.max(1, expendioCurrentPage), totalExpendioPages);
+    const startIdx = (safePage - 1) * expendioPageSize;
+    return expendiosFiltrados.slice(startIdx, startIdx + expendioPageSize);
+  }, [expendiosFiltrados, expendioCurrentPage, expendioPageSize, totalExpendioPages]);
 
   // Months configuration for filtering
   const MESES_OPCIONES = [
@@ -1503,26 +1899,150 @@ export const AdminPanel: React.FC = () => {
           </p>
         </div>
 
+        {/* Action bar for All Administrators */}
         <div className="flex flex-wrap items-center gap-2">
-          {/* Componente de Verificación de Salud de Firebase */}
-          <FirebaseHealthCheck />
-
-          {/* Componente de Estado de Conexión en Tiempo Real (Firestore & Storage) */}
-          <EstadoConexion isLight={false} />
-
+          {/* BOTÓN PRINCIPAL: DESCARGA INMEDIATA DE LA COPIA DE SEGURIDAD (.JSON) */}
           <button
+            type="button"
+            onClick={async () => {
+              const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+              setSyncStatusMsg('⏳ Generando y descargando copia de seguridad de la base de datos...');
+              await downloadAuthenticatedFile('/api/admin/database-download', `CAMARCA_BASE_DATOS_${timestamp}.json`, {
+                onSuccess: (filename) => {
+                  setSyncStatusMsg(`✓ ¡Copia de seguridad descargada con éxito! Archivo '${filename}' guardado en la carpeta de Descargas de tu computador.`);
+                },
+                onError: (err) => {
+                  setSyncStatusMsg(`Error en descarga: ${err.message}. Abriendo opciones avanzadas...`);
+                  setCopiaSeguridadInitialTab('export');
+                  setShowCopiaSeguridadModal(true);
+                },
+              });
+            }}
+            className="bg-amber-400 hover:bg-amber-300 active:bg-amber-500 text-slate-950 font-black text-xs py-2 px-4 rounded-xl flex items-center space-x-2 cursor-pointer transition-all shadow-xl shadow-amber-500/25 active:scale-95 border-2 border-amber-300 ring-2 ring-amber-400/40"
+            title="Haz clic aquí para descargar inmediatamente el archivo de respaldo (.JSON) a tu computador"
+          >
+            <Download className="w-4 h-4 text-slate-950 stroke-[2.5]" />
+            <span>Descargar Copia de Seguridad</span>
+          </button>
+
+          {/* BOTÓN SECUNDARIO: DESCARGA DIRECTA DE FOTOS (.ZIP) */}
+          <button
+            type="button"
+            onClick={async () => {
+              const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+              setSyncStatusMsg('⏳ Empaquetando y descargando fotografías (.ZIP)...');
+              await downloadAuthenticatedFile('/api/admin/backup-fotos-zip', `CAMARCA_FOTOS_${timestamp}.zip`, {
+                onSuccess: (filename) => {
+                  setSyncStatusMsg(`✓ ¡Descarga completada! Archivo fotográfico '${filename}' guardado en tu carpeta de Descargas.`);
+                },
+                onError: (err) => {
+                  setSyncStatusMsg(`Error descargando fotos: ${err.message}`);
+                },
+              });
+            }}
+            className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 font-bold text-xs py-2 px-3 rounded-xl flex items-center space-x-1.5 cursor-pointer transition-all border border-slate-700 shadow"
+            title="Descargar paquete ZIP con todas las fotos de los municipios"
+          >
+            <FolderArchive className="w-3.5 h-3.5 text-amber-400" />
+            <span>Descargar Fotos (.ZIP)</span>
+          </button>
+
+          {/* BOTÓN PARA ABRIR EL PANEL DE RESTAURACIÓN Y GESTIÓN AVANZADA */}
+          <button
+            type="button"
             onClick={() => {
-              setCopiaSeguridadInitialTab('googleDrive');
+              setCopiaSeguridadInitialTab('import');
               setShowCopiaSeguridadModal(true);
             }}
-            className="bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs py-2 px-3.5 rounded-xl flex items-center space-x-2 cursor-pointer transition-all shadow-md active:scale-95"
-            title="Ajustes de Almacenamiento, Migración y Respaldos"
+            className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-300 font-bold text-xs py-2 px-3 rounded-xl flex items-center space-x-1.5 cursor-pointer transition-all border border-slate-700 shadow"
+            title="Restaurar base de datos desde archivo, snapshots, Google Drive o Cloud SQL"
           >
-            <Cloud className="w-4 h-4 text-white" />
-            <span>Configuración y Respaldos</span>
+            <Database className="w-3.5 h-3.5 text-slate-400" />
+            <span>Restaurar / Más</span>
           </button>
+
+          {/* Componente de Estado de Conexión en Tiempo Real */}
+          <EstadoConexion isLight={false} />
+
+          {/* Botón de Storage con Estado de la Cuota Destacado */}
+          <button
+            type="button"
+            onClick={() => {
+              setCopiaSeguridadInitialTab('cloudSql');
+              setShowCopiaSeguridadModal(true);
+            }}
+            className="bg-emerald-700/90 hover:bg-emerald-600 text-white font-extrabold text-xs py-2 px-3 rounded-xl flex items-center space-x-2 cursor-pointer transition-all shadow-md active:scale-95 border border-emerald-500/40"
+            title="Ajustes de Almacenamiento, Estado de la Cuota y Respaldos"
+          >
+            <Cloud className="w-4 h-4 text-emerald-200" />
+            <span className="font-black text-slate-100">Storage</span>
+            <div className="flex items-center space-x-1 px-1.5 py-0.5 rounded-lg bg-emerald-950/70 border border-emerald-400/40 text-[10px] text-emerald-300 font-mono">
+              <strong className="text-white font-bold">{storageSummary?.firebaseQuotaState || 'Óptima'}</strong>
+            </div>
+          </button>
+
+          {/* Botón Centro de Errores y Catálogo Oficial */}
+          <button
+            type="button"
+            onClick={() => setShowErrorCenterModal(true)}
+            className="bg-amber-950/80 hover:bg-amber-900/90 text-amber-300 font-extrabold text-xs py-2 px-3 rounded-xl flex items-center space-x-1.5 transition-all shadow-md active:scale-95 border border-amber-500/40 cursor-pointer"
+            title="Consultar Catálogo Oficial de Errores y Registro en Vivo de Incidencias"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-400" />
+            <span>Errores</span>
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          </button>
+
+          {/* Botón Diagnóstico Oculto IndexedDB vs Red (SOLO ADMINISTRADOR TÉCNICO) */}
+          {!isCleanAdmin && (
+            <button
+              type="button"
+              onClick={() => setShowIDBDebuggerModal(true)}
+              className="bg-indigo-950/80 hover:bg-indigo-900/90 text-indigo-300 font-extrabold text-xs py-2 px-3 rounded-xl flex items-center space-x-1.5 transition-all shadow-md active:scale-95 border border-indigo-500/40 cursor-pointer"
+              title="Herramienta de Diagnóstico en Tiempo Real: IndexedDB Local vs Red / Servidor"
+            >
+              <Database className="w-4 h-4 text-indigo-400" />
+              <span>Diagnóstico IDB</span>
+            </button>
+          )}
+
+          {/* Botón Destructivo de RESET TOTAL DE DATOS */}
+          {!isCleanAdmin && (
+            <button
+              type="button"
+              onClick={() => setShowResetTotalModal(true)}
+              className="bg-red-700 hover:bg-red-600 active:bg-red-800 text-white font-black text-xs py-2 px-3 rounded-xl flex items-center space-x-1.5 cursor-pointer transition-all shadow-md shadow-red-950/60 border border-red-500/50"
+              title="Vaciado absoluto de expendios, pagos, cobros y fotos en PostgreSQL"
+            >
+              <Trash2 className="w-4 h-4 text-red-200" />
+              <span>RESET</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Panel Administrativo de Verificación del Bucket AWS S3 'camarca-expendios-photos-contingency' */}
+      {!isCleanAdmin && showS3StatusPanel && (
+        <AwsS3ConnectionStatusPanel
+          onStatusUpdated={fetchStorageSummary}
+          onSyncAllPhotos={handleSyncPhotosToS3}
+          isSyncingPhotos={isSyncingS3Photos}
+        />
+      )}
+
+      {/* Módulo de Backup Fotográfico en Google Drive (Carpeta Municipio / Municipio_TipoFoto_DDMMAAAA.jpg) */}
+      {!isCleanAdmin && (
+        <GoogleDrivePhotoBackupModule
+          expendios={expendios}
+          onUpdateExpendio={(updatedExp) => {
+            setExpendios((prev) => prev.map((item) => (item.id === updatedExp.id ? updatedExp : item)));
+          }}
+          onRefreshExpendios={() => {
+            fetchStorageSummary();
+            fetchData();
+          }}
+        />
+      )}
 
       {/* Sync Status Banner */}
       {syncStatusMsg && (
@@ -1554,29 +2074,33 @@ export const AdminPanel: React.FC = () => {
           <span>1. Gestión de Expendios</span>
         </button>
 
-        <button
-          onClick={() => setActiveTab('cobros')}
-          className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
-            activeTab === 'cobros'
-              ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <FileCheck2 className="w-4 h-4" />
-          <span>2. Cuentas de Cobro Masivas</span>
-        </button>
+        {!isCleanAdmin && (
+          <button
+            onClick={() => setActiveTab('cobros')}
+            className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
+              activeTab === 'cobros'
+                ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <FileCheck2 className="w-4 h-4" />
+            <span>2. Cuentas de Cobro Masivas</span>
+          </button>
+        )}
 
-        <button
-          onClick={() => setActiveTab('pagos')}
-          className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
-            activeTab === 'pagos'
-              ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <FileSpreadsheet className="w-4 h-4" />
-          <span>3. Relación de Pagos & Excel</span>
-        </button>
+        {!isCleanAdmin && (
+          <button
+            onClick={() => setActiveTab('pagos')}
+            className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
+              activeTab === 'pagos'
+                ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            <span>3. Relación de Pagos & Excel</span>
+          </button>
+        )}
 
         <button
           onClick={() => setActiveTab('historial')}
@@ -1587,7 +2111,7 @@ export const AdminPanel: React.FC = () => {
           }`}
         >
           <History className="w-4 h-4" />
-          <span>4. Historial de Cobros</span>
+          <span>{isCleanAdmin ? '2. Historial de Cobros' : '4. Historial de Cobros'}</span>
         </button>
 
         <button
@@ -1599,7 +2123,7 @@ export const AdminPanel: React.FC = () => {
           }`}
         >
           <Camera className="w-4 h-4" />
-          <span>5. Reportes Fotográficos</span>
+          <span>{isCleanAdmin ? '3. Reportes Fotográficos' : '5. Reportes Fotográficos'}</span>
         </button>
 
         <button
@@ -1611,20 +2135,22 @@ export const AdminPanel: React.FC = () => {
           }`}
         >
           <ArrowLeftRight className="w-4 h-4" />
-          <span>6. Trazabilidad de Expendios</span>
+          <span>{isCleanAdmin ? '4. Trazabilidad de Expendios' : '6. Trazabilidad de Expendios'}</span>
         </button>
 
-        <button
-          onClick={() => setActiveTab('metricas')}
-          className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
-            activeTab === 'metricas'
-              ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
-              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-          }`}
-        >
-          <Activity className="w-4 h-4" />
-          <span>7. Métricas de Acceso</span>
-        </button>
+        {!isCleanAdmin && (
+          <button
+            onClick={() => setActiveTab('metricas')}
+            className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
+              activeTab === 'metricas'
+                ? 'bg-amber-500 text-slate-950 font-bold shadow-lg'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <Activity className="w-4 h-4" />
+            <span>7. Métricas de Acceso</span>
+          </button>
+        )}
 
         <button
           onClick={() => setActiveTab('documentos')}
@@ -1635,25 +2161,12 @@ export const AdminPanel: React.FC = () => {
           }`}
         >
           <FolderDown className="w-4 h-4" />
-          <span>8. Documentación Expendios</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('sheets')}
-          className={`py-2.5 px-4 rounded-xl flex items-center space-x-2 transition-all cursor-pointer whitespace-nowrap ${
-            activeTab === 'sheets'
-              ? 'bg-emerald-500 text-slate-950 font-black shadow-lg'
-              : 'text-emerald-400 hover:text-emerald-200 hover:bg-emerald-950/40 border border-emerald-800/60'
-          }`}
-        >
-          <FileSpreadsheet className="w-4 h-4" />
-          <span>9. Google Sheets DB</span>
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span>{isCleanAdmin ? '5. Documentación Expendios' : '8. Documentación Expendios'}</span>
         </button>
       </div>
 
       {/* --- TAB 1: CUENTAS DE COBRO MASIVAS --- */}
-      {activeTab === 'cobros' && (
+      {!isCleanAdmin && activeTab === 'cobros' && (
         <div className="space-y-6">
           {/* Card Destacado: Control de Periodo Oficial Habilitado para Descarga de Expendios */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
@@ -1972,6 +2485,37 @@ export const AdminPanel: React.FC = () => {
             </div>
           </div>
 
+          {/* Card Destacado: Carga de Cuentas Físicas / Soportes Escaneados para Conciliación con Preview */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+            <div className="flex items-start sm:items-center space-x-3.5">
+              <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl shrink-0">
+                <FileCheck className="w-6 h-6" />
+              </div>
+              <div className="space-y-0.5">
+                <div className="flex items-center space-x-2">
+                  <h4 className="text-sm font-bold text-slate-100">
+                    Conciliación de Cuentas Escaneadas (OCR & Soportes Físicos)
+                  </h4>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
+                    100% Determinístico
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Carga archivos PDF o imágenes escaneadas de cuentas firmadas para inspeccionar el <strong>preview físico</strong> y autorizar la conciliación.
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowAIConciliacionModal(true)}
+              className="px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-black rounded-xl text-xs flex items-center space-x-2 transition-all cursor-pointer shadow-lg active:scale-95 shrink-0"
+            >
+              <Upload className="w-4 h-4 text-slate-950" />
+              <span>Cargar Cuentas Físicas para Conciliar (con Preview)</span>
+            </button>
+          </div>
+
           {/* Calculated Output Table Preview Side */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1991,6 +2535,28 @@ export const AdminPanel: React.FC = () => {
 
               {cuentasGeneradas.length > 0 && (
                 <div className="flex flex-wrap items-center gap-2">
+                  {/* Botón de Vista Previa y Conciliación Destacado */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const listToPreview = selectedCuentasKeys.length > 0
+                        ? cuentasGeneradas.filter((c, idx) => selectedCuentasKeys.includes(getCuentaKey(c, idx)))
+                        : cuentasGeneradas;
+                      setPreviewConciliacionData({
+                        isOpen: true,
+                        cuentas: listToPreview,
+                        initialIndex: 0,
+                      });
+                    }}
+                    className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold py-2 px-3.5 rounded-xl text-xs flex items-center space-x-1.5 shadow-md cursor-pointer transition-all active:scale-95 border border-emerald-400/40"
+                    title="Ver Vista Previa Oficial y Conciliar Cuentas de Cobro"
+                  >
+                    <Eye className="w-3.5 h-3.5 text-emerald-200" />
+                    <span>
+                      Vista Previa y Conciliación {selectedCuentasKeys.length > 0 ? `(${selectedCuentasKeys.length})` : `(${cuentasGeneradas.length})`}
+                    </span>
+                  </button>
+
                   <button
                     onClick={handleCargarCuentasAContabilidad}
                     disabled={cargandoAContabilidad}
@@ -2242,6 +2808,20 @@ export const AdminPanel: React.FC = () => {
                           <td className="py-2.5 px-3 text-center sticky right-0 z-10 bg-slate-900/95 backdrop-blur-xs shadow-[-4px_0_12px_rgba(0,0,0,0.5)] border-l border-slate-800">
                             <div className="flex items-center justify-center space-x-1.5">
                               <button
+                                onClick={() => {
+                                  setPreviewConciliacionData({
+                                    isOpen: true,
+                                    cuentas: cuentasGeneradasFiltradas,
+                                    initialIndex: index,
+                                  });
+                                }}
+                                className="bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 font-bold px-2 py-1 rounded-lg text-[11px] transition-colors cursor-pointer inline-flex items-center space-x-1 shadow-xs"
+                                title="Ver Vista Previa de la Cuenta que se va a conciliar"
+                              >
+                                <Eye className="w-3 h-3 text-emerald-400" />
+                                <span>Preview y Conciliar</span>
+                              </button>
+                              <button
                                 onClick={() => handleOpenModalSingle(item)}
                                 className="bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold px-2 py-1 rounded-lg text-[11px] transition-colors cursor-pointer inline-flex items-center space-x-1"
                                 title="Ver e imprimir carta individual"
@@ -2323,17 +2903,6 @@ export const AdminPanel: React.FC = () => {
                 <p className="text-xs text-slate-400 mt-0.5">
                   Búsqueda, filtrado avanzado por meses y años, gestión, visualización y descarga de cobros históricos.
                 </p>
-              </div>
-
-              <div className="flex items-center space-x-2 self-start lg:self-center flex-wrap gap-y-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAIConciliacionModal(true)}
-                  className="bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-bold px-3.5 py-1.5 rounded-xl text-xs flex items-center space-x-1.5 shadow transition-all cursor-pointer"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-slate-950" />
-                  <span>Auditoría & Conciliación IA (PDF / Escáner)</span>
-                </button>
               </div>
             </div>
 
@@ -2683,13 +3252,23 @@ export const AdminPanel: React.FC = () => {
 
       {/* --- TAB 4: REPORTE FOTOGRÁFICO POR MUNICIPIO CON 7 FOTOS --- */}
       {activeTab === 'fotos' && (
-        <ReporteFotograficoMunicipiosView
-          expendios={expendios}
-          onUpdateExpendio={(updatedExp) => {
-            setExpendios((prev) => prev.map((item) => (item.id === updatedExp.id ? updatedExp : item)));
-          }}
-          onRefreshExpendios={fetchData}
-        />
+        <div className="space-y-6">
+          {!isCleanAdmin && !showS3StatusPanel && (
+            <AwsS3ConnectionStatusPanel
+              onStatusUpdated={() => fetchStorageSummary()}
+              onSyncAllPhotos={handleSyncPhotosToS3}
+              isSyncingPhotos={isSyncingS3Photos}
+            />
+          )}
+          <ReporteFotograficoMunicipiosView
+            expendios={expendios}
+            isCleanAdmin={isCleanAdmin}
+            onUpdateExpendio={(updatedExp) => {
+              setExpendios((prev) => prev.map((item) => (item.id === updatedExp.id ? updatedExp : item)));
+            }}
+            onRefreshExpendios={fetchData}
+          />
+        </div>
       )}
 
       {/* --- GESTIÓN DE EXPENDIOS --- */}
@@ -2728,16 +3307,162 @@ export const AdminPanel: React.FC = () => {
                 <span>+ Registrar Nuevo Expendio</span>
               </button>
 
-              <a
-                href="/api/cliente/export-excel"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold py-2.5 px-3.5 rounded-xl text-xs flex items-center space-x-1.5 shadow-md cursor-pointer transition-colors"
+              {!isCleanAdmin && (
+                <button
+                  onClick={() => setShowResetTotalModal(true)}
+                  className="bg-red-700 hover:bg-red-600 active:bg-red-800 text-white font-bold py-2.5 px-3.5 rounded-xl text-xs flex items-center space-x-1.5 shadow-md border border-red-500/50 cursor-pointer transition-colors"
+                  title="Vaciado total y reseteo de datos operativos en PostgreSQL"
+                >
+                  <Trash2 className="w-4 h-4 text-red-200" />
+                  <span>RESET TOTAL DE DATOS</span>
+                </button>
+              )}
+
+              <div className="flex items-center bg-sky-500/15 border border-sky-500/40 rounded-xl p-0.5 shadow-lg">
+                <button
+                  type="button"
+                  onClick={handleDescargarInformeConsolidado}
+                  disabled={descargandoInformeConsolidado}
+                  className="bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-slate-950 font-bold py-2 px-3.5 rounded-lg text-xs flex items-center space-x-1.5 cursor-pointer transition-colors"
+                  title={`Descargar Informe Consolidado en Excel: Municipio, Nombre Contratista, Cédula, Celular, Dirección, Última Actualización, Estado de las Fotos (7/7, 3/4, etc.) y Valor de Pagos (${informeAnio === 'COMPARAR_2026_2027' ? 'Comparativo 2026 vs 2027' : informeAnio})`}
+                >
+                  {descargandoInformeConsolidado ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
+                  ) : (
+                    <FileSpreadsheet className="w-4 h-4" />
+                  )}
+                  <span>
+                    {descargandoInformeConsolidado
+                      ? 'Descargando...'
+                      : `Descargar Informe Consolidado (${
+                          informeAnio === 'COMPARAR_2026_2027'
+                            ? '2026 vs 2027'
+                            : `${informeMes !== 'TODOS' ? informeMes.slice(0, 3) + ' ' : ''}${informeAnio}`
+                        }${informeCentroOp !== 'TODOS' ? ` • ${informeCentroOp}` : ''})`}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowInformeSelector((prev) => !prev)}
+                  className={`px-2.5 py-2 rounded-lg text-xs font-bold flex items-center space-x-1 transition-colors cursor-pointer ml-0.5 ${
+                    showInformeSelector
+                      ? 'bg-sky-400 text-slate-950'
+                      : 'text-sky-300 hover:bg-sky-500/20 hover:text-white'
+                  }`}
+                  title="Configurar Año (2026 / 2027 / Comparativo), Mes o Centro Operativo para el Informe Consolidado"
+                >
+                  <Filter className="w-3.5 h-3.5" />
+                  <span>Año / Mes / C.Op</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleExportarExcelExpendios}
+                disabled={descargandoExcelExpendios}
+                className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 border border-slate-700 font-bold py-2.5 px-3.5 rounded-xl text-xs flex items-center space-x-1.5 shadow-md cursor-pointer transition-colors"
+                title="Exportar base de datos consolidada de expendios a Excel (.xlsx)"
               >
-                <Download className="w-3.5 h-3.5" />
-                <span>Exportar Excel (.xlsx)</span>
-              </a>
+                {descargandoExcelExpendios ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-200" />
+                ) : (
+                  <Download className="w-3.5 h-3.5" />
+                )}
+                <span>{descargandoExcelExpendios ? 'Exportando...' : 'Exportar Excel (.xlsx)'}</span>
+              </button>
             </div>
+
+            {/* Panel Desplegable de Filtros del Informe Consolidado de Excel */}
+            {showInformeSelector && (
+              <div className="w-full mt-3 p-4 rounded-2xl bg-slate-950/90 border border-sky-500/40 shadow-xl space-y-3 animate-fadeIn">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                  <div className="flex items-center space-x-2">
+                    <FileSpreadsheet className="w-4 h-4 text-sky-400" />
+                    <span className="text-xs font-extrabold text-sky-300 uppercase tracking-wider">
+                      Configuración del Informe Consolidado de Excel (Año, Mes, Centro Operativo y Comparativo 2026/2027)
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowInformeSelector(false)}
+                    className="text-slate-400 hover:text-slate-200 text-xs font-bold flex items-center space-x-1 cursor-pointer self-end sm:self-auto"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Cerrar</span>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      1. Año o Comparativo Anual:
+                    </label>
+                    <select
+                      value={informeAnio}
+                      onChange={(e) => setInformeAnio(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-2 text-xs text-slate-100 font-bold cursor-pointer focus:outline-none"
+                    >
+                      <option value="2026">Año 2026 (Vigencia 2026)</option>
+                      <option value="2027">Año 2027 (Vigencia 2027)</option>
+                      <option value="COMPARAR_2026_2027">📊 Comparar Años (2026 vs 2027)</option>
+                      <option value="2028">Año 2028</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      2. Mes de Consulta:
+                    </label>
+                    <select
+                      value={informeMes}
+                      onChange={(e) => setInformeMes(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-2 text-xs text-slate-100 font-bold cursor-pointer focus:outline-none"
+                    >
+                      <option value="TODOS">Todos los Meses (Consolidado Anual)</option>
+                      {MESES_SISTEMA.map((m) => (
+                        <option key={m.value} value={m.value}>
+                          Solo {m.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
+                      3. Filtrar por Centro Operativo:
+                    </label>
+                    <select
+                      value={informeCentroOp}
+                      onChange={(e) => setInformeCentroOp(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-2 text-xs text-slate-100 font-bold cursor-pointer focus:outline-none"
+                    >
+                      <option value="TODOS">Todos los Centros Operativos ({expendios.length})</option>
+                      {uniqueCentrosOperativos.map((co) => (
+                        <option key={co} value={co}>
+                          {co}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleDescargarInformeConsolidado}
+                      disabled={descargandoInformeConsolidado}
+                      className="w-full bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-slate-950 font-black py-2 px-4 rounded-xl text-xs flex items-center justify-center space-x-1.5 shadow-lg cursor-pointer transition-colors"
+                    >
+                      {descargandoInformeConsolidado ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                      <span>{descargandoInformeConsolidado ? 'Generando...' : 'Descargar Informe Filtrado'}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Quick Stats Grid */}
@@ -2764,48 +3489,245 @@ export const AdminPanel: React.FC = () => {
             <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-center">
               <div className="text-[10px] text-slate-400 font-semibold uppercase">Con Fotos Cargadas</div>
               <div className="text-xl font-bold text-amber-400 font-mono mt-0.5">
-                {expendios.filter((e) => e.letreroUrl || e.basculaUrl).length}
+                {expendios.filter((e) => isRealPhoto(e.letreroUrl) || isRealPhoto(e.fotoAvisoUrl) || isRealPhoto(e.basculaUrl) || isRealPhoto(e.fotoBasculaUrl)).length}
               </div>
             </div>
           </div>
 
-          {/* Search Bar & Scroll Controls */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="relative max-w-md w-full">
-              <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-500" />
-              <input
-                type="text"
-                value={searchExpendioTerm}
-                onChange={(e) => setSearchExpendioTerm(e.target.value)}
-                placeholder="Buscar por Localidad, Municipio, Encargado, Cédula o Dirección..."
-                className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
-              />
+          {/* Excel Filter & Control Bar */}
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 shadow-md space-y-3" ref={adminDropdownRef}>
+            <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
+              {/* Search Bar */}
+              <div className="relative flex-1 min-w-[240px]">
+                <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-500" />
+                <input
+                  type="text"
+                  value={searchExpendioTerm}
+                  onChange={(e) => setSearchExpendioTerm(e.target.value)}
+                  placeholder="Buscar por Localidad, Municipio, Encargado, Cédula o Dirección..."
+                  className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-9 pr-8 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                />
+                {searchExpendioTerm && (
+                  <button
+                    onClick={() => setSearchExpendioTerm('')}
+                    className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-200"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Quick Selectors tipo Excel */}
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Casilla Centro Operativo */}
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400">
+                    C. Operativo:
+                  </span>
+                  <select
+                    value={filterCentroOperativo}
+                    onChange={(e) => setFilterCentroOperativo(e.target.value)}
+                    className={`border rounded-lg px-2.5 py-1.5 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                      filterCentroOperativo !== 'TODOS'
+                        ? 'bg-amber-950/80 border-amber-700 text-amber-300 font-bold'
+                        : 'bg-slate-900 border-slate-700 text-slate-200'
+                    }`}
+                  >
+                    <option value="TODOS">Todos ({uniqueCentrosOperativos.length})</option>
+                    {uniqueCentrosOperativos.map((co) => (
+                      <option key={co} value={co}>{co}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Casilla Centro de Acopio */}
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400">
+                    C. Acopio:
+                  </span>
+                  <select
+                    value={filterCentroAcopio}
+                    onChange={(e) => setFilterCentroAcopio(e.target.value)}
+                    className={`border rounded-lg px-2.5 py-1.5 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                      filterCentroAcopio !== 'TODOS'
+                        ? 'bg-amber-950/80 border-amber-700 text-amber-300 font-bold'
+                        : 'bg-slate-900 border-slate-700 text-slate-200'
+                    }`}
+                  >
+                    <option value="TODOS">Todos ({uniqueCentrosAcopio.length})</option>
+                    {uniqueCentrosAcopio.map((ca) => (
+                      <option key={ca} value={ca}>{ca}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Casilla Localidad */}
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400">
+                    Localidad:
+                  </span>
+                  <select
+                    value={filterLocalidad}
+                    onChange={(e) => setFilterLocalidad(e.target.value)}
+                    className={`border rounded-lg px-2.5 py-1.5 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                      filterLocalidad !== 'TODOS'
+                        ? 'bg-amber-950/80 border-amber-700 text-amber-300 font-bold'
+                        : 'bg-slate-900 border-slate-700 text-slate-200'
+                    }`}
+                  >
+                    <option value="TODOS">Todas ({uniqueLocalidades.length})</option>
+                    {uniqueLocalidades.map((loc) => (
+                      <option key={loc} value={loc}>{loc}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Selector Rápido de Ordenamiento */}
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400">
+                    Ordenar:
+                  </span>
+                  <select
+                    value={expendioSortField || ''}
+                    onChange={(e) => setExpendioSortField((e.target.value || null) as any)}
+                    className="border rounded-lg px-2.5 py-1.5 text-xs font-medium bg-slate-900 border-slate-700 text-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  >
+                    <option value="encargado">Nombre / Encargado</option>
+                    <option value="localidad">Localidad</option>
+                    <option value="centroOperativo">Centro Operativo</option>
+                    <option value="centroAcopio">Centro de Acopio</option>
+                    <option value="cedula">Cédula</option>
+                    <option value="direccionPunto">Dirección</option>
+                    <option value="fechaUltimaActualizacion">Última Actualización</option>
+                  </select>
+
+                  <button
+                    type="button"
+                    onClick={() => setExpendioSortDirection(expendioSortDirection === 'asc' ? 'desc' : 'asc')}
+                    className="p-1.5 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center cursor-pointer transition-colors"
+                    title={`Cambiar orden: ${expendioSortDirection === 'asc' ? 'Ascendente (A-Z)' : 'Descendente (Z-A)'}`}
+                  >
+                    {expendioSortDirection === 'asc' ? (
+                      <span className="flex items-center text-[11px] font-bold text-amber-400">
+                        A→Z <ArrowUp className="w-3 h-3 ml-0.5" />
+                      </span>
+                    ) : (
+                      <span className="flex items-center text-[11px] font-bold text-amber-400">
+                        Z→A <ArrowDown className="w-3 h-3 ml-0.5" />
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                {(searchExpendioTerm || filterCentroOperativo !== 'TODOS' || filterCentroAcopio !== 'TODOS' || filterLocalidad !== 'TODOS' || expendioSortField !== 'encargado' || expendioSortDirection !== 'asc') && (
+                  <button
+                    type="button"
+                    onClick={resetAdminExpendioFilters}
+                    className="text-[11px] font-bold py-1.5 px-2.5 rounded-lg border bg-amber-950/60 hover:bg-amber-900 text-amber-300 border-amber-800 flex items-center space-x-1 cursor-pointer transition-colors"
+                    title="Restablecer todos los filtros y orden"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Limpiar</span>
+                  </button>
+                )}
+              </div>
             </div>
 
-            {/* Desplazamiento Horizontal Controls */}
-            <div className="flex items-center space-x-2 bg-slate-950 px-3 py-1.5 rounded-xl border border-slate-800 text-xs text-slate-400">
-              <span className="flex items-center space-x-1.5 font-semibold text-amber-400 text-[11px]">
-                <ArrowLeftRight className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Desplazar Tabla:</span>
-              </span>
-              <button
-                type="button"
-                onClick={() => scrollTable('left')}
-                className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 px-2.5 py-1 rounded-lg border border-slate-700 text-[11px] flex items-center space-x-1 cursor-pointer transition-colors"
-                title="Desplazar tabla a la izquierda"
-              >
-                <ChevronLeft className="w-3.5 h-3.5" />
-                <span>Izq</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => scrollTable('right')}
-                className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 px-2.5 py-1 rounded-lg border border-slate-700 text-[11px] flex items-center space-x-1 cursor-pointer transition-colors"
-                title="Desplazar tabla a la derecha"
-              >
-                <span>Der</span>
-                <ChevronRight className="w-3.5 h-3.5" />
-              </button>
+            {/* Counter, Pagination Size and Desplazamiento Controls */}
+            <div className="flex flex-wrap items-center justify-between text-xs pt-2 border-t border-slate-800/80 gap-2">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-slate-400">
+                  Mostrando:{' '}
+                  <strong className="font-mono font-bold text-amber-400">
+                    {expendiosPaginados.length}
+                  </strong>{' '}
+                  de{' '}
+                  <span className="font-mono font-bold text-slate-200">
+                    {expendiosFiltrados.length}
+                  </span>{' '}
+                  filtrados (Total: {expendios.length})
+                </span>
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-[11px] text-slate-400">Filas por página:</span>
+                  <select
+                    value={expendioPageSize}
+                    onChange={(e) => {
+                      setExpendioPageSize(Number(e.target.value));
+                      setExpendioCurrentPage(1);
+                    }}
+                    className="bg-slate-900 border border-slate-700 text-slate-200 rounded-lg px-2 py-0.5 text-[11px] font-semibold focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+                  >
+                    <option value={25}>25 (Óptimo RAM)</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                    <option value={0}>Todos ({expendiosFiltrados.length})</option>
+                  </select>
+                </div>
+                {expendioSortField && (
+                  <span className="text-[11px] text-amber-400 font-semibold bg-amber-950/40 px-2 py-0.5 rounded border border-amber-800/60">
+                    Orden: {
+                      expendioSortField === 'encargado' ? 'Nombre / Encargado' :
+                      expendioSortField === 'localidad' ? 'Localidad' :
+                      expendioSortField === 'centroOperativo' ? 'Centro Operativo' :
+                      expendioSortField === 'centroAcopio' ? 'Centro de Acopio' :
+                      expendioSortField === 'cedula' ? 'Cédula' :
+                      expendioSortField === 'fechaUltimaActualizacion' ? 'Última Actualización' : expendioSortField
+                    } ({expendioSortDirection === 'asc' ? 'A→Z' : 'Z→A'})
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {expendioPageSize > 0 && totalExpendioPages > 1 && (
+                  <div className="flex items-center space-x-1.5 bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-800 text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setExpendioCurrentPage((p) => Math.max(1, p - 1))}
+                      disabled={expendioCurrentPage <= 1}
+                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 font-bold cursor-pointer transition-colors"
+                    >
+                      Anterior
+                    </button>
+                    <span className="text-slate-300 font-mono px-1">
+                      Pág. <strong className="text-amber-400">{expendioCurrentPage}</strong> / {totalExpendioPages}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setExpendioCurrentPage((p) => Math.min(totalExpendioPages, p + 1))}
+                      disabled={expendioCurrentPage >= totalExpendioPages}
+                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 font-bold cursor-pointer transition-colors"
+                    >
+                      Siguiente
+                    </button>
+                  </div>
+                )}
+
+                {/* Desplazamiento Horizontal Controls */}
+                <div className="flex items-center space-x-2 bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-800 text-xs text-slate-400">
+                  <span className="flex items-center space-x-1 font-semibold text-amber-400 text-[11px]">
+                    <ArrowLeftRight className="w-3 h-3" />
+                    <span className="hidden sm:inline">Desplazar Tabla:</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => scrollTable('left')}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2 py-0.5 rounded border border-slate-700 text-[11px] flex items-center space-x-0.5 cursor-pointer transition-colors"
+                    title="Desplazar tabla a la izquierda"
+                  >
+                    <ChevronLeft className="w-3 h-3" />
+                    <span>Izq</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => scrollTable('right')}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2 py-0.5 rounded border border-slate-700 text-[11px] flex items-center space-x-0.5 cursor-pointer transition-colors"
+                    title="Desplazar tabla a la derecha"
+                  >
+                    <span>Der</span>
+                    <ChevronRight className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -2834,37 +3756,556 @@ export const AdminPanel: React.FC = () => {
               className="overflow-x-auto rounded-b-xl border border-slate-800"
             >
               <table className="w-full text-left text-xs whitespace-nowrap">
-                <thead className="bg-slate-900 text-slate-100 font-bold uppercase tracking-wider text-[11px] border-b-2 border-slate-700 shadow-md">
+                <thead className="bg-slate-900 text-slate-100 font-bold uppercase tracking-wider text-[11px] border-b-2 border-slate-700 shadow-md select-none">
                   <tr>
-                    <th className="py-3 px-3.5 text-slate-200">CENTRO OPERATIVO</th>
-                    <th className="py-3 px-3.5 text-slate-200">CENTRO DE ACOPIO</th>
-                    <th className="py-2.5 px-3.5 text-amber-300 leading-tight">
-                      <div>LOCALIDAD</div>
-                      <div className="text-[9.5px] text-amber-400/80 font-normal tracking-normal normal-case">(Municipio Corregimiento Inspección)</div>
+                    {/* 1. CENTRO OPERATIVO */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 relative">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleExpendioSort('centroOperativo')}
+                          className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left text-slate-200"
+                          title="Click para ordenar por Centro Operativo"
+                        >
+                          <span>CENTRO OPERATIVO</span>
+                          {expendioSortField === 'centroOperativo' ? (
+                            expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                          ) : (
+                            <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOpenFilterDropdown(openFilterDropdown === 'centroOperativo' ? null : 'centroOperativo')}
+                          className={`p-1 rounded hover:bg-slate-800 transition-colors ${
+                            filterCentroOperativo !== 'TODOS' ? 'text-amber-400 bg-amber-950/80' : 'text-slate-400'
+                          }`}
+                          title="Filtro tipo Excel"
+                        >
+                          <Filter className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {/* Dropdown Centro Operativo */}
+                      {openFilterDropdown === 'centroOperativo' && (
+                        <div className="absolute left-0 top-full mt-1 z-30 w-56 rounded-xl border border-slate-700 bg-slate-900 shadow-2xl p-2.5 text-xs font-normal normal-case text-slate-100">
+                          <div className="font-bold text-[11px] mb-2 pb-1 border-b border-slate-700 flex justify-between items-center text-amber-400">
+                            <span>Filtro Centro Operativo</span>
+                            <button onClick={() => setOpenFilterDropdown(null)}><X className="w-3 h-3 text-slate-400 hover:text-slate-200" /></button>
+                          </div>
+                          <div className="space-y-1 mb-2">
+                            <button
+                              onClick={() => { setExpendioSortField('centroOperativo'); setExpendioSortDirection('asc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowUp className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar A a Z</span>
+                            </button>
+                            <button
+                              onClick={() => { setExpendioSortField('centroOperativo'); setExpendioSortDirection('desc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowDown className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar Z a A</span>
+                            </button>
+                          </div>
+                          <div className="border-t border-slate-700 pt-1.5 max-h-48 overflow-y-auto space-y-1">
+                            <div
+                              onClick={() => { setFilterCentroOperativo('TODOS'); setOpenFilterDropdown(null); }}
+                              className={`px-2 py-1 rounded cursor-pointer text-[11px] font-semibold flex items-center justify-between ${
+                                filterCentroOperativo === 'TODOS' ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              <span>(Todos)</span>
+                              {filterCentroOperativo === 'TODOS' && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                            </div>
+                            {uniqueCentrosOperativos.map((co) => (
+                              <div
+                                key={co}
+                                onClick={() => { setFilterCentroOperativo(co); setOpenFilterDropdown(null); }}
+                                className={`px-2 py-1 rounded cursor-pointer text-[11px] flex items-center justify-between ${
+                                  filterCentroOperativo === co ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                                }`}
+                              >
+                                <span className="truncate">{co}</span>
+                                {filterCentroOperativo === co && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </th>
-                    <th className="py-3 px-3.5 text-slate-200">ENCARGADO</th>
-                    <th className="py-3 px-3.5 text-slate-200">CEDULA</th>
-                    <th className="py-3 px-3.5 text-slate-200">DIRECCION PUNTO</th>
-                    <th className="py-3 px-3.5 text-slate-200">TELEFONO PUNTO</th>
-                    <th className="py-3 px-3 text-center text-slate-200">LETRERO</th>
-                    <th className="py-3 px-3 text-center text-slate-200">BASCULA</th>
-                    <th className="py-3 px-3 text-center text-slate-200">MATASELLO</th>
-                    <th className="py-3 px-3.5 text-emerald-300">USUARIO DE SIPOST</th>
-                    <th className="py-3 px-3 text-center text-slate-200">COMPUTADOR</th>
-                    <th className="py-3 px-3 text-center text-slate-200">INTERNET</th>
-                    <th className="py-3 px-3.5 text-slate-200">NIT</th>
-                    <th className="py-3 px-3.5 text-emerald-300 font-bold">CUENTA BANCARIA</th>
-                    <th className="py-3 px-3.5 text-slate-200">Correo Electronico</th>
-                    <th className="py-3 px-3.5 text-slate-200">OBSERVACION</th>
+
+                    {/* 2. CENTRO DE ACOPIO */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 relative">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleExpendioSort('centroAcopio')}
+                          className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left text-slate-200"
+                          title="Click para ordenar por Centro de Acopio"
+                        >
+                          <span>CENTRO DE ACOPIO</span>
+                          {expendioSortField === 'centroAcopio' ? (
+                            expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                          ) : (
+                            <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOpenFilterDropdown(openFilterDropdown === 'centroAcopio' ? null : 'centroAcopio')}
+                          className={`p-1 rounded hover:bg-slate-800 transition-colors ${
+                            filterCentroAcopio !== 'TODOS' ? 'text-amber-400 bg-amber-950/80' : 'text-slate-400'
+                          }`}
+                          title="Filtro tipo Excel"
+                        >
+                          <Filter className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {/* Dropdown Centro de Acopio */}
+                      {openFilterDropdown === 'centroAcopio' && (
+                        <div className="absolute left-0 top-full mt-1 z-30 w-56 rounded-xl border border-slate-700 bg-slate-900 shadow-2xl p-2.5 text-xs font-normal normal-case text-slate-100">
+                          <div className="font-bold text-[11px] mb-2 pb-1 border-b border-slate-700 flex justify-between items-center text-amber-400">
+                            <span>Filtro Centro de Acopio</span>
+                            <button onClick={() => setOpenFilterDropdown(null)}><X className="w-3 h-3 text-slate-400 hover:text-slate-200" /></button>
+                          </div>
+                          <div className="space-y-1 mb-2">
+                            <button
+                              onClick={() => { setExpendioSortField('centroAcopio'); setExpendioSortDirection('asc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowUp className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar A a Z</span>
+                            </button>
+                            <button
+                              onClick={() => { setExpendioSortField('centroAcopio'); setExpendioSortDirection('desc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowDown className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar Z a A</span>
+                            </button>
+                          </div>
+                          <div className="border-t border-slate-700 pt-1.5 max-h-48 overflow-y-auto space-y-1">
+                            <div
+                              onClick={() => { setFilterCentroAcopio('TODOS'); setOpenFilterDropdown(null); }}
+                              className={`px-2 py-1 rounded cursor-pointer text-[11px] font-semibold flex items-center justify-between ${
+                                filterCentroAcopio === 'TODOS' ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              <span>(Todos)</span>
+                              {filterCentroAcopio === 'TODOS' && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                            </div>
+                            {uniqueCentrosAcopio.map((ca) => (
+                              <div
+                                key={ca}
+                                onClick={() => { setFilterCentroAcopio(ca); setOpenFilterDropdown(null); }}
+                                className={`px-2 py-1 rounded cursor-pointer text-[11px] flex items-center justify-between ${
+                                  filterCentroAcopio === ca ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                                }`}
+                              >
+                                <span className="truncate">{ca}</span>
+                                {filterCentroAcopio === ca && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </th>
+
+                    {/* 3. LOCALIDAD */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 relative text-amber-300 leading-tight">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleExpendioSort('localidad')}
+                          className="flex items-center space-x-1 hover:text-amber-200 font-bold transition-colors cursor-pointer text-left text-amber-300"
+                          title="Click para ordenar por Localidad"
+                        >
+                          <div>
+                            <div>LOCALIDAD</div>
+                            <div className="text-[9.5px] text-amber-400/80 font-normal tracking-normal normal-case">(Municipio Corregimiento Inspección)</div>
+                          </div>
+                          {expendioSortField === 'localidad' ? (
+                            expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                          ) : (
+                            <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOpenFilterDropdown(openFilterDropdown === 'localidad' ? null : 'localidad')}
+                          className={`p-1 rounded hover:bg-slate-800 transition-colors ${
+                            filterLocalidad !== 'TODOS' ? 'text-amber-400 bg-amber-950/80' : 'text-slate-400'
+                          }`}
+                          title="Filtro tipo Excel"
+                        >
+                          <Filter className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {/* Dropdown Localidad */}
+                      {openFilterDropdown === 'localidad' && (
+                        <div className="absolute left-0 top-full mt-1 z-30 w-56 rounded-xl border border-slate-700 bg-slate-900 shadow-2xl p-2.5 text-xs font-normal normal-case text-slate-100">
+                          <div className="font-bold text-[11px] mb-2 pb-1 border-b border-slate-700 flex justify-between items-center text-amber-400">
+                            <span>Filtro Localidad</span>
+                            <button onClick={() => setOpenFilterDropdown(null)}><X className="w-3 h-3 text-slate-400 hover:text-slate-200" /></button>
+                          </div>
+                          <div className="space-y-1 mb-2">
+                            <button
+                              onClick={() => { setExpendioSortField('localidad'); setExpendioSortDirection('asc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowUp className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar A a Z</span>
+                            </button>
+                            <button
+                              onClick={() => { setExpendioSortField('localidad'); setExpendioSortDirection('desc'); setOpenFilterDropdown(null); }}
+                              className="w-full text-left px-2 py-1 rounded hover:bg-slate-800 flex items-center space-x-1.5 text-xs"
+                            >
+                              <ArrowDown className="w-3 h-3 text-amber-400" />
+                              <span>Ordenar Z a A</span>
+                            </button>
+                          </div>
+                          <div className="border-t border-slate-700 pt-1.5 max-h-48 overflow-y-auto space-y-1">
+                            <div
+                              onClick={() => { setFilterLocalidad('TODOS'); setOpenFilterDropdown(null); }}
+                              className={`px-2 py-1 rounded cursor-pointer text-[11px] font-semibold flex items-center justify-between ${
+                                filterLocalidad === 'TODOS' ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              <span>(Todas)</span>
+                              {filterLocalidad === 'TODOS' && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                            </div>
+                            {uniqueLocalidades.map((loc) => (
+                              <div
+                                key={loc}
+                                onClick={() => { setFilterLocalidad(loc); setOpenFilterDropdown(null); }}
+                                className={`px-2 py-1 rounded cursor-pointer text-[11px] flex items-center justify-between ${
+                                  filterLocalidad === loc ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                                }`}
+                              >
+                                <span className="truncate">{loc}</span>
+                                {filterLocalidad === loc && <CheckCircle2 className="w-3 h-3 text-amber-400" />}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </th>
+
+                    {/* 4. ENCARGADO / NOMBRE */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 relative">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleExpendioSort('encargado')}
+                          className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left text-slate-200"
+                          title="Click para ordenar por Nombre / Encargado"
+                        >
+                          <span>ENCARGADO (NOMBRE)</span>
+                          {expendioSortField === 'encargado' ? (
+                            expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                          ) : (
+                            <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOpenFilterDropdown(openFilterDropdown === 'encargado' ? null : 'encargado')}
+                          className={`p-1 rounded hover:bg-slate-800 transition-colors ${
+                            expendioSortField === 'encargado' ? 'text-amber-400 bg-amber-950/80' : 'text-slate-400'
+                          }`}
+                          title="Ordenar por Nombre"
+                        >
+                          <Filter className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {/* Dropdown Encargado */}
+                      {openFilterDropdown === 'encargado' && (
+                        <div className="absolute left-0 top-full mt-1 z-30 w-56 rounded-xl border border-slate-700 bg-slate-900 shadow-2xl p-2.5 text-xs font-normal normal-case text-slate-100">
+                          <div className="font-bold text-[11px] mb-2 pb-1 border-b border-slate-700 flex justify-between items-center text-amber-400">
+                            <span>Ordenar por Nombre</span>
+                            <button onClick={() => setOpenFilterDropdown(null)}><X className="w-3 h-3 text-slate-400 hover:text-slate-200" /></button>
+                          </div>
+                          <div className="space-y-1">
+                            <button
+                              onClick={() => { setExpendioSortField('encargado'); setExpendioSortDirection('asc'); setOpenFilterDropdown(null); }}
+                              className={`w-full text-left px-2 py-1.5 rounded flex items-center justify-between text-xs ${
+                                expendioSortField === 'encargado' && expendioSortDirection === 'asc' ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              <span className="flex items-center space-x-1.5">
+                                <ArrowUp className="w-3 h-3 text-amber-400" />
+                                <span>Ordenar de A a Z</span>
+                              </span>
+                              {expendioSortField === 'encargado' && expendioSortDirection === 'asc' && <CheckCircle2 className="w-3.5 h-3.5 text-amber-400" />}
+                            </button>
+                            <button
+                              onClick={() => { setExpendioSortField('encargado'); setExpendioSortDirection('desc'); setOpenFilterDropdown(null); }}
+                              className={`w-full text-left px-2 py-1.5 rounded flex items-center justify-between text-xs ${
+                                expendioSortField === 'encargado' && expendioSortDirection === 'desc' ? 'bg-amber-950/80 text-amber-300 font-bold' : 'hover:bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              <span className="flex items-center space-x-1.5">
+                                <ArrowDown className="w-3 h-3 text-amber-400" />
+                                <span>Ordenar de Z a A</span>
+                              </span>
+                              {expendioSortField === 'encargado' && expendioSortDirection === 'desc' && <CheckCircle2 className="w-3.5 h-3.5 text-amber-400" />}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </th>
+
+                    {/* 5. CEDULA */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 text-slate-200">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('cedula')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Cédula"
+                      >
+                        <span>CEDULA</span>
+                        {expendioSortField === 'cedula' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 6. DIRECCION */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 text-slate-200">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('direccionPunto')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Dirección"
+                      >
+                        <span>DIRECCION PUNTO</span>
+                        {expendioSortField === 'direccionPunto' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 7. TELEFONO */}
+                    <th className="py-2.5 px-3 border-r border-slate-800 text-slate-200">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('telefonoPunto')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Teléfono"
+                      >
+                        <span>TELEFONO PUNTO</span>
+                        {expendioSortField === 'telefonoPunto' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 8. LETRERO */}
+                    <th className="py-2.5 px-3 text-center text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('letrero')}
+                        className="flex items-center justify-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer w-full"
+                        title="Click para ordenar por Letrero"
+                      >
+                        <span>LETRERO</span>
+                        {expendioSortField === 'letrero' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 9. BASCULA */}
+                    <th className="py-2.5 px-3 text-center text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('bascula')}
+                        className="flex items-center justify-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer w-full"
+                        title="Click para ordenar por Báscula"
+                      >
+                        <span>BASCULA</span>
+                        {expendioSortField === 'bascula' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 10. MATASELLO */}
+                    <th className="py-2.5 px-3 text-center text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('matasello')}
+                        className="flex items-center justify-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer w-full"
+                        title="Click para ordenar por Matasello"
+                      >
+                        <span>MATASELLO</span>
+                        {expendioSortField === 'matasello' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 11. USUARIO SIPOST */}
+                    <th className="py-2.5 px-3 text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('usuarioSipost')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left text-emerald-300"
+                        title="Click para ordenar por Usuario Sipost"
+                      >
+                        <span>USUARIO DE SIPOST</span>
+                        {expendioSortField === 'usuarioSipost' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 12. COMPUTADOR */}
+                    <th className="py-2.5 px-3 text-center text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('computador')}
+                        className="flex items-center justify-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer w-full"
+                        title="Click para ordenar por Computador"
+                      >
+                        <span>COMPUTADOR</span>
+                        {expendioSortField === 'computador' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 13. INTERNET */}
+                    <th className="py-2.5 px-3 text-center text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('internet')}
+                        className="flex items-center justify-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer w-full"
+                        title="Click para ordenar por Internet"
+                      >
+                        <span>INTERNET</span>
+                        {expendioSortField === 'internet' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 14. NIT */}
+                    <th className="py-2.5 px-3 text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('nit')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por NIT"
+                      >
+                        <span>NIT</span>
+                        {expendioSortField === 'nit' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* CUENTA BANCARIA */}
+                    <th className="py-2.5 px-3 text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('cuentaBancaria')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left text-emerald-300"
+                        title="Click para ordenar por Cuenta Bancaria"
+                      >
+                        <span>CUENTA BANCARIA</span>
+                        {expendioSortField === 'cuentaBancaria' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 15. Correo Electronico */}
+                    <th className="py-2.5 px-3 text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('correoElectronico')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Correo Electrónico"
+                      >
+                        <span>Correo Electronico</span>
+                        {expendioSortField === 'correoElectronico' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 16. OBSERVACION */}
+                    <th className="py-2.5 px-3 text-slate-200 border-r border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('observacion')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Observación"
+                      >
+                        <span>OBSERVACION</span>
+                        {expendioSortField === 'observacion' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
+
+                    {/* 17. FECHA DE ÚLTIMA ACTUALIZACIÓN */}
+                    <th className="py-2.5 px-3 text-emerald-400 border-r border-slate-800 whitespace-nowrap">
+                      <button
+                        type="button"
+                        onClick={() => handleExpendioSort('fechaUltimaActualizacion')}
+                        className="flex items-center space-x-1 hover:text-amber-400 font-bold transition-colors cursor-pointer text-left"
+                        title="Click para ordenar por Fecha de Última Actualización de Datos o Imágenes"
+                      >
+                        <span>ÚLTIMA ACTUALIZACIÓN</span>
+                        {expendioSortField === 'fechaUltimaActualizacion' ? (
+                          expendioSortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-amber-400" /> : <ArrowDown className="w-3 h-3 text-amber-400" />
+                        ) : (
+                          <ArrowUpDown className="w-2.5 h-2.5 opacity-40 hover:opacity-100" />
+                        )}
+                      </button>
+                    </th>
                     <th className="py-3 px-4 text-center text-slate-200 border-l border-slate-700 sticky right-0 z-20 bg-slate-900 shadow-[-4px_0_12px_rgba(0,0,0,0.5)]">ACCIONES</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800 text-slate-200">
-                  {expendiosFiltrados.length > 0 ? (
-                    expendiosFiltrados.map((exp) => (
+                  {expendiosPaginados.length > 0 ? (
+                    expendiosPaginados.map((exp) => (
                       <tr key={exp.id} className="hover:bg-slate-800/50 transition-colors group">
-                        <td className="py-2.5 px-3 font-medium text-slate-300">{exp.centroOperativo || '-'}</td>
-                        <td className="py-2.5 px-3 font-semibold text-slate-200">{exp.centroAcopio || '-'}</td>
+                        <td className="py-2.5 px-3 font-medium text-slate-300">{exp.centroOperativo || normalizeCentroOperativo(exp.centroOperativo, exp.localidad)}</td>
+                        <td className="py-2.5 px-3 font-semibold text-slate-200">{exp.centroAcopio || normalizeCentroAcopio(exp.centroAcopio, exp.localidad)}</td>
                         <td className="py-2.5 px-3 font-bold text-amber-300">{exp.localidad || '-'}</td>
                       <td className="py-2.5 px-3 font-semibold text-slate-100">{exp.encargado}</td>
                       <td className="py-2.5 px-3 font-mono text-slate-300">{exp.cedula}</td>
@@ -3074,6 +4515,17 @@ export const AdminPanel: React.FC = () => {
                         {(!exp.observacion && exp.tieneAviso !== 'NO' && exp.tieneBascula !== 'NO' && exp.tieneMatasello !== 'NO' && exp.tieneComputador !== 'NO') && '-'}
                       </td>
 
+                      {/* Fecha de Última Actualización */}
+                      <td className="py-2.5 px-3 whitespace-nowrap text-center">
+                        {exp.fechaUltimaActualizacion && exp.fechaUltimaActualizacion !== '2026-07-31' ? (
+                          <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-md bg-emerald-950/80 text-emerald-300 border border-emerald-700/60 font-mono font-bold text-[10.5px]">
+                            <span>{exp.fechaUltimaActualizacion}</span>
+                          </span>
+                        ) : (
+                          <span className="text-slate-500 italic text-[10.5px]">Sin actualizar</span>
+                        )}
+                      </td>
+
                       {/* Acciones */}
                       <td className="py-2.5 px-4 text-center border-l border-slate-700 sticky right-0 z-10 bg-slate-900/95 backdrop-blur-xs shadow-[-4px_0_12px_rgba(0,0,0,0.5)]">
                         <div className="flex items-center justify-center space-x-1.5">
@@ -3111,14 +4563,63 @@ export const AdminPanel: React.FC = () => {
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={18} className="py-8 text-center text-slate-500">
-                      No se encontraron expendios registrados con el término de búsqueda.
+                    <td colSpan={19} className="py-12 text-center text-slate-400 font-semibold text-sm">
+                      <div className="flex flex-col items-center justify-center space-y-2">
+                        <Store className="w-8 h-8 text-slate-600" />
+                        <span>Sin datos registrados.</span>
+                        <span className="text-xs text-slate-500 font-normal">
+                          Carga tu archivo oficial desde Excel (.xlsx) o registra un nuevo expendio.
+                        </span>
+                      </div>
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
+
+          {expendioPageSize > 0 && totalExpendioPages > 1 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800 text-xs text-slate-400">
+              <span>
+                Mostrando página <strong className="text-amber-400 font-mono">{expendioCurrentPage}</strong> de{' '}
+                <strong className="text-slate-200 font-mono">{totalExpendioPages}</strong> ({expendiosFiltrados.length} registros en total)
+              </span>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setExpendioCurrentPage(1)}
+                  disabled={expendioCurrentPage <= 1}
+                  className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-slate-300 border border-slate-800 font-semibold cursor-pointer transition-colors"
+                >
+                  « Primera
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExpendioCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={expendioCurrentPage <= 1}
+                  className="px-3 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-700 font-bold cursor-pointer transition-colors"
+                >
+                  ‹ Anterior
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExpendioCurrentPage((p) => Math.min(totalExpendioPages, p + 1))}
+                  disabled={expendioCurrentPage >= totalExpendioPages}
+                  className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 disabled:opacity-40 text-amber-300 border border-amber-500/40 font-bold cursor-pointer transition-colors"
+                >
+                  Siguiente ›
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExpendioCurrentPage(totalExpendioPages)}
+                  disabled={expendioCurrentPage >= totalExpendioPages}
+                  className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-slate-300 border border-slate-800 font-semibold cursor-pointer transition-colors"
+                >
+                  Última »
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
           {/* Sección de Generación de Registro Fotográfico Oficial al final del módulo */}
@@ -3363,15 +4864,15 @@ export const AdminPanel: React.FC = () => {
       )}
 
       {/* --- TAB: RELACIÓN DE PAGOS & EXCEL --- */}
-      {activeTab === 'pagos' && <RelacionPagosPanel />}
+      {!isCleanAdmin && activeTab === 'pagos' && <RelacionPagosPanel />}
 
       {/* --- TAB: TRAZABILIDAD DE EXPENDIOS POR MUNICIPIO --- */}
       {activeTab === 'trazabilidad' && (
         <TrazabilidadExpendiosPanel onUpdate={fetchData} />
       )}
 
-      {/* --- TAB: MÉTRICAS DE ACCESO (SOLO ADMINISTRADOR) --- */}
-      {activeTab === 'metricas' && (
+      {/* --- TAB: MÉTRICAS DE ACCESO (SOLO ADMINISTRADOR TÉCNICO) --- */}
+      {!isCleanAdmin && activeTab === 'metricas' && (
         <AdminMetricasView onGoToExpendios={() => setActiveTab('expendios')} />
       )}
 
@@ -3380,22 +4881,7 @@ export const AdminPanel: React.FC = () => {
         <AdminDocumentosExpendiosPanel isLight={false} expendios={expendios} />
       )}
 
-      {/* --- TAB 9: BASE DE DATOS GOOGLE SHEETS EN VIVO --- */}
-      {activeTab === 'sheets' && (
-        <div className="space-y-6">
-          <GoogleSheetsDatabaseManager
-            accessToken={driveAccessToken}
-            isAuthenticated={isGoogleDriveConnected}
-            onSignIn={handleGoogleSignIn}
-            theme="dark"
-            onDataImported={() => {
-              fetchData();
-              setSyncStatusMsg('✓ Base de datos sincronizada exitosamente con Google Sheets.');
-              setTimeout(() => setSyncStatusMsg(''), 8000);
-            }}
-          />
-        </div>
-      )}
+
 
       {/* Modal para Editar Cuenta de Cobro */}
       {editingCuentaItem && (
@@ -3732,7 +5218,7 @@ export const AdminPanel: React.FC = () => {
         />
       )}
 
-      {/* Render Modal de Borrado Seguro con Contraseña Maestra (Camarca.2023*) */}
+      {/* Render Modal de Borrado Seguro con Contraseña Maestra de Seguridad */}
       {borradoModalConfig && (
         <ConfirmarBorradoModal
           isOpen={borradoModalConfig.isOpen}
@@ -3789,17 +5275,6 @@ export const AdminPanel: React.FC = () => {
         </div>
       )}
 
-      {/* AI Scanned Document & Payment Support Reconciliation Modal */}
-      <ConciliacionCuentasAIModal
-        isOpen={showAIConciliacionModal}
-        onClose={() => setShowAIConciliacionModal(false)}
-        expendiosList={expendios}
-        onSuccessReconciliation={() => {
-          fetchData();
-          setSyncStatusMsg('✓ Cuentas de cobro conciliadas y marcadas en estado CANCELADO exitosamente.');
-        }}
-      />
-
       {/* Database Backup & Restore Modal */}
       <ErrorBoundary fallbackTitle="Panel de Copia de Seguridad" onClose={() => setShowCopiaSeguridadModal(false)}>
         <CopiaSeguridadModal
@@ -3827,6 +5302,56 @@ export const AdminPanel: React.FC = () => {
         }}
       />
 
+      {/* RESET TOTAL DE DATOS Modal */}
+      <ResetTotalModal
+        isOpen={showResetTotalModal}
+        onClose={() => setShowResetTotalModal(false)}
+        expendiosCount={expendios.length}
+        relacionPagosCount={relacionPagosData.length}
+        historialCount={historial.length}
+        onSuccessReset={(msg) => {
+          fetchData();
+          setSyncStatusMsg(msg);
+          setTimeout(() => setSyncStatusMsg(''), 10000);
+        }}
+      />
+
+      {/* Modal de Vista Previa Oficial de la Cuenta a Conciliar */}
+      {previewConciliacionData?.isOpen && (
+        <PreviewCuentaConciliacionModal
+          isOpen={previewConciliacionData.isOpen}
+          onClose={() => setPreviewConciliacionData(null)}
+          cuentas={previewConciliacionData.cuentas}
+          initialIndex={previewConciliacionData.initialIndex}
+          expendiosList={expendios}
+          onConciliacionExitosa={(conciliada) => {
+            fetchData();
+            setSyncStatusMsg(`✓ Cuenta de ${conciliada.encargado} conciliada y marcada como Cancelada exitosamente.`);
+            setTimeout(() => setSyncStatusMsg(''), 7000);
+          }}
+        />
+      )}
+
+      {/* Modal de Conciliación de Cuentas Escaneadas con Preview Físico */}
+      <ConciliacionCuentasAIModal
+        isOpen={showAIConciliacionModal}
+        onClose={() => setShowAIConciliacionModal(false)}
+        expendiosList={expendios}
+        onSuccessReconciliation={() => {
+          fetchData();
+          setSyncStatusMsg('✓ Conciliación con preview completada y registrada en el sistema.');
+          setTimeout(() => setSyncStatusMsg(''), 7000);
+        }}
+      />
+
+      {/* Modal de Depuración Oculta IndexedDB vs Red */}
+      {showIDBDebuggerModal && (
+        <IndexedDBNetworkDebuggerModal
+          isOpen={showIDBDebuggerModal}
+          onClose={() => setShowIDBDebuggerModal(false)}
+        />
+      )}
+
       {/* Lightbox Modal for Photo Inspection in Admin */}
       {previewPhotoModal && (
         <PhotoLightboxModal
@@ -3838,6 +5363,11 @@ export const AdminPanel: React.FC = () => {
           metadata={previewPhotoModal.metadata}
         />
       )}
+      {/* Modal Centro de Errores y Catálogo de la Plataforma */}
+      <AdminErrorCenterModal
+        isOpen={showErrorCenterModal}
+        onClose={() => setShowErrorCenterModal(false)}
+      />
     </div>
   );
 };

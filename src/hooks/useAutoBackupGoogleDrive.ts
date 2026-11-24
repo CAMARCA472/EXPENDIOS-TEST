@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { User } from 'firebase/auth';
 import { 
+  User,
   initAuth, 
   googleSignIn, 
   logoutGoogle, 
@@ -86,9 +86,34 @@ export function useAutoBackupGoogleDrive() {
   const ultimoBackupRef = useRef<GoogleDriveBackupRecord | null>(ultimoBackup);
   ultimoBackupRef.current = ultimoBackup;
 
-  // Cargar estado inicial y registros guardados en el servidor
+  // Cargar estado inicial y registros guardados en el servidor (solo para administradores)
   const fetchServerBackupStatus = useCallback(async () => {
     try {
+      const rawSession = localStorage.getItem('camarca_session');
+      if (!rawSession) return;
+      const parsedSession = JSON.parse(rawSession);
+      if (parsedSession?.role !== 'admin') return;
+
+      // 1. Obtener estado de autenticación y Refresh Token en PostgreSQL
+      try {
+        const tokenRes = await fetch(`/api/admin/google-drive/token?_t=${Date.now()}`);
+        if (tokenRes.ok) {
+          const tokenData = await tokenRes.json();
+          if (tokenData.success) {
+            setHasRefreshTokenState(Boolean(tokenData.hasRefreshToken));
+            if (tokenData.accessToken) {
+              setAccessToken(tokenData.accessToken);
+              if (tokenData.email) {
+                setUser({
+                  email: tokenData.email,
+                  displayName: tokenData.displayName || 'Administrador',
+                });
+              }
+            }
+          }
+        }
+      } catch {}
+
       const res = await fetch(`/api/admin/google-drive/status?_t=${Date.now()}`);
       if (!res.ok) return;
       const data = await res.json();
@@ -180,20 +205,22 @@ export function useAutoBackupGoogleDrive() {
           // Sincronización automática de fotos en segundo plano hacia Google Drive DESACTIVADA
           // syncAllPhotosToGoogleDrive(token).catch(() => {});
         } catch (fErr: any) {
-          const isAuthError =
-            fErr?.message?.includes('invalid authentication credentials') ||
-            fErr?.message?.includes('401') ||
-            fErr?.message?.includes('UNAUTHENTICATED') ||
-            fErr?.message?.includes('Invalid Credentials') ||
-            fErr?.message?.includes('Failed to fetch') ||
-            fErr?.message?.includes('NetworkError');
+          const isHardAuthRevocation =
+            fErr?.message?.includes('invalid_grant') ||
+            fErr?.message?.includes('Token revoked');
 
-          if (isAuthError) {
-            console.warn('[Google Drive] Credenciales de Google inválidas o no disponibles al inicializar. Limpiando sesión...');
+          if (isHardAuthRevocation) {
+            console.warn('[Google Drive] Autorización explícitamente revocada en Google. Limpiando sesión...');
             clearSessionToken();
             setAccessToken(null);
             setUser(null);
           } else {
+            // Error transitorio o token por renovar: intentar renovación en segundo plano
+            refreshGoogleAccessToken().then((newToken) => {
+              if (newToken) {
+                setAccessToken(newToken);
+              }
+            }).catch(() => {});
             console.warn('Aviso resolviendo carpeta de Drive:', fErr?.message || fErr);
           }
         }
@@ -219,11 +246,12 @@ export function useAutoBackupGoogleDrive() {
       proximoBackupRef.current = nextTime;
       setProximoBackupTimestamp(nextTime);
 
-      const currentToken = accessToken || (await getAccessToken());
+      let currentToken = accessToken || (await getAccessToken());
       if (!currentToken || isAccessTokenExpired(0)) {
-        clearSessionToken();
-        setAccessToken(null);
-        setUser(null);
+        currentToken = await refreshGoogleAccessToken();
+      }
+
+      if (!currentToken) {
         setProximoBackupTimestamp(null);
         proximoBackupRef.current = null;
         setError('No hay sesión de Google activa para realizar la copia de seguridad.');
@@ -234,24 +262,32 @@ export function useAutoBackupGoogleDrive() {
       setError(null);
 
       try {
-        const record = await executeGoogleDriveBackup(
-          currentToken,
+        // 1. Sincronización automática exclusiva de fotografías (Tercer Respaldo Automático)
+        const photoSyncRes = await syncAllPhotosToGoogleDrive(currentToken);
+        
+        // 2. Registrar informe exclusivo de fotos
+        const photoRecord: GoogleDriveBackupRecord = {
+          id: `gdrive_photos_${Date.now()}`,
+          name: `Fotos Sincronizadas (${photoSyncRes.totalUploaded} subidas, ${photoSyncRes.totalErrors} errores)`,
+          timestamp: new Date().toISOString(),
+          sizeBytes: photoSyncRes.totalUploaded * 250000,
+          status: photoSyncRes.totalErrors === 0 ? 'Completado' : 'Fallido',
+          mensaje: `Sincronización automática de fotos: ${photoSyncRes.totalUploaded} subidas exitosamente`,
+          carpetaId: carpetaDriveId || undefined,
+          cuentaGoogle: user?.email || undefined,
+          webViewLink: photoSyncRes.folderUrl || undefined,
           origen,
-          user?.email || undefined
-        );
+        };
 
-        setUltimoBackup(record);
-        setHistorialBackups((prev) => [record, ...prev.filter((b) => b.id !== record.id)].slice(0, 40));
+        setUltimoBackup(photoRecord);
+        setHistorialBackups((prev) => [photoRecord, ...prev.filter((b) => b.id !== photoRecord.id)].slice(0, 40));
 
-        if (record.carpetaId) {
-          setCarpetaDriveId(record.carpetaId);
-          setCarpetaDriveUrl(`https://drive.google.com/drive/folders/${record.carpetaId}`);
+        if (photoRecord.carpetaId) {
+          setCarpetaDriveId(photoRecord.carpetaId);
+          setCarpetaDriveUrl(`https://drive.google.com/drive/folders/${photoRecord.carpetaId}`);
         }
 
-        // Subida automática de fotos en segundo plano DESACTIVADA por petición del usuario (ahora es manual)
-        // syncAllPhotosToGoogleDrive(currentToken).catch(() => {});
-
-        return record;
+        return photoRecord;
       } catch (err: any) {
         const isAuthOrNetError =
           err?.message?.includes('invalid authentication credentials') ||
@@ -342,48 +378,9 @@ export function useAutoBackupGoogleDrive() {
   const ejecutarCopiaRef = useRef(ejecutarCopia);
   ejecutarCopiaRef.current = ejecutarCopia;
 
-  // Bucle de cuenta regresiva y verificación de 10 minutos
+  // Sincronización bajo demanda: desactivado el bucle de 1 segundo que descargaba todas las fotos en segundo plano en el navegador
   useEffect(() => {
-    if (!user || !accessToken || !autoBackupActivo) {
-      setTiempoRestanteStr((prev) => (prev === '--:--:--' ? prev : '--:--:--'));
-      return;
-    }
-
-    const intervalId = setInterval(() => {
-      const now = Date.now();
-
-      // Si no tenemos timestamp próximo programado, lo fijamos a 10 minutos desde el último o desde ahora
-      let target = proximoBackupRef.current;
-      if (!target) {
-        const lastTime = ultimoBackupRef.current ? new Date(ultimoBackupRef.current.timestamp).getTime() : 0;
-        target = lastTime > 0 ? lastTime + BACKUP_INTERVAL_MS : now;
-        proximoBackupRef.current = target;
-        setProximoBackupTimestamp(target);
-      }
-
-      const diff = target - now;
-
-      if (diff <= 0) {
-        // ¡Han pasado las 10 minutos! Programar preventivamente el siguiente ciclo y ejecutar
-        const nextCycle = now + BACKUP_INTERVAL_MS;
-        proximoBackupRef.current = nextCycle;
-        setProximoBackupTimestamp(nextCycle);
-        if (!isBackingUpRef.current) {
-          ejecutarCopiaRef.current('Automatico_10m');
-        }
-      } else {
-        // Formatear cuenta regresiva hh:mm:ss
-        const totalSeconds = Math.floor(diff / 1000);
-        const hours = Math.floor(totalSeconds / 3600);
-        const minutes = Math.floor((totalSeconds % 3600) / 60);
-        const seconds = totalSeconds % 60;
-        const pad = (n: number) => n.toString().padStart(2, '0');
-        const formatted = `${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
-        setTiempoRestanteStr((prev) => (prev === formatted ? prev : formatted));
-      }
-    }, 1000);
-
-    return () => clearInterval(intervalId);
+    setTiempoRestanteStr('Manual');
   }, [Boolean(user), Boolean(accessToken), autoBackupActivo]);
 
   // Ejecutar purga de copias mayores a 1 semana (7 días)

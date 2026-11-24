@@ -172,6 +172,16 @@ export const HistorialDashboard: React.FC<HistorialDashboardProps> = ({
     return 'Historial Consolidado (Todos los Periodos)';
   }, [filtroMes, filtroAnio]);
 
+  if (historialItems.length === 0) {
+    return (
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center text-slate-400 text-xs shadow-xl space-y-2">
+        <BarChart3 className="w-8 h-8 text-slate-600 mx-auto" />
+        <p className="font-bold text-slate-300">Sin datos registrados.</p>
+        <p className="text-slate-500">No hay cuentas de cobro generadas ni historial registrado.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-4">
       {/* Header with Title and Context */}

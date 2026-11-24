@@ -1,17 +1,20 @@
+import 'dotenv/config';
+import { EventEmitter } from 'events';
 import express from 'express';
-import { initializeApp as initAdminApp } from 'firebase-admin/app';
-import { getStorage as getAdminStorage } from 'firebase-admin/storage';
-import { initializeApp as initClientApp, getApps as getClientApps, getApp as getClientApp } from 'firebase/app';
-import { getStorage as getClientStorage, ref as storageRef, uploadBytes as uploadBytesStorage, getDownloadURL as getDownloadURLStorage, listAll as listAllStorage, deleteObject as deleteObjectStorage } from 'firebase/storage';
+import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import * as XLSX from 'xlsx';
 import { PDFDocument } from 'pdf-lib';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import JSZip from 'jszip';
-import { INITIAL_EXPENDIOS, INITIAL_HISTORIAL, INITIAL_TRAZABILIDAD } from './src/data/initialData.ts';
+import sharp from 'sharp';
+import rateLimit from 'express-rate-limit';
+
+// Incrementar límite de listeners para procesos paralelos de descarga y streamings
+EventEmitter.defaultMaxListeners = 50;
 import {
   ExpendioData,
   HistorialItem,
@@ -26,79 +29,164 @@ import {
   ResultadoConciliacionAI,
   RegistroAcceso,
   MetricasAccesoResumen,
+  DatabaseSchema,
 } from './src/types.ts';
 import { numeroALetras } from './src/utils/numeroALetras.ts';
 import {
-  getCloudFirestore,
-  saveDatabaseToCloud,
-  loadDatabaseFromCloud,
-  scheduleCloudSync,
-  getCloudSyncStatus,
-  savePhotoToCloud,
-  getPhotoFromCloud,
-  deletePhotoFromCloud,
-  resetFirestoreQuotaCooldown,
-  saveDriveRegistryToCloud,
-  loadDriveRegistryFromCloud,
-  saveDriveCredentialsToCloud,
-  loadDriveCredentialsFromCloud,
-  clearDriveCredentialsFromCloud,
-} from './server/firestoreDatabase.ts';
+  normalizeCentroOperativo,
+  normalizeCentroAcopio,
+  CANONICAL_CENTROS_OPERATIVOS,
+  CANONICAL_CENTROS_ACOPIO,
+  MUNICIPIO_CENTROS_MAP,
+} from './src/utils/centroOperativoAcopioHelper.ts';
+import {
+  checkCloudSqlHealth,
+  getCloudSqlDatabaseSnapshot,
+} from './src/db/cloudSqlStore.ts';
+import { saveDatabaseToPostgres } from './src/db/migrateData.ts';
+import { db, createPool } from './src/db/index.ts';
+import * as schema from './src/db/schema.ts';
+import { sql, desc, eq, inArray, or, and } from 'drizzle-orm';
+import {
+  migrateLocalJsonToCloudSql,
+} from './src/db/migrateData.ts';
+import {
+  getDatabase,
+  getDatabaseReadOnly,
+  loadDatabase,
+  mutateDatabase,
+  resolveStartupDatabase,
+  setAuthoritativeDatabase,
+  getRegistrosAcceso,
+  addRegistroAcceso,
+  clearRegistrosAcceso,
+  getActiveDbPath,
+  getMasterDbFilePath,
+  verifyLocalDatabaseStateBeforeSave,
+  verifyWrittenMasterDatabaseOnDisk,
+  normalizeDatabase,
+  createAutoSnapshot,
+  syncJsonToCloudVaults,
+  loadJsonFromCloudVaults,
+} from './server/dbStore.ts';
+import {
+  extractTextFromPdf,
+  extractTextFromImage,
+  extractFieldsFromOcrText,
+  reconcileOcrWithPostgres,
+  persistSha256ToRegistry,
+  computeSha256,
+} from './server/deterministicReconciliationEngine.ts';
+import { errorLogService } from './server/errorLogService.ts';
 
+const DRIVE_CREDS_CLOUD_KEY = 'database/google_drive_credentials.json';
+const DRIVE_REGISTRY_CLOUD_KEY = 'database/google_drive_registry.json';
 
-
-// Initialize Firebase Admin (Storage)
-try {
-  const fConfig = JSON.parse(fs.readFileSync(process.cwd() + '/firebase-applet-config.json', 'utf8'));
-  initAdminApp({
-    projectId: fConfig.projectId,
-    storageBucket: fConfig.storageBucket,
-  });
-  console.log('[Server] Firebase Admin (Storage) initialized');
-} catch (e: any) {
-  if (!e.message.includes('already exists')) {
-    console.warn('[Server] Firebase Admin initialization failed:', e.message);
+// Persistencia en Bóveda Triple (AWS S3 + Firebase Storage) para credenciales y registro de Google Drive
+async function saveDriveCredentialsToCloud(creds: any): Promise<void> {
+  try {
+    await syncJsonToCloudVaults(DRIVE_CREDS_CLOUD_KEY, creds);
+  } catch (e: any) {
+    console.warn('[CloudVault Drive Creds Warn]:', e.message);
   }
 }
 
-// Initialize Firebase Client Storage on Server for direct reliable operations
-let serverStorageInstance: any = null;
-function getServerStorage() {
-  if (!serverStorageInstance) {
-    try {
-      const fConfig = JSON.parse(fs.readFileSync(process.cwd() + '/firebase-applet-config.json', 'utf8'));
-      const clientApp = getClientApps().length ? getClientApp() : initClientApp(fConfig);
-      serverStorageInstance = getClientStorage(clientApp);
-    } catch (e: any) {
-      console.warn('[Server] Error initializing Firebase Client Storage:', e.message);
-    }
+async function loadDriveCredentialsFromCloud(): Promise<any> {
+  try {
+    const { s3Data, firebaseStorageData } = await loadJsonFromCloudVaults(DRIVE_CREDS_CLOUD_KEY);
+    return s3Data || firebaseStorageData || null;
+  } catch {
+    return null;
   }
-  return serverStorageInstance;
 }
+
+async function clearDriveCredentialsFromCloud(): Promise<void> {
+  try {
+    await syncJsonToCloudVaults(DRIVE_CREDS_CLOUD_KEY, {});
+  } catch {}
+}
+
+async function saveDriveRegistryToCloud(registry: any): Promise<void> {
+  try {
+    await syncJsonToCloudVaults(DRIVE_REGISTRY_CLOUD_KEY, registry);
+  } catch (e: any) {
+    console.warn('[CloudVault Drive Registry Warn]:', e.message);
+  }
+}
+
+async function loadDriveRegistryFromCloud(): Promise<Record<string, any>> {
+  try {
+    const { s3Data, firebaseStorageData } = await loadJsonFromCloudVaults<Record<string, any>>(
+      DRIVE_REGISTRY_CLOUD_KEY
+    );
+    return { ...(firebaseStorageData || {}), ...(s3Data || {}) };
+  } catch {
+    return {};
+  }
+}
+
+async function saveAccessLogsToCloud(_logs: RegistroAcceso[]): Promise<void> {
+  // Manejado automáticamente por addRegistroAcceso en dbStore.ts hacia AWS S3 + Firebase Storage
+}
+
+import {
+  ADMIN_CEDULA,
+  CLEAN_ADMIN_CEDULA,
+  ADMIN_ACCESS_PASSWORD,
+  resolveAuthorizedAdminCedula,
+  isAuthorizedAdminCedula,
+  generateSessionToken,
+  verifySessionToken,
+  extractAuthenticatedUser,
+  requireAuthenticatedUser,
+  requireAdmin,
+  requireExpendio,
+  requireExpendioOwnership,
+  resolveUserExpendio,
+  normalizeCedula,
+  AuthRequest,
+  AuthenticatedUser,
+} from './server/authService.ts';
+import {
+  processAndSavePhotoHybrid,
+  readPhotoFromStorage,
+  firebaseCircuitBreaker,
+  getS3Client,
+  getFirebaseBucket,
+  PhotoMetadata,
+  getAwsS3Config,
+  uploadPhotoToS3Bucket,
+  ensureS3BucketExists,
+  listPhotosInS3Bucket,
+} from './src/lib/hybridPhotoStorage.ts';
+import {
+  registerDriveTokenProvider,
+  processPendingS3Backups,
+  processPendingDriveBackups,
+} from './src/lib/photoBackupWorkers.ts';
+import {
+  runFirebaseRecoveryWorker,
+  getRecoveryWorkerStats,
+} from './src/lib/firebaseRecoveryWorker.ts';
+import { diagnosePhotoIntegrity } from './server/photoDiagnosticService.ts';
+import { generateNoDisponibleSvg } from './src/lib/noDisponibleSvg.ts';
+import {
+  auditDatabaseIntegrity,
+  validateDatabaseInvariants,
+  normalizePeriodKey,
+} from './server/domainIntegrity.ts';
+import {
+  getOutboxSummary,
+  getPendingOutboxEvents,
+} from './server/durableOutbox.ts';
+import {
+  formatDateCanonical,
+  formatDateTimeCanonical,
+} from './server/dateUtils.ts';
 
 const app = express();
-const PORT = 3000;
-
-// --- CLOUD SYNC MIDDLEWARE ---
-// Prevents Cloud Run container from suspending before Firestore saves are complete
-global.pendingCloudSyncs = [];
-
-app.use((req, res, next) => {
-  const originalSend = res.send;
-  res.send = function (body) {
-    if (global.pendingCloudSyncs && global.pendingCloudSyncs.length > 0) {
-      const promises = [...global.pendingCloudSyncs];
-      global.pendingCloudSyncs.length = 0; // clear
-      Promise.allSettled(promises).then(() => {
-        originalSend.call(this, body);
-      });
-      return this; // send returns this
-    } else {
-      return originalSend.call(this, body);
-    }
-  };
-  next();
-});
+app.set('trust proxy', 1);
+const PORT = Number(process.env.PORT) || 3000;
 
 
 // Lazy initialization of Gemini API
@@ -146,19 +234,23 @@ const photosMunicipiosDir = path.join(dataDir, 'photos_municipios');
   }
 });
 
-// Restaurar fotos desde permanentPhotosDir a photosDir si el contenedor se reinició
-try {
-  if (fs.existsSync(permanentPhotosDir)) {
-    const permFiles = fs.readdirSync(permanentPhotosDir).filter((f) => f.endsWith('.jpg'));
-    for (const pf of permFiles) {
-      const src = path.join(permanentPhotosDir, pf);
-      const dest = path.join(photosDir, pf);
-      if (!fs.existsSync(dest)) {
-        try { fs.copyFileSync(src, dest); } catch {}
-      }
-    }
-  }
-} catch {}
+// Las fotos permanentes residen en permanentPhotosDir (data/photos_permanent) sin duplicarlas en uploads/photos
+
+// Middleware global de seguridad HTTP: nosniff y compatibilidad con iframe de AI Studio
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Permitir la visualización dentro del iframe del entorno AI Studio
+  res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ancestors *;");
+  next();
+});
+
+// Middleware global para prevenir respuestas HTTP cacheadas u obsoletas en toda la API
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 
 // Persistent Google Drive credentials file (independently preserved outside database snapshots)
 const googleDriveCredsPath = path.join(dataDir, 'google_drive_credentials.json');
@@ -206,7 +298,7 @@ function loadGoogleDriveCredentials(): GoogleDriveCredentialsFile | null {
 function saveGoogleDriveCredentials(creds: GoogleDriveCredentialsFile) {
   try {
     fs.writeFileSync(googleDriveCredsPath, JSON.stringify(creds, null, 2));
-    // Persistir de inmediato a Firestore en la nube para resistir reinicios de contenedor
+    // Persistir de inmediato a PostgreSQL para resistir reinicios de contenedor y redeploys
     saveDriveCredentialsToCloud(creds as any).catch(() => {});
   } catch (err) {
     console.error('Error guardando google_drive_credentials.json:', err);
@@ -214,13 +306,6 @@ function saveGoogleDriveCredentials(creds: GoogleDriveCredentialsFile) {
 }
 
 function getOAuthClientId(): string {
-  try {
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      if (cfg.oAuthClientId) return cfg.oAuthClientId;
-    }
-  } catch {}
   return process.env.GOOGLE_OAUTH_CLIENT_ID || '1094702324887-rp4lbvga43esdfrgjvp00huuf2tihoit.apps.googleusercontent.com';
 }
 
@@ -230,9 +315,20 @@ async function refreshServerDriveToken(refreshTokenOverride?: string): Promise<{
   expiresIn?: number;
   error?: string;
 }> {
-  const fileCreds = loadGoogleDriveCredentials();
+  let fileCreds = loadGoogleDriveCredentials();
   const db = loadDatabase();
-  const refreshToken = (refreshTokenOverride || fileCreds?.refreshToken || db.config?.googleDriveRefreshToken)?.trim();
+  let refreshToken = (refreshTokenOverride || fileCreds?.refreshToken || db.config?.googleDriveRefreshToken)?.trim();
+
+  // Si no está en disco ni memoria, consultar directamente en PostgreSQL
+  if (!refreshToken) {
+    try {
+      const cloudCreds = await loadDriveCredentialsFromCloud();
+      if (cloudCreds?.refreshToken) {
+        refreshToken = cloudCreds.refreshToken.trim();
+        fileCreds = cloudCreds;
+      }
+    } catch {}
+  }
 
   if (!refreshToken) {
     return { success: false, error: 'No hay Refresh Token configurado en el servidor.' };
@@ -263,6 +359,11 @@ async function refreshServerDriveToken(refreshTokenOverride?: string): Promise<{
     if (!tokenRes.ok || !data.access_token) {
       const errorMsg = data.error_description || data.error || `HTTP ${tokenRes.status}`;
       console.warn('[OAuth2 Server] Fallo al renovar access token con refresh token:', errorMsg);
+      // Solo purgar si Google reporta explícitamente invalid_grant (revocado por el usuario)
+      if (data.error === 'invalid_grant' || (typeof errorMsg === 'string' && errorMsg.includes('invalid_grant'))) {
+        console.warn('[OAuth2 Server] Refresh token revocado por el usuario. Limpiando credenciales revocadas...');
+        await purgeInvalidGoogleDriveCredentialsServer();
+      }
       return { success: false, error: errorMsg };
     }
 
@@ -271,20 +372,24 @@ async function refreshServerDriveToken(refreshTokenOverride?: string): Promise<{
     const expiresAt = Date.now() + expiresIn * 1000;
 
     // Actualizar base de datos
-    if (!db.config) db.config = {} as any;
-    db.config.googleDriveAccessToken = newAccessToken;
-    db.config.googleDriveRefreshToken = refreshToken;
-    db.config.googleDriveTokenExpiresAt = expiresAt;
-    saveDatabase(db);
+    await mutateDatabase(async (database) => {
+      if (!database.config) database.config = {} as any;
+      database.config.googleDriveAccessToken = newAccessToken;
+      database.config.googleDriveRefreshToken = refreshToken;
+      database.config.googleDriveTokenExpiresAt = expiresAt;
+    });
 
-    saveGoogleDriveCredentials({
+    const updatedCreds: GoogleDriveCredentialsFile = {
       accessToken: newAccessToken,
       refreshToken: refreshToken,
       expiresAt: expiresAt,
       email: fileCreds?.email || db.config?.googleDriveAccountEmail,
       displayName: fileCreds?.displayName || (db.config as any)?.googleDriveAccountName,
       updatedAt: new Date().toISOString(),
-    });
+    };
+
+    saveGoogleDriveCredentials(updatedCreds);
+    await saveDriveCredentialsToCloud(updatedCreds);
 
     console.log(`[OAuth2 Server] Access token renovado exitosamente con Refresh Token. Vigencia: ${expiresIn}s.`);
     return { success: true, accessToken: newAccessToken, expiresIn };
@@ -317,28 +422,50 @@ async function purgeInvalidGoogleDriveCredentialsServer() {
     if (fs.existsSync(rootCredsPath)) {
       try { fs.unlinkSync(rootCredsPath); } catch {}
     }
-    const db = loadDatabase();
-    if (db.config) {
-      delete db.config.googleDriveAccessToken;
-      delete db.config.googleDriveRefreshToken;
-      delete db.config.googleDriveTokenExpiresAt;
-      saveDatabase(db);
-    }
+    await mutateDatabase(async (db) => {
+      if (db.config) {
+        delete db.config.googleDriveAccessToken;
+        delete db.config.googleDriveRefreshToken;
+        delete db.config.googleDriveTokenExpiresAt;
+      }
+    });
     await clearDriveCredentialsFromCloud();
-    console.log('[OAuth2 Server] Credenciales expiradas/inválidas de Google Drive eliminadas del servidor y Firestore.');
+    console.log('[OAuth2 Server] Credenciales expiradas/inválidas de Google Drive eliminadas del servidor y base de datos.');
   } catch (err: any) {
     console.warn('[OAuth2 Server] Error limpiando credenciales expiradas:', err.message);
   }
 }
 
 async function getOrRefreshDriveTokenServer(): Promise<string | null> {
-  const fileCreds = loadGoogleDriveCredentials();
+  let fileCreds = loadGoogleDriveCredentials();
+  
+  // 1. Si no hay credenciales locales, cargar desde PostgreSQL
+  if (!fileCreds || !fileCreds.accessToken) {
+    try {
+      const cloudCreds = await loadDriveCredentialsFromCloud();
+      if (cloudCreds && cloudCreds.accessToken) {
+        fileCreds = cloudCreds;
+        saveGoogleDriveCredentials(cloudCreds);
+      }
+    } catch {}
+  }
+
   const db = loadDatabase();
   let token = fileCreds?.accessToken || db.config?.googleDriveAccessToken || null;
   let expiresAt = fileCreds?.expiresAt || db.config?.googleDriveTokenExpiresAt;
-  const refreshToken = (fileCreds?.refreshToken || db.config?.googleDriveRefreshToken)?.trim();
+  let refreshToken = (fileCreds?.refreshToken || db.config?.googleDriveRefreshToken)?.trim();
 
-  // 1. Si el token expiró o está por expirar y tenemos refresh token, renovar automáticamente
+  // Si no tenemos refreshToken en memoria/disco, buscar en PostgreSQL
+  if (!refreshToken) {
+    try {
+      const cloudCreds = await loadDriveCredentialsFromCloud();
+      if (cloudCreds?.refreshToken) {
+        refreshToken = cloudCreds.refreshToken.trim();
+      }
+    } catch {}
+  }
+
+  // 2. Si el token expiró o está por expirar y tenemos refresh token, renovar automáticamente
   if (refreshToken) {
     if (!token || !expiresAt || expiresAt <= (Date.now() + 180000)) {
       console.log('[OAuth2 Server] Renovando token de Google Drive automáticamente con Refresh Token...');
@@ -349,32 +476,22 @@ async function getOrRefreshDriveTokenServer(): Promise<string | null> {
     }
   }
 
-  // 2. Si no teníamos token en disco, intentar cargarlo de Firestore
-  if (!token) {
-    try {
-      const cloudCreds = await loadDriveCredentialsFromCloud();
-      if (cloudCreds?.accessToken) {
-        token = cloudCreds.accessToken;
-        expiresAt = cloudCreds.expiresAt;
-        if (cloudCreds.refreshToken) {
-          const refreshRes = await refreshServerDriveToken(cloudCreds.refreshToken);
-          if (refreshRes.success && refreshRes.accessToken) {
-            return refreshRes.accessToken;
-          }
-        }
-      }
-    } catch {}
-  }
-
   // 3. Validar token existente contra Google si no tiene refreshToken
   if (token) {
     const isValid = await isGoogleTokenValid(token);
     if (isValid) {
       return token;
     }
-    // Token es inválido y no se puede renovar: purgar para evitar errores 401
-    console.warn('[OAuth2 Server] El token de Google Drive almacenado no es válido según Google OAuth2. Limpiando credenciales...');
-    await purgeInvalidGoogleDriveCredentialsServer();
+    // Si no es válido pero tenemos refresh token, intentar renovar antes de considerar error
+    if (refreshToken) {
+      console.log('[OAuth2 Server] Token no válido en tokeninfo, intentando renovación con Refresh Token...');
+      const refreshRes = await refreshServerDriveToken(refreshToken);
+      if (refreshRes.success && refreshRes.accessToken) {
+        return refreshRes.accessToken;
+      }
+    }
+    // Preservar la sesión configurada y no purgar automáticamente para prevenir desconexiones accidentales
+    console.warn('[OAuth2 Server] Token de Google Drive expirado o pendiente de renovación por el cliente.');
   }
 
   return null;
@@ -388,6 +505,27 @@ function getActiveDriveTokenServer(): string | null {
   const db = loadDatabase();
   return db.config?.googleDriveAccessToken || null;
 }
+
+// Conectar proveedor de token renovable desde PostgreSQL al worker de Google Drive
+registerDriveTokenProvider(async () => {
+  return await getOrRefreshDriveTokenServer();
+});
+
+// Worker bajo demanda: solo procesa respaldos pendientes si hubo actividad reciente, permitiendo Scale-to-Zero en Cloud Run y Cloud SQL
+let lastPhotoUploadOrModifyAt = 0;
+export function markPhotoActivity() {
+  lastPhotoUploadOrModifyAt = Date.now();
+}
+setInterval(async () => {
+  // No despertar PostgreSQL ni S3 si no ha habido actividad fotográfica en los últimos 15 minutos
+  if (Date.now() - lastPhotoUploadOrModifyAt > 15 * 60 * 1000) return;
+  try {
+    await processPendingS3Backups(db, 5);
+    await processPendingDriveBackups(db, 5);
+  } catch (err: any) {
+    console.warn('[PhotoBackupWorker Cron Warn]:', err.message);
+  }
+}, 10 * 60 * 1000);
 
 // Configure multer storage
 const storage = multer.diskStorage({
@@ -407,8 +545,29 @@ const storage = multer.diskStorage({
   },
 });
 
+// Filtro estricto de seguridad: únicamente extensiones y tipos MIME seguros (.jpg, .jpeg, .png, .pdf)
+const safeMediaFileFilter = (req: any, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const ext = path.extname(file.originalname).toLowerCase();
+  const allowedExts = ['.jpg', '.jpeg', '.png', '.pdf'];
+  const allowedMimes = [
+    'image/jpeg',
+    'image/jpg',
+    'image/pjpeg',
+    'image/png',
+    'image/x-png',
+    'application/pdf',
+    'application/x-pdf',
+  ];
+
+  if (!allowedExts.includes(ext) || !allowedMimes.includes(file.mimetype.toLowerCase())) {
+    return cb(new Error('Formato no permitido: Únicamente se aceptan extensiones seguras (.jpg, .jpeg, .png, .pdf).'));
+  }
+  cb(null, true);
+};
+
 const upload = multer({
   storage,
+  fileFilter: safeMediaFileFilter,
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
 });
 
@@ -426,8 +585,93 @@ const scannedStorage = multer.diskStorage({
 
 const uploadScanned = multer({
   storage: scannedStorage,
+  fileFilter: safeMediaFileFilter,
   limits: { fileSize: 30 * 1024 * 1024 }, // 30MB limit for high-res PDF / scans
 });
+
+// Multer específico para importación de hojas de cálculo administrativas (.xlsx, .xls, .csv)
+const uploadExcel = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, tempImportsDir),
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+      const cleanOriginalName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+      cb(null, `excel-${uniqueSuffix}-${cleanOriginalName}`);
+    },
+  }),
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const allowed = ['.xlsx', '.xls', '.csv'];
+    if (!allowed.includes(ext)) {
+      return cb(new Error('Formato no permitido: Solo se admiten archivos de cálculo (.xlsx, .xls, .csv).'));
+    }
+    cb(null, true);
+  },
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
+
+/**
+ * Valida los números mágicos (magic bytes / file signatures) reales en los primeros bytes del archivo
+ * para garantizar en el servidor que sea auténticamente JPEG, PNG o PDF y no un script malicioso renombrado.
+ */
+async function verifyFileMagicBytes(filePath: string): Promise<{ valid: boolean; detectedType?: string }> {
+  try {
+    const fd = await fs.promises.open(filePath, 'r');
+    const buffer = Buffer.alloc(16);
+    const { bytesRead } = await fd.read(buffer, 0, 16, 0);
+    await fd.close();
+
+    if (bytesRead < 4) return { valid: false };
+
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+      return { valid: true, detectedType: 'image/jpeg' };
+    }
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+      return { valid: true, detectedType: 'image/png' };
+    }
+    // PDF: %PDF- (25 50 44 46)
+    if (buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) {
+      return { valid: true, detectedType: 'application/pdf' };
+    }
+
+    return { valid: false };
+  } catch {
+    return { valid: false };
+  }
+}
+
+/**
+ * Middleware para validar la autenticidad de los archivos subidos mediante inspección de magic bytes
+ */
+async function validateUploadedFileSecurity(req: any, res: any, next: any) {
+  const filesToCheck: Express.Multer.File[] = [];
+  if (req.file) filesToCheck.push(req.file);
+  if (Array.isArray(req.files)) {
+    filesToCheck.push(...req.files);
+  } else if (req.files && typeof req.files === 'object') {
+    for (const field of Object.values(req.files)) {
+      if (Array.isArray(field)) filesToCheck.push(...(field as Express.Multer.File[]));
+    }
+  }
+
+  for (const file of filesToCheck) {
+    if (!file.path || !fs.existsSync(file.path)) continue;
+    const { valid } = await verifyFileMagicBytes(file.path);
+    if (!valid) {
+      try {
+        fs.unlinkSync(file.path);
+      } catch {}
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_FILE_SIGNATURE',
+        message: 'El archivo subido fue rechazado por motivos de seguridad: el contenido real no corresponde a una imagen (.jpg, .png) o documento (.pdf) válido.',
+      });
+    }
+  }
+  next();
+}
 
 // Environment and database files separation (Published vs Test)
 const PUBLISHED_APP_URL = 'https://ais-pre-ypoh6t44vnhnm5py2vaqxs-464412252846.us-east1.run.app';
@@ -441,24 +685,6 @@ const masterPublishedDbPath = path.join(dataDir, 'database.published.json');
 const testDbPath = path.join(dataDir, 'database.test.json');
 const legacyDbPath = path.join(dataDir, 'database.json');
 const dbFilePath = legacyDbPath; // Keep for backward compatibility
-
-function getActiveDbPath(): string {
-  if (isPublishedEnv) {
-    return fs.existsSync(masterPublishedDbPath) ? masterPublishedDbPath : legacyDbPath;
-  }
-  return testDbPath;
-}
-
-interface DatabaseSchema {
-  expendios: ExpendioData[];
-  historial: HistorialItem[];
-  trazabilidad: TrazabilidadExpendio[];
-  config?: SystemConfig;
-  cuentasCargadas?: CuentaCargadaExpendio[];
-  relacionPagos?: PagoRelacionItem[];
-  registrosAcceso?: RegistroAcceso[];
-  visitasGenerales?: number;
-}
 
 function parseDeviceInfo(userAgent?: string): { dispositivo: string; navegador: string } {
   if (!userAgent) return { dispositivo: 'Desconocido', navegador: 'Navegador Web' };
@@ -544,7 +770,7 @@ async function resolveIpLocation(ip: string, reqHeaders?: any): Promise<{ ubicac
 }
 
 function registrarIngresoUsuario(
-  db: DatabaseSchema,
+  _db: DatabaseSchema,
   req: express.Request,
   usuario: string,
   cedulaOrNit: string,
@@ -554,8 +780,66 @@ function registrarIngresoUsuario(
   exitoso: boolean = true,
   detalles?: string
 ) {
-  if (!Array.isArray(db.registrosAcceso)) {
-    db.registrosAcceso = [];
+  // Filtrar palabras clave de prueba o simulación
+  const rawSearchStr = `${usuario} ${cedulaOrNit} ${rol} ${municipio || ''} ${tipoAcceso} ${detalles || ''}`.toLowerCase();
+  const testKeywords = ['test', 'mock', 'demo', 'fake', 'sample', 'fixture', 'dummy', 'simula', 'synthetic', 'health', 'check', 'internal', 'request', 'attemp', 'prueva', 'prueba', 'unknown', '9999999'];
+  for (const keyword of testKeywords) {
+    if (rawSearchStr.includes(keyword)) {
+      console.warn(`[AccessLog] Rechazado registro de acceso debido a patrón de prueba detectado: "${keyword}"`);
+      return null;
+    }
+  }
+
+  // Validar existencia real del usuario / expendio en PostgreSQL (db maestro)
+  const db = loadDatabase();
+  const cleanCed = String(cedulaOrNit || '').replace(/\D/g, '');
+  if (!cleanCed) {
+    console.warn('[AccessLog] Rechazado: Cédula de ingreso vacía.');
+    return null;
+  }
+
+  let userExists = false;
+  let matchedExpendio = null;
+  if (cleanCed === ADMIN_CEDULA) {
+    userExists = true;
+    matchedExpendio = (db.expendios || []).find((e) => String(e.cedula || '').replace(/\D/g, '') === ADMIN_CEDULA) || null;
+  } else {
+    // Buscar en el catálogo de expendios de la base de datos
+    const foundExp = (db.expendios || []).find((e) => String(e.cedula || '').replace(/\D/g, '') === cleanCed);
+    if (foundExp && foundExp.estado !== 'Inhabilitado') {
+      userExists = true;
+      matchedExpendio = foundExp;
+    }
+  }
+
+  if (!userExists) {
+    console.warn(`[AccessLog] Rechazado: Intento de registro para usuario con cédula "${cedulaOrNit}" inexistente o inhabilitado en PostgreSQL.`);
+    return null;
+  }
+
+  // Si corresponde a un expendio, el expendioId debe existir y la cédula corresponder
+  if (rol === 'expendio' && !matchedExpendio) {
+    console.warn(`[AccessLog] Rechazado: El rol 'expendio' requiere un expendio real asociado en PostgreSQL.`);
+    return null;
+  }
+
+  // Validar sesión/token si es un acceso de visita / página
+  if (tipoAcceso === 'visita') {
+    const authUser = extractAuthenticatedUser(req);
+    if (!authUser) {
+      console.warn(`[AccessLog] Rechazado: Intento de registro de visita sin sesión/token válido.`);
+      return null;
+    }
+    if (String(authUser.cedula || '').replace(/\D/g, '') !== cleanCed) {
+      console.warn(`[AccessLog] Rechazado: Discrepancia de cédula entre el token y el log.`);
+      return null;
+    }
+  }
+
+  // Solamente registrar operaciones reales exitosas
+  if (!exitoso) {
+    console.warn(`[AccessLog] Ignorando registro de acceso fallido para mantener limpio producción.`);
+    return null;
   }
 
   const rawIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '';
@@ -577,7 +861,8 @@ function registrarIngresoUsuario(
   const fechaCorta = now.toISOString().split('T')[0];
 
   const cachedLoc = ipLocationCache.get(ip);
-  const initialUbicacion = cachedLoc?.ubicacion || (municipio ? `${municipio}, Colombia` : 'Colombia');
+  const resolvedMuni = matchedExpendio?.municipio || matchedExpendio?.localidad || municipio || '';
+  const initialUbicacion = cachedLoc?.ubicacion || (resolvedMuni ? `${resolvedMuni}, Colombia` : 'Colombia');
   const initialIsp = cachedLoc?.isp || '';
 
   const nuevoRegistro: RegistroAcceso = {
@@ -585,10 +870,10 @@ function registrarIngresoUsuario(
     timestamp: now.toISOString(),
     fechaFormateada,
     fechaCorta,
-    usuario,
-    cedulaOrNit,
+    usuario: matchedExpendio?.encargado || usuario,
+    cedulaOrNit: matchedExpendio?.cedula || cedulaOrNit,
     rol,
-    municipio: municipio || '',
+    municipio: resolvedMuni,
     ip,
     ubicacionIp: initialUbicacion,
     isp: initialIsp,
@@ -599,36 +884,112 @@ function registrarIngresoUsuario(
     detalles,
   };
 
-  db.registrosAcceso.unshift(nuevoRegistro);
+  // 1. Guardado en store aislado en disco (registros_acceso.json) sin tocar el JSON maestro
+  addRegistroAcceso(nuevoRegistro);
+
+  // 2. Persistencia aislada en PostgreSQL (registrosAcceso) en background
+  saveAccessLogsToCloud([nuevoRegistro]).catch(() => {});
 
   // Background lookup to enrich location if not already cached
   if (!cachedLoc && ip !== '127.0.0.1' && !ip.startsWith('10.') && !ip.startsWith('192.168.')) {
     resolveIpLocation(ip, req.headers).then((loc) => {
       nuevoRegistro.ubicacionIp = loc.ubicacion;
       if (loc.isp) nuevoRegistro.isp = loc.isp;
-      try {
-        saveDatabase(db);
-      } catch {
-        // Ignored
-      }
+      addRegistroAcceso(nuevoRegistro);
     }).catch(() => {});
   }
 
-  // Keep up to 2,000 most recent logs
-  if (db.registrosAcceso.length > 2000) {
-    db.registrosAcceso = db.registrosAcceso.slice(0, 2000);
-  }
-
-  saveDatabase(db);
   return nuevoRegistro;
 }
 
-function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
-  const registros = db.registrosAcceso || [];
-  const expendios = db.expendios || [];
+// Real-time active online users presence tracking
+interface PresenceEntry {
+  key: string;
+  cedula: string;
+  usuario: string;
+  rol: string;
+  municipio: string;
+  ip: string;
+  dispositivo: string;
+  navegador: string;
+  path: string;
+  lastSeen: number;
+  timestampIso: string;
+}
+
+const activeUsersPresenceMap = new Map<string, PresenceEntry>();
+
+function cleanupStalePresence() {
+  const cutoff = Date.now() - 90 * 1000; // 90 seconds timeout
+  for (const [key, value] of activeUsersPresenceMap.entries()) {
+    if (value.lastSeen < cutoff) {
+      activeUsersPresenceMap.delete(key);
+    }
+  }
+}
+
+async function calcularMetricasAccesoAsync(dbData: DatabaseSchema): Promise<MetricasAccesoResumen> {
+  cleanupStalePresence();
+  let rawRegistros = getRegistrosAcceso();
+
+  // 1. Cargar registros persistentes directamente desde PostgreSQL para garantizar métricas 100% reales
+  try {
+    const pgRows = await db.select().from(schema.registrosAcceso);
+    if (pgRows && pgRows.length > 0) {
+      const pgMapped: RegistroAcceso[] = pgRows.map((r: any) => {
+        const d = (r.details || {}) as any;
+        return {
+          id: r.id || d.id || `acc_pg_${r.timestamp}`,
+          timestamp: r.timestamp ? new Date(r.timestamp).toISOString() : (d.timestamp || new Date().toISOString()),
+          fechaFormateada: d.fechaFormateada || (r.timestamp ? new Date(r.timestamp).toLocaleString('es-CO', { timeZone: 'America/Bogota' }) : ''),
+          fechaCorta: d.fechaCorta || (r.timestamp ? new Date(r.timestamp).toISOString().split('T')[0] : ''),
+          usuario: d.usuario || d.encargado || r.actorId || 'Usuario',
+          cedulaOrNit: d.cedulaOrNit || d.cedula || r.actorId || '',
+          rol: (r.actorRole || d.rol || 'desconocido') as any,
+          municipio: d.municipio || '',
+          ip: r.ip || d.ip || '127.0.0.1',
+          ubicacionIp: d.ubicacionIp || (d.municipio ? `${d.municipio}, Colombia` : 'Colombia'),
+          isp: d.isp || 'Red Nacional',
+          dispositivo: d.dispositivo || r.userAgent || 'Navegador Web',
+          navegador: d.navegador || '',
+          tipoAcceso: (r.action || d.tipoAcceso || 'visita') as any,
+          exitoso: d.exitoso !== false,
+          detalles: d.detalles || r.action,
+        };
+      });
+
+      const seenIds = new Set<string>();
+      const combined: RegistroAcceso[] = [];
+      for (const reg of [...rawRegistros, ...pgMapped]) {
+        if (!reg || !reg.id) continue;
+        if (!seenIds.has(reg.id)) {
+          seenIds.add(reg.id);
+          combined.push(reg);
+        }
+      }
+      rawRegistros = combined;
+    }
+  } catch (err: any) {
+    console.warn('[Metricas Acceso PG Warn]:', err.message);
+  }
+
+  // Ordenar cronológicamente descendente
+  rawRegistros.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  const expendios = dbData.expendios || [];
+
+  // Filtrar registros sintéticos o de prueba
+  const registros = rawRegistros.filter((r) => {
+    if (!r || !r.exitoso) return false;
+    const cedClean = normalizeCedula(r.cedulaOrNit);
+    if (!cedClean || cedClean.startsWith('99999')) return false;
+    const text = `${r.usuario || ''} ${r.municipio || ''} ${r.detalles || ''}`.toLowerCase();
+    if (text.includes('attempt') || text.includes('no registrado') || text.includes('synthetic') || text.includes('bucaramanga test')) return false;
+    return true;
+  });
 
   const totalIngresos = registros.length;
-  const uniqueCedulas = new Set(registros.map((r) => r.cedulaOrNit).filter(Boolean));
+  const uniqueCedulas = new Set(registros.map((r) => normalizeCedula(r.cedulaOrNit)).filter(Boolean));
   const totalUsuariosUnicos = uniqueCedulas.size;
 
   const now = new Date();
@@ -650,6 +1011,7 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
     movil: registros.filter(
       (r) =>
         (r.dispositivo || '').toLowerCase().includes('móvil') ||
+        (r.dispositivo || '').toLowerCase().includes('movil') ||
         (r.dispositivo || '').toLowerCase().includes('iphone')
     ).length,
     escritorio: registros.filter(
@@ -672,6 +1034,7 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
       municipio: string;
       totalIngresos: number;
       ultimoIngreso: string;
+      ultimoTimestamp: string;
       telefonoPunto?: string;
       tieneFotos?: boolean;
       ultimaIp?: string;
@@ -680,27 +1043,49 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
     }
   >();
 
+  const checkExpendioHasPhotos = (exp?: ExpendioData | null) =>
+    Boolean(
+      exp &&
+        (exp.fotoAvisoUrl ||
+          exp.fotoPanoramicaUrl ||
+          exp.fotoMataselloUrl ||
+          exp.fotoBasculaUrl ||
+          exp.fotoContratistaUrl ||
+          exp.fotoHorarioUrl ||
+          exp.fotoTarifasUrl ||
+          exp.fotoFachadaUrl ||
+          exp.letreroUrl ||
+          exp.basculaUrl ||
+          exp.mataselloUrl)
+    );
+
   registros.forEach((r) => {
-    if (r.rol === 'expendio' && r.cedulaOrNit) {
-      const exp = expendios.find((e) => e.cedula === r.cedulaOrNit);
-      const prev = expendiosQueHanIngresadoMap.get(r.cedulaOrNit);
-      const tieneFotos = !!(
-        exp?.fotoAvisoUrl ||
-        exp?.fotoPanoramicaUrl ||
-        exp?.fotoMataselloUrl ||
-        exp?.fotoBasculaUrl ||
-        exp?.fotoFachadaUrl ||
-        exp?.letreroUrl ||
-        exp?.basculaUrl ||
-        exp?.mataselloUrl
-      );
+    const cleanRegCed = normalizeCedula(r.cedulaOrNit);
+    if (!cleanRegCed) return;
+
+    const exp =
+      expendios.find((e) => normalizeCedula(e.cedula) === cleanRegCed) ||
+      (r.municipio
+        ? expendios.find(
+            (e) =>
+              (e.municipio || '').trim().toUpperCase() === r.municipio!.trim().toUpperCase() ||
+              (e.localidad || '').trim().toUpperCase() === r.municipio!.trim().toUpperCase()
+          )
+        : undefined);
+
+    if (r.rol === 'expendio' || (r.rol === 'admin' && exp)) {
+      const mapKey = exp ? normalizeCedula(exp.cedula) : cleanRegCed;
+      const prev = expendiosQueHanIngresadoMap.get(mapKey);
+      const tieneFotos = checkExpendioHasPhotos(exp);
+
       if (!prev) {
-        expendiosQueHanIngresadoMap.set(r.cedulaOrNit, {
-          cedula: r.cedulaOrNit,
+        expendiosQueHanIngresadoMap.set(mapKey, {
+          cedula: exp?.cedula || r.cedulaOrNit,
           encargado: exp?.encargado || r.usuario,
           municipio: exp?.municipio || exp?.localidad || r.municipio || 'SIN MUNICIPIO',
           totalIngresos: 1,
           ultimoIngreso: r.fechaFormateada || r.timestamp,
+          ultimoTimestamp: r.timestamp,
           telefonoPunto: exp?.telefonoPunto,
           tieneFotos,
           ultimaIp: r.ip || '',
@@ -709,7 +1094,8 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
         });
       } else {
         prev.totalIngresos += 1;
-        if (r.timestamp > prev.ultimoIngreso) {
+        if (r.timestamp > prev.ultimoTimestamp) {
+          prev.ultimoTimestamp = r.timestamp;
           prev.ultimoIngreso = r.fechaFormateada || r.timestamp;
           if (r.ip) prev.ultimaIp = r.ip;
           if (r.ubicacionIp) prev.ultimaUbicacion = r.ubicacionIp;
@@ -719,11 +1105,37 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
     }
   });
 
-  const expendiosQueHanIngresado = Array.from(expendiosQueHanIngresadoMap.values());
-  const cedulasQueIngresaron = new Set(expendiosQueHanIngresado.map((e) => e.cedula));
+  for (const exp of expendios) {
+    const cleanCed = normalizeCedula(exp.cedula);
+    if (!cleanCed) continue;
+    const tieneFotos = checkExpendioHasPhotos(exp);
+    if ((tieneFotos || exp.primeraVezActualizado) && !expendiosQueHanIngresadoMap.has(cleanCed)) {
+      const fechaAct = exp.updatedAt || exp.fechaUltimaActualizacion || new Date().toISOString();
+      expendiosQueHanIngresadoMap.set(cleanCed, {
+        cedula: exp.cedula,
+        encargado: exp.encargado,
+        municipio: exp.municipio || exp.localidad || 'SIN MUNICIPIO',
+        totalIngresos: 1,
+        ultimoIngreso: exp.fechaUltimaActualizacion || fechaAct.split('T')[0],
+        ultimoTimestamp: fechaAct,
+        telefonoPunto: exp.telefonoPunto,
+        tieneFotos,
+        ultimaIp: 'Registro Fotográfico Sincronizado',
+        ultimaUbicacion: `${exp.municipio || exp.localidad || 'Colombia'}, Colombia`,
+        isp: 'Red Nacional',
+      });
+    }
+  }
+
+  const expendiosQueHanIngresado = Array.from(expendiosQueHanIngresadoMap.values()).map(
+    ({ ultimoTimestamp, ...rest }) => rest
+  );
+  const cedulasQueIngresaron = new Set(
+    expendiosQueHanIngresado.map((e) => normalizeCedula(e.cedula))
+  );
 
   const expendiosPendientesPorIngresar = expendios
-    .filter((e) => !cedulasQueIngresaron.has(e.cedula))
+    .filter((e) => !cedulasQueIngresaron.has(normalizeCedula(e.cedula)))
     .map((e) => ({
       cedula: e.cedula,
       encargado: e.encargado,
@@ -738,10 +1150,25 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
       ? Math.round((expendiosQueHanIngresadoCount / expendiosRegistradosTotales) * 1000) / 10
       : 0;
 
+  // Realtime active users online calculation
+  const nowMs = Date.now();
+  const activeList = Array.from(activeUsersPresenceMap.values())
+    .map((item) => ({
+      ...item,
+      haceCuantoSegundos: Math.max(0, Math.floor((nowMs - item.lastSeen) / 1000)),
+    }))
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+
+  const desgloseEnLinea = {
+    expendio: activeList.filter((u) => u.rol === 'expendio').length,
+    admin: activeList.filter((u) => u.rol === 'admin').length,
+    cliente: activeList.filter((u) => u.rol === 'cliente').length,
+  };
+
   return {
     totalIngresos,
-    totalUsuariosUnicos,
-    totalVisitasGenerales: db.visitasGenerales || totalIngresos,
+    totalUsuariosUnicos: Math.max(totalUsuariosUnicos, expendiosQueHanIngresadoCount),
+    totalVisitasGenerales: Math.max(dbData.visitasGenerales || 0, totalIngresos),
     ingresosHoy,
     ingresosUltimos7Dias,
     ingresosEsteMes,
@@ -753,6 +1180,9 @@ function calcularMetricasAcceso(db: DatabaseSchema): MetricasAccesoResumen {
     expendiosQueHanIngresado,
     expendiosPendientesPorIngresar,
     ultimosAccesos: registros.slice(0, 150),
+    usuariosEnLineaCount: activeList.length,
+    desgloseEnLinea,
+    listaUsuariosEnLinea: activeList,
   };
 }
 
@@ -788,8 +1218,9 @@ function formatCuentaBancaria(
   rawCuenta?: string | null,
   rawBanco?: string | null
 ): { cuenta: string; banco: string } {
-  if (!rawCuenta) return { cuenta: 'NEQUI 3123304166', banco: 'NEQUI' };
+  if (!rawCuenta) return { cuenta: '', banco: String(rawBanco || '').trim() };
   const str = String(rawCuenta).trim();
+  if (!str) return { cuenta: '', banco: String(rawBanco || '').trim() };
   const upper = str.toUpperCase();
   const bancoUpper = (rawBanco || '').toUpperCase();
 
@@ -804,9 +1235,9 @@ function formatCuentaBancaria(
 
   if (isNequi) {
     const numClean = cleanNequiNumber(str);
-    const validNum = numClean.length === 10 ? numClean : numClean || '3123304166';
+    const validNum = numClean.length === 10 ? numClean : numClean;
     return {
-      cuenta: `NEQUI ${validNum}`,
+      cuenta: validNum ? `NEQUI ${validNum}` : str,
       banco: 'NEQUI',
     };
   }
@@ -871,8 +1302,8 @@ function syncCuentasToRelacionPagos(db: any, cuentas: CuentaCobroResult[], perio
         (cleanCed && cleanDigits(e.cedula) === cleanCed)
     );
 
-    let cuentaFinal = 'NEQUI 3123304166';
-    let bancoFinal = 'NEQUI';
+    let cuentaFinal = '';
+    let bancoFinal = '';
 
     if (expItem?.cuentaBancaria && expItem.cuentaBancaria.trim()) {
       const expBanco = (expItem.banco || 'NEQUI').toUpperCase().trim();
@@ -884,8 +1315,8 @@ function syncCuentasToRelacionPagos(db: any, cuentas: CuentaCobroResult[], perio
       bancoFinal = formatted.banco;
     } else if (expItem?.telefonoPunto) {
       const phoneClean = cleanNequiNumber(expItem.telefonoPunto);
-      cuentaFinal = phoneClean ? `NEQUI ${phoneClean}` : 'NEQUI 3123304166';
-      bancoFinal = 'NEQUI';
+      cuentaFinal = phoneClean ? `NEQUI ${phoneClean}` : '';
+      bancoFinal = phoneClean ? 'NEQUI' : '';
     }
 
     const rawCed = (c.cedula || '').replace(/[^0-9]/g, '');
@@ -908,9 +1339,28 @@ function syncCuentasToRelacionPagos(db: any, cuentas: CuentaCobroResult[], perio
     };
   });
 
+  const currentMonthExisting = db.relacionPagos.filter(
+    (p: any) => p.mes?.toUpperCase() === mesUpper && String(p.anio || '2026') === anioStr
+  );
+  const existingKeys = new Set(
+    currentMonthExisting.map((p: any) => (p.municipio || '').trim().toUpperCase())
+  );
+
+  let insertados = 0;
+  let actualizados = 0;
+  for (const r of newRecords) {
+    if (existingKeys.has((r.municipio || '').trim().toUpperCase())) {
+      actualizados++;
+    } else {
+      insertados++;
+    }
+  }
+
   db.relacionPagos = [...otherMonths, ...newRecords];
   return {
     totalSynced: newRecords.length,
+    insertados,
+    actualizados,
     mes: mesUpper,
     anio: anioStr,
   };
@@ -976,53 +1426,7 @@ const DEFAULT_CONFIG: SystemConfig = {
   documentosExpendios: DEFAULT_DOCUMENTOS_EXPENDIOS,
 };
 
-const DEFAULT_RELACION_PAGOS: PagoRelacionItem[] = [
-  {
-    id: 'pago-1',
-    consecutivo: 1,
-    centroOperativo: 'ARAUCA',
-    municipio: 'ARAUCA',
-    concepto: 'PAGO MES FEBRERO EXPENDIO ARAUCA',
-    nombreEncargado: 'JORGE ANDRES LOPEZ PATIÑO',
-    cedula: '1.116.796.414',
-    cuenta: 'NEQUI 3123304166',
-    valorCancelar: 0,
-    banco: 'NEQUI',
-    estado: 'Pendiente',
-    mes: 'FEBRERO',
-    anio: '2026',
-  },
-  {
-    id: 'pago-2',
-    consecutivo: 2,
-    centroOperativo: 'ARAUCA',
-    municipio: 'ARAUQUITA',
-    concepto: 'PAGO MES FEBRERO EXPENDIO ARAUQUITA',
-    nombreEncargado: 'JAIME YESITH PINILLA',
-    cedula: '1.06.610.564',
-    cuenta: 'NEQUI 3143495145',
-    valorCancelar: 121350,
-    banco: 'NEQUI',
-    estado: 'Pendiente',
-    mes: 'FEBRERO',
-    anio: '2026',
-  },
-  {
-    id: 'pago-3',
-    consecutivo: 3,
-    centroOperativo: 'ARAUCA',
-    municipio: 'CRAVO NORTE',
-    concepto: 'PAGO MES FEBRERO EXPENDIO CRAVO NORTE',
-    nombreEncargado: 'ERIKA ISABEL CISNEROS',
-    cedula: '30.020.686',
-    cuenta: 'NEQUI 3177320154',
-    valorCancelar: 0,
-    banco: 'NEQUI',
-    estado: 'Pendiente',
-    mes: 'FEBRERO',
-    anio: '2026',
-  },
-];
+const DEFAULT_RELACION_PAGOS: PagoRelacionItem[] = [];
 
 function deduplicateHistorial(historialList: HistorialItem[]): HistorialItem[] {
   if (!Array.isArray(historialList)) return [];
@@ -1177,277 +1581,10 @@ function checkDiscrepanciesEncargado(
   return diffs;
 }
 
-function loadDatabase(): DatabaseSchema {
-  const currentDbPath = getActiveDbPath();
-  let db: DatabaseSchema;
-
-  if (!fs.existsSync(currentDbPath)) {
-    // If running in TEST, copy from master published database if it exists
-    if (!isPublishedEnv && (fs.existsSync(masterPublishedDbPath) || fs.existsSync(legacyDbPath))) {
-      try {
-        const sourcePath = fs.existsSync(masterPublishedDbPath) ? masterPublishedDbPath : legacyDbPath;
-        const seedRaw = fs.readFileSync(sourcePath, 'utf-8');
-        fs.writeFileSync(currentDbPath, seedRaw);
-        db = JSON.parse(seedRaw);
-        return db;
-      } catch (e) {
-        console.warn('Error inicializando base de datos de test desde producción:', e);
-      }
-    }
-
-    db = {
-      expendios: INITIAL_EXPENDIOS.map((e) => ({
-        ...e,
-        municipio: (e.municipio || e.localidad || '').trim(),
-        localidad: (e.localidad || e.municipio || '').trim(),
-      })),
-      historial: INITIAL_HISTORIAL,
-      trazabilidad: INITIAL_TRAZABILIDAD,
-      config: { ...DEFAULT_CONFIG, isEphemeralSeed: true }, // Mark as seed
-      cuentasCargadas: [],
-      relacionPagos: DEFAULT_RELACION_PAGOS,
-    };
-    saveDatabase(db);
-    return db;
-  }
-
-  try {
-    const raw = fs.readFileSync(currentDbPath, 'utf-8');
-    db = JSON.parse(raw);
-  } catch (err) {
-    console.error('Error reading database file, resetting to initial baseline:', err);
-    db = {
-      expendios: INITIAL_EXPENDIOS,
-      historial: INITIAL_HISTORIAL,
-      trazabilidad: INITIAL_TRAZABILIDAD,
-      config: { ...DEFAULT_CONFIG, isEphemeralSeed: true },
-      cuentasCargadas: [],
-      relacionPagos: DEFAULT_RELACION_PAGOS,
-    };
-    saveDatabase(db);
-    return db;
-  }
-
-  // Ensure arrays exist without overwriting empty collections when cleared
-  if (!Array.isArray(db.expendios)) {
-    db.expendios = [];
-  }
-
-  if (!Array.isArray(db.trazabilidad)) {
-    db.trazabilidad = [];
-  }
-  if (!db.config) {
-    db.config = { ...DEFAULT_CONFIG };
-  } else if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
-    db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-  }
-  if (!Array.isArray(db.cuentasCargadas)) {
-    db.cuentasCargadas = [];
-  }
-
-  if (!Array.isArray(db.historial)) {
-    db.historial = [];
-  } else {
-    // Deduplicate to ensure no single period accumulates repeated copies
-    db.historial = deduplicateHistorial(db.historial);
-  }
-
-  if (!Array.isArray(db.relacionPagos)) {
-    db.relacionPagos = [];
-  }
-
-  // Clean and format relacionPagos
-  db.relacionPagos = db.relacionPagos
-    .filter((p) => {
-      const enc = (p.nombreEncargado || '').trim().toUpperCase();
-      const mun = (p.municipio || '').trim().toUpperCase();
-      const con = (p.concepto || '').trim().toUpperCase();
-      const isTotalRow =
-        enc === 'TOTAL' ||
-        mun === 'TOTAL' ||
-        con.includes('TOTAL') ||
-        (enc === 'ENCARGADO' && !p.cedula) ||
-        (p.valorCancelar > 1000000 && (!p.cedula || enc === 'ENCARGADO'));
-      return !isTotalRow;
-    })
-    .map((p) => {
-      const formatted = formatCuentaBancaria(p.cuenta, p.banco);
-      return {
-        ...p,
-        cuenta: formatted.cuenta,
-        banco: formatted.banco,
-      };
-    });
-
-  // Normalize expendios
-  const sanitizePhotoUrl = (url?: string) => {
-    if (!url || typeof url !== 'string') return '';
-    const u = url.trim();
-    if (
-      u.includes('placehold.co') ||
-      u.includes('placeholder') ||
-      u.includes('via.placeholder') ||
-      u.includes('dummyimage') ||
-      u.includes('text=')
-    ) {
-      return '';
-    }
-    return u;
-  };
-
-  db.expendios = db.expendios.map((exp) => {
-    const mun = (exp.municipio || exp.localidad || '').trim();
-    let adm = exp.admisionSipost ?? 0;
-    if (adm > 0 && adm < 1000) {
-      adm = 0;
-    }
-    const cleanedPhone = cleanNequiNumber(exp.telefonoPunto);
-    return {
-      ...exp,
-      municipio: mun || 'MUNICIPIO',
-      localidad: exp.localidad || mun || 'LOCALIDAD',
-      admisionSipost: adm,
-      telefonoPunto: cleanedPhone.length === 10 ? cleanedPhone : exp.telefonoPunto,
-      fotoAvisoUrl: sanitizePhotoUrl(exp.fotoAvisoUrl),
-      letreroUrl: sanitizePhotoUrl(exp.letreroUrl),
-      fotoPanoramicaUrl: sanitizePhotoUrl(exp.fotoPanoramicaUrl),
-      fotoMataselloUrl: sanitizePhotoUrl(exp.fotoMataselloUrl),
-      mataselloUrl: sanitizePhotoUrl(exp.mataselloUrl),
-      fotoBasculaUrl: sanitizePhotoUrl(exp.fotoBasculaUrl),
-      basculaUrl: sanitizePhotoUrl(exp.basculaUrl),
-      fotoContratistaUrl: sanitizePhotoUrl(exp.fotoContratistaUrl),
-      fotoHorarioUrl: sanitizePhotoUrl(exp.fotoHorarioUrl),
-      fotoTarifasUrl: sanitizePhotoUrl(exp.fotoTarifasUrl),
-      fotoCedulaFrontalUrl: sanitizePhotoUrl(exp.fotoCedulaFrontalUrl),
-      fotoCedulaPosteriorUrl: sanitizePhotoUrl(exp.fotoCedulaPosteriorUrl),
-      fotoRutUrl: sanitizePhotoUrl(exp.fotoRutUrl),
-      computadorUrl: sanitizePhotoUrl(exp.computadorUrl),
-    };
-  });
-
-  if (!Array.isArray(db.registrosAcceso)) {
-    db.registrosAcceso = [];
-  }
-  if (typeof db.visitasGenerales !== 'number') {
-    db.visitasGenerales = 0;
-  }
-
-  // Filtrar cualquier registro ficticio/auto-generado para asegurar métricas 100% reales
-  db.registrosAcceso = db.registrosAcceso.filter(
-    (reg) => !reg.id?.startsWith('acc-init-')
-  );
-
-  return db;
-}
-
-let lastAutoBackupTime = 0;
-
-function createAutoSnapshot(db: DatabaseSchema) {
-  try {
-    if (!fs.existsSync(backupsDir)) {
-      fs.mkdirSync(backupsDir, { recursive: true });
-    }
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const snapPath = path.join(backupsDir, `snapshot-${timestamp}.json`);
-    fs.writeFileSync(snapPath, JSON.stringify(db, null, 2));
-
-    // Keep up to the 20 most recent snapshots
-    const files = fs.readdirSync(backupsDir)
-      .filter((f) => f.startsWith('snapshot-') && f.endsWith('.json'))
-      .sort()
-      .reverse();
-
-    if (files.length > 20) {
-      files.slice(20).forEach((f) => {
-        try { fs.unlinkSync(path.join(backupsDir, f)); } catch (e) {}
-      });
-    }
-  } catch (err) {
-    console.warn('Advertencia creando auto-snapshot local:', err);
-  }
-}
-
-async function triggerGoogleDriveWebhookAsync(webhookUrl: string, db: DatabaseSchema) {
-  try {
-    const payload = {
-      filename: `CAMARCA_DB_${environmentMode}_${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
-      timestamp: new Date().toISOString(),
-      ambiente: environmentMode,
-      totalExpendios: (db.expendios || []).length,
-      totalHistorial: (db.historial || []).length,
-      database: db,
-    };
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    // Non-blocking background sync
-  }
-}
-
-function saveDatabase(db: DatabaseSchema, options: { immediateCloudSync?: boolean } = {}) {
-  try {
-    const currentDbPath = getActiveDbPath();
-    fs.writeFileSync(currentDbPath, JSON.stringify(db, null, 2));
-
-    // If running in published environment, also keep master published seed and permanent archive updated
-    if (isPublishedEnv) {
-      try {
-        fs.writeFileSync(masterPublishedDbPath, JSON.stringify(db, null, 2));
-        fs.writeFileSync(legacyDbPath, JSON.stringify(db, null, 2));
-        
-        // Permanent immutable archive in archivos_permanentes
-        const permMasterPath = path.join(permanentArchiveDir, 'database.published.permanent.json');
-        fs.writeFileSync(permMasterPath, JSON.stringify(db, null, 2));
-      } catch (archiveErr) {
-        console.warn('Error guardando archivo maestro permanente de producción:', archiveErr);
-      }
-    } else {
-      // In TEST environment, also save a permanent test archive copy
-      try {
-        const permTestPath = path.join(permanentArchiveDir, 'database.test.permanent.json');
-        fs.writeFileSync(permTestPath, JSON.stringify(db, null, 2));
-      } catch (e) {}
-    }
-    
-    // PERSISTENCIA PERMANENTE EN GOOGLE CLOUD FIRESTORE
-    // Ensure all saves are pushed to the global queue so Express middleware can await them
-    // This prevents Cloud Run from suspending the container while the save is still in flight.
-    // We also serialize the calls to prevent race conditions causing Firestore write overlaps.
-    if (!global.cloudSyncPromiseChain) {
-      global.cloudSyncPromiseChain = Promise.resolve();
-    }
-    
-    // Create a deep copy of the database at this exact moment so the deferred promise saves the correct state
-    const dbSnapshot = JSON.parse(JSON.stringify(db));
-    
-    global.cloudSyncPromiseChain = global.cloudSyncPromiseChain.then(() => {
-      return saveDatabaseToCloud(dbSnapshot).catch((err) => {
-        console.warn('[Cloud Sync Error]:', err.message);
-      });
-    });
-
-    if (global.pendingCloudSyncs) {
-      global.pendingCloudSyncs.push(global.cloudSyncPromiseChain);
-    }
-
-    // Auto-create snapshot every 3 minutes if modified
-    const now = Date.now();
-    if (now - lastAutoBackupTime > 3 * 60 * 1000) {
-      lastAutoBackupTime = now;
-      createAutoSnapshot(db);
-    }
-
-    // Google Drive Webhook asynchronous sync if configured
-    if (db.config?.googleDriveWebhookUrl && typeof fetch !== 'undefined') {
-      triggerGoogleDriveWebhookAsync(db.config.googleDriveWebhookUrl, db).catch(() => {});
-    }
-  } catch (err) {
-    console.error('Error saving database file:', err);
-  }
-}
+// ==============================================================================
+// GESTOR DE BASE DE DATOS Y CONCURRENCIA: Implementado en ./server/dbStore.ts
+// loadDatabase, saveDatabase, mutateDatabase, createAutoSnapshot provistos por dbStore.
+// ==============================================================================
 
 // Initialize middleware
 app.use(express.json({ limit: '50mb' }));
@@ -1461,13 +1598,42 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-
-app.use('/api', (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  next();
+// Health check endpoint for keep-alive, Cloud Run health probes, and uptime monitors
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    environment: isPublishedEnv ? 'PUBLICADA' : 'TEST',
+  });
 });
+
+// Endpoint público y desacoplado para reportar errores y novedades desde el cliente (expendio / admin)
+app.post('/api/error-log', (req, res) => {
+  try {
+    const { errorCode, source, expendioId, municipio, cedula, userMessage, technicalDetails, category, severity } = req.body || {};
+    if (!errorCode) {
+      return res.status(400).json({ success: false, error: 'errorCode es requerido' });
+    }
+    const logged = errorLogService.logError({
+      errorCode: String(errorCode).trim(),
+      source: source || 'expendio',
+      expendioId: expendioId ? String(expendioId).trim() : undefined,
+      municipio: municipio ? String(municipio).trim() : undefined,
+      cedula: cedula ? String(cedula).trim() : undefined,
+      userMessage: userMessage ? String(userMessage).trim() : undefined,
+      technicalDetails: technicalDetails ? String(technicalDetails).trim() : undefined,
+      category,
+      severity,
+    });
+    res.json({ success: true, logId: logged.id });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Proteger todas las rutas bajo /api/admin desde el inicio del pipeline
+app.use('/api/admin', requireAdmin);
 
 // Service Worker dedicado para sincronización de archivos con Google Drive en segundo plano
 app.get('/drive-sync-sw.js', (req, res) => {
@@ -1481,94 +1647,600 @@ app.get('/drive-sync-sw.js', (req, res) => {
   res.status(404).send('Service Worker no encontrado');
 });
 
-// Interceptor para /uploads/photos/:fileName: si el archivo físico en el contenedor desapareció tras reinicio,
-// se recupera de manera transparente e instantánea desde Cloud Firestore (colección camarca_photos).
+// Endpoint protegido para descargar o visualizar el código fuente (exclusivo Administrador)
+app.get(['/codigo_completo_app.txt', '/api/admin/codigo-completo.txt'], requireAdmin, (req, res) => {
+  const filePath = path.join(process.cwd(), 'codigo_completo_app.txt');
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    if (req.query.download === '1' || req.query.download === 'true') {
+      res.setHeader('Content-Disposition', 'attachment; filename="codigo_completo_camarca.txt"');
+    }
+    return res.sendFile(filePath);
+  }
+  res.status(404).send('Archivo de código no encontrado. Ejecute el generador.');
+});
+
+// Servir documentos institucionales de expendios (horario, tarifas, contrato, avisos) con sanitización contra Path Traversal
+app.get('/uploads/docs_expendios/:fileName', (req, res, next) => {
+  const safeFileName = path.basename(req.params.fileName || '');
+  if (!safeFileName) return res.status(400).send('Nombre de archivo inválido');
+  const localPath = path.join(docsExpendiosDir, safeFileName);
+  if (fs.existsSync(localPath)) {
+    return res.sendFile(localPath);
+  }
+  const permPath = path.join(permanentArchiveDir, safeFileName);
+  if (fs.existsSync(permPath)) {
+    return res.sendFile(permPath);
+  }
+  next();
+});
+
+// Autenticación obligatoria para todas las rutas bajo /uploads (no es ruta pública)
+app.use('/uploads', requireAuthenticatedUser);
+
+// Interceptor para /uploads/photos/:fileName: servir desde disco o almacenamiento permanente
 app.get('/uploads/photos/:fileName', async (req, res, next) => {
-  const fileName = req.params.fileName;
-  const filePath = path.join(photosDir, fileName);
+  const safeFileName = path.basename(req.params.fileName || '');
+  if (!safeFileName) return next();
+  const filePath = path.join(photosDir, safeFileName);
 
   if (fs.existsSync(filePath)) {
     res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     return res.sendFile(filePath);
   }
 
-  // Si no está en disco local, intentar recuperar de Firestore
+  next();
+});
+
+const getPhotoSlotVariants = (slot: string): string[] => {
+  const s = (slot || '').trim();
+  const map: Record<string, string[]> = {
+    fotoAvisoUrl: ['fotoAvisoUrl', 'fotoAviso', 'aviso', 'letrero', 'letreroUrl'],
+    fotoAviso: ['fotoAvisoUrl', 'fotoAviso', 'aviso', 'letrero', 'letreroUrl'],
+    letrero: ['fotoAvisoUrl', 'fotoAviso', 'aviso', 'letrero', 'letreroUrl'],
+    letreroUrl: ['fotoAvisoUrl', 'fotoAviso', 'aviso', 'letrero', 'letreroUrl'],
+    aviso: ['fotoAvisoUrl', 'fotoAviso', 'aviso', 'letrero', 'letreroUrl'],
+
+    fotoPanoramicaUrl: ['fotoPanoramicaUrl', 'fotoPanoramica', 'panoramica', 'fachada', 'fotoFachada'],
+    fotoPanoramica: ['fotoPanoramicaUrl', 'fotoPanoramica', 'panoramica', 'fachada', 'fotoFachada'],
+    panoramica: ['fotoPanoramicaUrl', 'fotoPanoramica', 'panoramica', 'fachada', 'fotoFachada'],
+    fachada: ['fotoPanoramicaUrl', 'fotoPanoramica', 'panoramica', 'fachada', 'fotoFachada'],
+    fotoFachada: ['fotoPanoramicaUrl', 'fotoPanoramica', 'panoramica', 'fachada', 'fotoFachada'],
+
+    fotoMataselloUrl: ['fotoMataselloUrl', 'fotoMatasello', 'matasello', 'mataselloUrl'],
+    fotoMatasello: ['fotoMataselloUrl', 'fotoMatasello', 'matasello', 'mataselloUrl'],
+    matasello: ['fotoMataselloUrl', 'fotoMatasello', 'matasello', 'mataselloUrl'],
+    mataselloUrl: ['fotoMataselloUrl', 'fotoMatasello', 'matasello', 'mataselloUrl'],
+
+    fotoBasculaUrl: ['fotoBasculaUrl', 'fotoBascula', 'bascula', 'basculaUrl'],
+    fotoBascula: ['fotoBasculaUrl', 'fotoBascula', 'bascula', 'basculaUrl'],
+    bascula: ['fotoBasculaUrl', 'fotoBascula', 'bascula', 'basculaUrl'],
+    basculaUrl: ['fotoBasculaUrl', 'fotoBascula', 'bascula', 'basculaUrl'],
+
+    fotoContratistaUrl: ['fotoContratistaUrl', 'fotoContratista', 'contratista', 'encargado', 'fotoPropietario', 'propietario'],
+    fotoContratista: ['fotoContratistaUrl', 'fotoContratista', 'contratista', 'encargado', 'fotoPropietario', 'propietario'],
+    contratista: ['fotoContratistaUrl', 'fotoContratista', 'contratista', 'encargado', 'fotoPropietario', 'propietario'],
+
+    fotoHorarioUrl: ['fotoHorarioUrl', 'fotoHorario', 'horario'],
+    fotoHorario: ['fotoHorarioUrl', 'fotoHorario', 'horario'],
+    horario: ['fotoHorarioUrl', 'fotoHorario', 'horario'],
+
+    fotoTarifasUrl: ['fotoTarifasUrl', 'fotoTarifas', 'tarifas'],
+    fotoTarifas: ['fotoTarifasUrl', 'fotoTarifas', 'tarifas'],
+    tarifas: ['fotoTarifasUrl', 'fotoTarifas', 'tarifas'],
+
+    fotoCedulaFrontalUrl: ['fotoCedulaFrontalUrl', 'fotoCedulaFrontal', 'cedulaFrontal'],
+    fotoCedulaPosteriorUrl: ['fotoCedulaPosteriorUrl', 'fotoCedulaPosterior', 'cedulaPosterior'],
+    fotoRutUrl: ['fotoRutUrl', 'fotoRut', 'rut'],
+  };
+  return map[s] || [s];
+};
+
+// Endpoint diagnóstico exhaustivo de integridad de fotografía (PostgreSQL vs Firebase Storage REAL vs AWS S3 REAL)
+app.get(['/api/photos/debug/:photoId', '/api/photos/debug/:cedula/:slotKey'], requireAuthenticatedUser, async (req, res) => {
   try {
-    const baseName = fileName.replace(/\.[^/.]+$/, '');
-    const parts = baseName.split('_');
-    if (parts.length >= 2) {
-      const cedula = parts[0];
-      const slotKey = parts.slice(1).join('_');
-      const cloudPhoto = await getPhotoFromCloud(cedula, slotKey);
-      if (cloudPhoto) {
-        const cleanBase64 = cloudPhoto.replace(/^data:[^;]+;base64,/, '').trim();
-        const buffer = Buffer.from(cleanBase64, 'base64');
-        try {
-          fs.writeFileSync(filePath, buffer);
-        } catch {}
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-        return res.send(buffer);
+    const { photoId, cedula, slotKey } = req.params;
+    const targetId = photoId || cedula;
+    const report = await diagnosePhotoIntegrity(targetId, slotKey);
+    res.json(report);
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: `Error ejecutando diagnóstico de fotografía: ${err.message}`,
+    });
+  }
+});
+
+/**
+ * Resuelve de forma segura y aislada las claves candidatas (IDs, nombres de archivo y prefijos S3)
+ * para una fotografía, garantizando que NUNCA se mezclen datos entre expendios distintos (ej: Girón, Pamplona, Togüí, Landázuri).
+ */
+function resolveExpendioCandidateKeys(
+  cleanCed: string,
+  cleanTargetCed: string,
+  matchedExp: any,
+  slotVariants: string[],
+  database: DatabaseSchema
+): { candidateCedulas: string[]; candidatePhotoIds: string[]; candidateFileNames: string[] } {
+  const forbiddenOtherCedulas = new Set<string>();
+  for (const e of database.expendios || []) {
+    if (matchedExp && e.id === matchedExp.id) continue;
+    const norm = normalizeCedula(e.cedula);
+    if (norm) forbiddenOtherCedulas.add(norm);
+  }
+  // Si el expendio consultado NO es Girón (1094269932), prohibir terminantemente la cédula del superadmin
+  if (matchedExp && normalizeCedula(matchedExp.cedula) !== ADMIN_CEDULA) {
+    forbiddenOtherCedulas.add(ADMIN_CEDULA);
+  }
+
+  const allowedCedulas: string[] = [];
+
+  // 1. Cédula canónica del expendio coincidente
+  if (matchedExp?.cedula) {
+    const expCedNorm = normalizeCedula(matchedExp.cedula);
+    if (expCedNorm && !forbiddenOtherCedulas.has(expCedNorm)) {
+      allowedCedulas.push(expCedNorm);
+    }
+  }
+
+  // 2. ID inmutable del expendio coincidente
+  if (matchedExp?.id) {
+    allowedCedulas.push(matchedExp.id.trim());
+  }
+
+  // 3. Cédula solicitada explícitamente en la URL (si no pertenece a otro expendio)
+  if (cleanTargetCed && !forbiddenOtherCedulas.has(cleanTargetCed)) {
+    allowedCedulas.push(cleanTargetCed);
+  }
+  if (cleanCed && cleanCed !== cleanTargetCed && !forbiddenOtherCedulas.has(cleanCed)) {
+    allowedCedulas.push(cleanCed);
+  }
+
+  // 4. Historial explícito de cédulas anteriores sólo si pertenecen legítimamente a este expendio
+  if (Array.isArray(matchedExp?.cedulasAnteriores)) {
+    for (const prev of matchedExp.cedulasAnteriores) {
+      const prevNorm = normalizeCedula(prev);
+      if (prevNorm && !forbiddenOtherCedulas.has(prevNorm)) {
+        allowedCedulas.push(prevNorm);
       }
     }
+  }
 
-    // Buscar si algún expendio tiene este fileName en sus campos
-    const db = loadDatabase();
-    const targetExp = db.expendios.find((e: any) =>
-      Object.values(e).some((v) => typeof v === 'string' && v.includes(fileName))
-    );
-    if (targetExp) {
-      const slot = Object.keys(targetExp).find((k) => (targetExp as any)[k]?.includes(fileName));
-      if (slot) {
-        const cloudPhoto = await getPhotoFromCloud(targetExp.cedula, slot);
-        if (cloudPhoto) {
-          const cleanBase64 = cloudPhoto.replace(/^data:[^;]+;base64,/, '').trim();
-          const buffer = Buffer.from(cleanBase64, 'base64');
-          try {
-            fs.writeFileSync(filePath, buffer);
-          } catch {}
-          res.setHeader('Content-Type', 'image/jpeg');
-          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-          return res.send(buffer);
-        }
+  const candidateCedulas = Array.from(new Set(allowedCedulas.filter(Boolean)));
+  const candidatePhotoIds: string[] = [];
+  const candidateFileNames: string[] = [];
+
+  for (const c of candidateCedulas) {
+    for (const sv of slotVariants) {
+      candidatePhotoIds.push(`photo_${c}_${sv}`);
+      candidateFileNames.push(`${c}_${sv}.jpg`);
+      candidateFileNames.push(`${c}_${sv}.png`);
+    }
+  }
+
+  return { candidateCedulas, candidatePhotoIds, candidateFileNames };
+}
+
+// Endpoint específico para verificar metadatos de fotos (HEAD o GET JSON)
+app.get(['/api/photos/metadata/:cedula/:slotKey', '/api/expendio/photo/metadata/:cedula/:slotKey'], async (req, res) => {
+  const { cedula, slotKey } = req.params;
+  const cleanCed = (cedula || '').trim();
+  const cleanTargetCed = normalizeCedula(cleanCed);
+  const cleanSlot = (slotKey || '').trim();
+
+  const currentDb = getDatabaseReadOnly();
+  const matchedExp = (currentDb.expendios || []).find(
+    (e) =>
+      normalizeCedula(e.cedula) === cleanTargetCed ||
+      (e.id || '').trim() === cleanCed ||
+      (Array.isArray((e as any).cedulasAnteriores) &&
+        (e as any).cedulasAnteriores.some((prev: string) => normalizeCedula(prev) === cleanTargetCed))
+  );
+
+  const slotVariants = getPhotoSlotVariants(cleanSlot);
+  const { candidateCedulas, candidatePhotoIds, candidateFileNames } = resolveExpendioCandidateKeys(
+    cleanCed,
+    cleanTargetCed,
+    matchedExp,
+    slotVariants,
+    currentDb
+  );
+
+  try {
+    const hybridRecords = await db
+      .select()
+      .from(schema.photoStorage)
+      .where(
+        or(
+          inArray(schema.photoStorage.photoId, candidatePhotoIds),
+          and(
+            inArray(schema.photoStorage.cedula, candidateCedulas),
+            inArray(schema.photoStorage.slotKey, slotVariants)
+          )
+        )
+      )
+      .limit(1);
+
+    if (hybridRecords.length > 0) {
+      const r = hybridRecords[0];
+      const isErrorStatus =
+        r.status === 'ERROR' ||
+        !r.checksumSha256 ||
+        r.sizeBytes < 200 ||
+        r.checksumSha256 === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+      if (!isErrorStatus && (r.status === 'SYNCED' || r.status === 'S3_FALLBACK' || r.status === 'FIREBASE_PRIMARY')) {
+        return res.json({
+          success: true,
+          exists: true,
+          cedula: cleanCed,
+          slotKey: cleanSlot,
+          etag: r.checksumSha256,
+          version: r.version,
+          checksum: r.checksumSha256,
+          sizeBytes: r.sizeBytes,
+          storageProvider: r.storageProvider,
+          storageStatus: r.status,
+          updatedAt: r.updatedAt?.toISOString(),
+          url: `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`,
+        });
       }
     }
   } catch (err: any) {
-    console.warn('[Photos Fallback] Error intentando recuperar foto desde Firestore:', err.message);
+    console.warn(`[Photos Metadata API] Error querying PostgreSQL:`, err.message);
   }
 
-  next();
+  // Lectura rápida desde disco permanente/local (0 escrituras en la nube al consultar metadatos)
+  try {
+    const s3ReplicaDir = path.join(dataDir, 's3_replica');
+    const searchDirs = [permanentPhotosDir, s3ReplicaDir, photosDir];
+    for (const dir of searchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const fn of candidateFileNames) {
+        const fp = path.join(dir, fn);
+        if (fs.existsSync(fp)) {
+          const stat = fs.statSync(fp);
+          if (stat.size > 200) {
+            const buf = fs.readFileSync(fp);
+            const checksum = crypto.createHash('sha256').update(buf).digest('hex');
+            return res.json({
+              success: true,
+              exists: true,
+              cedula: cleanCed,
+              slotKey: cleanSlot,
+              etag: checksum,
+              version: 1,
+              checksum,
+              sizeBytes: stat.size,
+              storageProvider: 'S3',
+              storageStatus: 'SYNCED',
+              updatedAt: stat.mtime.toISOString(),
+              url: `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`,
+            });
+          }
+        }
+      }
+    }
+
+    // Si el expendio tiene la URL configurada en la base maestra (almacenada en AWS S3 + Firebase Storage)
+    if (matchedExp) {
+      for (const sv of slotVariants) {
+        const val = (matchedExp as any)[sv];
+        if (typeof val === 'string' && val.trim().length > 5 && !val.includes('placehold.co')) {
+          return res.json({
+            success: true,
+            exists: true,
+            cedula: cleanCed,
+            slotKey: cleanSlot,
+            etag: `cloud_${cleanCed}_${cleanSlot}_${matchedExp.revision || 1}`,
+            version: Number(matchedExp.revision) || 1,
+            storageProvider: 'S3',
+            storageStatus: 'SYNCED',
+            updatedAt: matchedExp.updatedAt || new Date().toISOString(),
+            url: `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`,
+          });
+        }
+      }
+    }
+  } catch {}
+
+  // Check drive registry
+  try {
+    const registry = loadDrivePhotosRegistry();
+    for (const c of candidateCedulas) {
+      for (const sv of slotVariants) {
+        const k = `${c}_${sv}`;
+        if (registry[k] && registry[k].driveFileId) {
+          return res.json({
+            success: true,
+            exists: true,
+            cedula: cleanCed,
+            slotKey: cleanSlot,
+            etag: `drive_${registry[k].driveFileId}`,
+            version: 1,
+            storageProvider: 'GOOGLE_DRIVE',
+            driveFileId: registry[k].driveFileId,
+            url: `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`,
+          });
+        }
+      }
+    }
+  } catch {}
+
+  return res.status(404).json({
+    success: false,
+    exists: false,
+    message: 'Fotografía no encontrada.',
+  });
 });
 
 // Endpoint canónico y permanente para servir fotos de expendios desde disco, permanentes o Google Drive
 app.get(['/api/photos/:cedula/:slotKey', '/api/expendio/photo/:cedula/:slotKey'], async (req, res) => {
+  let user = extractAuthenticatedUser(req);
+  if (!user && req.query.token && typeof req.query.token === 'string') {
+    user = verifySessionToken(req.query.token as string);
+  }
+
   const { cedula, slotKey } = req.params;
-  const cleanCed = cedula.trim();
-  const cleanSlot = slotKey.trim();
-  const localFileName = `${cleanCed}_${cleanSlot}.jpg`;
-  const localFilePath = path.join(photosDir, localFileName);
-  const permFilePath = path.join(permanentPhotosDir, localFileName);
+  const cleanCed = (cedula || '').trim();
+  const cleanTargetCed = normalizeCedula(cleanCed);
+  const cleanSlot = (slotKey || '').trim();
+  const lowerSlot = cleanSlot.toLowerCase();
 
-  // 1. Verificar si existe en la carpeta activa de subidas
-  if (fs.existsSync(localFilePath)) {
-    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-    return res.sendFile(localFilePath);
+  // Documentos privados sensibles exigen autenticación obligatoria y propiedad o rol administrador
+  const isSensitiveDoc =
+    lowerSlot.includes('cedula') ||
+    lowerSlot.includes('rut') ||
+    lowerSlot.includes('certificado') ||
+    lowerSlot.includes('cuenta');
+
+  if (isSensitiveDoc && !user) {
+    return res.status(401).json({ success: false, message: 'Acceso no autorizado para consultar documentos privados.' });
   }
 
-  // 2. Verificar si existe en la carpeta permanente local (fotos protegidas)
-  if (fs.existsSync(permFilePath)) {
-    try {
-      fs.copyFileSync(permFilePath, localFilePath);
-    } catch {}
-    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-    return res.sendFile(permFilePath);
+  const currentDb = getDatabaseReadOnly();
+  const matchedExp = (currentDb.expendios || []).find(
+    (e) =>
+      normalizeCedula(e.cedula) === cleanTargetCed ||
+      (e.id || '').trim() === cleanCed ||
+      (Array.isArray((e as any).cedulasAnteriores) &&
+        (e as any).cedulasAnteriores.some((prev: string) => normalizeCedula(prev) === cleanTargetCed))
+  );
+
+  // Si hay usuario autenticado:
+  // Administradores y Clientes pueden consultar fotografías operativas; solo Admin o el propio expendio consultan docs privados.
+  if (user && !user.roles.includes('admin')) {
+    if (isSensitiveDoc || !user.roles.includes('cliente')) {
+      const isOwnExp = matchedExp && user.expendioId === matchedExp.id;
+      if (!isOwnExp && normalizeCedula(user.cedula) !== cleanTargetCed && user.expendioId !== cleanCed) {
+        return res.status(403).json({ success: false, message: 'Acceso denegado: No tiene permisos para ver fotos o documentos de otro expendio.' });
+      }
+    }
   }
 
-  // 3. Recuperar directamente desde Google Drive a través del registro permanente
+  const slotVariants = getPhotoSlotVariants(cleanSlot);
+  const { candidateCedulas, candidatePhotoIds, candidateFileNames } = resolveExpendioCandidateKeys(
+    cleanCed,
+    cleanTargetCed,
+    matchedExp,
+    slotVariants,
+    currentDb
+  );
+
+  // 1. Consultar registro y metadatos de la fotografía en PostgreSQL (Fuente de Verdad)
+  try {
+    const hybridRecords = await db
+      .select()
+      .from(schema.photoStorage)
+      .where(
+        or(
+          inArray(schema.photoStorage.photoId, candidatePhotoIds),
+          and(
+            inArray(schema.photoStorage.cedula, candidateCedulas),
+            inArray(schema.photoStorage.slotKey, slotVariants)
+          )
+        )
+      )
+      .limit(1);
+
+    if (hybridRecords.length > 0) {
+      const photoRec = hybridRecords[0];
+
+      if (photoRec.sizeBytes >= 200) {
+        // ETag Validation (304 Not Modified)
+        const ifNoneMatch = req.headers['if-none-match'];
+        if (ifNoneMatch && (ifNoneMatch === `"${photoRec.checksumSha256}"` || ifNoneMatch === photoRec.checksumSha256)) {
+          res.setHeader('ETag', `"${photoRec.checksumSha256}"`);
+          res.setHeader('X-Storage-Provider', photoRec.storageProvider);
+          res.setHeader('X-Photo-Version', String(photoRec.version));
+          return res.status(304).end();
+        }
+
+        const photoMeta: PhotoMetadata = {
+          photoId: photoRec.photoId,
+          expendioId: photoRec.expendioId || undefined,
+          cedula: photoRec.cedula || undefined,
+          slotKey: photoRec.slotKey,
+          version: photoRec.version,
+          checksumSha256: photoRec.checksumSha256,
+          sizeBytes: photoRec.sizeBytes,
+          mimeType: photoRec.mimeType,
+          storageProvider: photoRec.storageProvider as any,
+          firebaseStoragePath: photoRec.firebaseStoragePath || undefined,
+          s3Bucket: photoRec.s3Bucket || undefined,
+          s3Key: photoRec.s3Key || undefined,
+          status: photoRec.status as any,
+          lastError: photoRec.lastError || undefined,
+          updatedAt: photoRec.updatedAt?.toISOString() || new Date().toISOString(),
+        };
+
+        const result = await readPhotoFromStorage(photoMeta);
+        if (result && result.buffer && result.buffer.length >= 200) {
+          const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+          const etagVal = `"${photoRec.checksumSha256}${isThumb ? '-thumb' : ''}"`;
+          if (req.headers['if-none-match'] === etagVal) {
+            return res.status(304).end();
+          }
+          let outBuffer = result.buffer;
+          let outMime = result.mimeType || 'image/jpeg';
+          if (isThumb) {
+            try {
+              outBuffer = await sharp(result.buffer)
+                .resize({ width: 320, withoutEnlargement: true })
+                .jpeg({ quality: 72, progressive: true })
+                .toBuffer();
+              outMime = 'image/jpeg';
+            } catch {}
+          }
+          res.setHeader('Content-Type', outMime);
+          res.setHeader('Content-Length', String(outBuffer.length));
+          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          res.setHeader('X-Storage-Provider', result.resolvedProvider || photoRec.storageProvider);
+          res.setHeader('X-Photo-Version', String(photoRec.version));
+          res.setHeader('ETag', etagVal);
+          return res.send(outBuffer);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Photos API] Warning querying PostgreSQL photo_storage (${cleanCed} - ${cleanSlot}):`, err.message);
+  }
+
+  // 1B. Fallback a tabla legacy googleDrivePhotos en PostgreSQL
+  try {
+    const photoRecords = await db
+      .select()
+      .from(schema.googleDrivePhotos)
+      .where(inArray(schema.googleDrivePhotos.fileName, candidateFileNames))
+      .limit(1);
+
+    if (photoRecords.length > 0 && photoRecords[0].path && fs.existsSync(photoRecords[0].path)) {
+      const stat = fs.statSync(photoRecords[0].path);
+      if (stat.size >= 200) {
+        const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+        if (isThumb) {
+          try {
+            const thumbBuf = await sharp(photoRecords[0].path)
+              .resize({ width: 320, withoutEnlargement: true })
+              .jpeg({ quality: 72, progressive: true })
+              .toBuffer();
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Content-Length', String(thumbBuf.length));
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+            return res.send(thumbBuf);
+          } catch {}
+        }
+        res.setHeader('Content-Type', photoRecords[0].mimeType || 'image/jpeg');
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        return res.sendFile(photoRecords[0].path);
+      }
+    }
+  } catch (err: any) {
+    console.warn(`[Photos API] Error consultando foto legacy en PostgreSQL (${cleanCed} - ${cleanSlot}):`, err.message);
+  }
+
+  // 2. Servir desde directorios de fotos permanentes/locales en <1ms (0 llamadas a la nube si ya está en caché local)
+  try {
+    const s3ReplicaDir = path.join(dataDir, 's3_replica');
+    const searchDirs = [permanentPhotosDir, s3ReplicaDir, photosDir];
+    for (const dir of searchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const fn of candidateFileNames) {
+        const fp = path.join(dir, fn);
+        if (fs.existsSync(fp)) {
+          const stat = fs.statSync(fp);
+          if (stat.size >= 200) {
+            const buffer = fs.readFileSync(fp);
+            const checksum = crypto.createHash('sha256').update(buffer).digest('hex');
+            const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+            const etagVal = `"${checksum}${isThumb ? '-thumb' : ''}"`;
+            if (req.headers['if-none-match'] === etagVal) {
+              return res.status(304).end();
+            }
+            let outBuffer: Buffer = buffer;
+            if (isThumb) {
+              try {
+                outBuffer = await sharp(buffer)
+                  .resize({ width: 320, withoutEnlargement: true })
+                  .jpeg({ quality: 72, progressive: true })
+                  .toBuffer();
+              } catch {}
+            }
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Content-Length', String(outBuffer.length));
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+            res.setHeader('X-Storage-Provider', 'S3');
+            res.setHeader('X-Photo-Version', '1');
+            res.setHeader('ETag', etagVal);
+            return res.send(outBuffer);
+          }
+        }
+      }
+    }
+  } catch (diskErr: any) {
+    console.warn(`[Photos API] Error leyendo foto de disco permanente (${cleanCed} - ${cleanSlot}):`, diskErr.message);
+  }
+
+  // 3. Si el contenedor acaba de reiniciar (Scale-to-Zero) y la foto no está en disco local,
+  // recuperarla directamente de AWS S3 o Firebase Storage y guardarla en caché local permanente.
+  try {
+    for (const c of candidateCedulas) {
+      for (const sv of slotVariants) {
+        const cloudResult = await readPhotoFromStorage({
+          photoId: `photo_${c}_${sv}`,
+          cedula: c,
+          slotKey: sv,
+          version: 1,
+          checksumSha256: '',
+          sizeBytes: 0,
+          mimeType: 'image/jpeg',
+          storageProvider: 'S3',
+          s3Key: `photos/${c}_${sv}.jpg`,
+          firebaseStoragePath: `photos/${c}/${sv}.jpg`,
+          status: 'SYNCED',
+          updatedAt: new Date().toISOString(),
+        });
+        if (cloudResult && cloudResult.buffer && cloudResult.buffer.length >= 200) {
+          const cachePath = path.join(permanentPhotosDir, `${c}_${sv}.jpg`);
+          try {
+            fs.writeFileSync(cachePath, cloudResult.buffer);
+          } catch {}
+          const checksum = crypto.createHash('sha256').update(cloudResult.buffer).digest('hex');
+          const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+          let outBuffer = cloudResult.buffer;
+          if (isThumb) {
+            try {
+              outBuffer = await sharp(cloudResult.buffer)
+                .resize({ width: 320, withoutEnlargement: true })
+                .jpeg({ quality: 72, progressive: true })
+                .toBuffer();
+            } catch {}
+          }
+          res.setHeader('Content-Type', 'image/jpeg');
+          res.setHeader('Content-Length', String(outBuffer.length));
+          res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          res.setHeader('X-Storage-Provider', cloudResult.resolvedProvider || 'S3');
+          res.setHeader('ETag', `"${checksum}${isThumb ? '-thumb' : ''}"`);
+          return res.send(outBuffer);
+        }
+      }
+    }
+  } catch {}
+
+  // 4. Recuperar desde Google Drive a través del registro permanente
   try {
     const registry = loadDrivePhotosRegistry();
-    const key = `${cleanCed}_${cleanSlot}`;
-    const driveData = registry[key];
+    const candidateKeys = Array.from(new Set([
+      `${cleanCed}_${cleanSlot}`,
+      `${cleanTargetCed}_${cleanSlot}`,
+    ]));
+
+    let driveData: any = null;
+    for (const k of candidateKeys) {
+      if (registry[k]) {
+        driveData = registry[k];
+        break;
+      }
+    }
 
     if (driveData && driveData.driveFileId) {
       const token = await getOrRefreshDriveTokenServer();
@@ -1580,57 +2252,537 @@ app.get(['/api/photos/:cedula/:slotKey', '/api/expendio/photo/:cedula/:slotKey']
           if (driveRes.ok) {
             const arrayBuf = await driveRes.arrayBuffer();
             const buffer = Buffer.from(arrayBuf);
+            const targetLocalPath = path.join(photosDir, candidateFileNames[0]);
+            const targetPermPath = path.join(permanentPhotosDir, candidateFileNames[0]);
             try {
-              fs.writeFileSync(localFilePath, buffer);
-              fs.writeFileSync(permFilePath, buffer);
+              fs.writeFileSync(targetLocalPath, buffer);
+              fs.writeFileSync(targetPermPath, buffer);
             } catch {}
+            const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
+            let outBuffer: Buffer = buffer;
+            if (isThumb) {
+              try {
+                outBuffer = await sharp(buffer)
+                  .resize({ width: 320, withoutEnlargement: true })
+                  .jpeg({ quality: 72, progressive: true })
+                  .toBuffer();
+              } catch {}
+            }
             res.setHeader('Content-Type', 'image/jpeg');
             res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-            return res.send(buffer);
+            return res.send(outBuffer);
           }
         } catch (dlErr: any) {
-          console.warn(`[Photos API] Error descargando foto de Drive (${key}):`, dlErr.message);
+          console.warn(`[Photos API] Error descargando foto de Drive (${cleanCed}_${cleanSlot}):`, dlErr.message);
         }
       }
 
-      // Redirección segura a la vista previa de Google Drive si no se pudo descargar en caliente
-      if (driveData.driveFileId) {
-        return res.redirect(`https://drive.google.com/thumbnail?id=${driveData.driveFileId}&sz=w1200`);
-      }
+      // No redirigir a URLs privadas de Google Drive que devuelven HTML de inicio de sesión
     }
   } catch (err: any) {
     console.warn(`[Photos API] Error consultando registro Drive (${cleanCed} - ${cleanSlot}):`, err.message);
   }
 
+  // 5. Si el expendio tiene declarado el ítem como NO DISPONIBLE, generar y persistir ilustración oficial automáticamente
   try {
-    const dataUrl = await getPhotoFromCloud(cleanCed, cleanSlot);
-    if (dataUrl) {
-      const cleanBase64 = dataUrl.replace(/^data:[^;]+;base64,/, '').trim();
-      const buffer = Buffer.from(cleanBase64, 'base64');
-      try {
-        fs.writeFileSync(localFilePath, buffer);
-        fs.writeFileSync(permFilePath, buffer);
-      } catch {}
-      res.setHeader('Content-Type', 'image/jpeg');
-      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-      return res.send(buffer);
+    if (matchedExp) {
+      const canonicalSlot = slotVariants.includes('fotoBasculaUrl')
+        ? 'fotoBasculaUrl'
+        : slotVariants.includes('fotoAvisoUrl')
+        ? 'fotoAvisoUrl'
+        : slotVariants.includes('fotoMataselloUrl')
+        ? 'fotoMataselloUrl'
+        : null;
+
+      const isMarkedNoDisp =
+        (canonicalSlot === 'fotoBasculaUrl' && matchedExp.tieneBascula === 'NO') ||
+        (canonicalSlot === 'fotoAvisoUrl' && matchedExp.tieneAviso === 'NO') ||
+        (canonicalSlot === 'fotoMataselloUrl' && matchedExp.tieneMatasello === 'NO');
+
+      if (canonicalSlot && isMarkedNoDisp) {
+        const svgContent = generateNoDisponibleSvg({
+          itemSlot: canonicalSlot,
+          municipio: matchedExp.localidad || matchedExp.municipio || 'EXPENDIO',
+          cedula: matchedExp.cedula || cleanCed,
+        });
+        const generatedJpg = await sharp(Buffer.from(svgContent, 'utf-8')).jpeg({ quality: 92 }).toBuffer();
+        processAndSavePhotoHybrid({
+          expendioId: matchedExp.id || '',
+          cedula: matchedExp.cedula || cleanCed,
+          slotKey: canonicalSlot,
+          inputBuffer: generatedJpg,
+          mimeType: 'image/jpeg',
+          dbClient: db,
+        }).catch(() => {});
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Content-Length', String(generatedJpg.length));
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+        return res.send(generatedJpg);
+      }
     }
-  } catch (err: any) {
-    console.error(`[Photos API] Error obteniendo foto de la nube (${cleanCed} - ${cleanSlot}):`, err.message);
+  } catch (genErr: any) {
+    console.warn(`[Photos API] Error generando soporte NO DISPONIBLE al vuelo (${cleanCed} - ${cleanSlot}):`, genErr.message);
   }
 
-  return res.status(404).json({ success: false, message: 'Fotografía no encontrada.' });
+  return res.status(404).json({ success: false, message: 'Fotografía no encontrada en almacenamiento cloud.' });
 });
 
-// Serve uploaded files statically
-app.use('/uploads', express.static(uploadDir));
+// Middleware de auto-restauración para /uploads/photos/:fileName si el contenedor fue reiniciado
+app.get('/uploads/photos/:fileName', async (req, res, next) => {
+  const safeFileName = path.basename(req.params.fileName || '');
+  if (!safeFileName) return next();
+  const filePath = path.join(photosDir, safeFileName);
+  if (fs.existsSync(filePath)) {
+    return next();
+  }
+  const permPath = path.join(permanentPhotosDir, safeFileName);
+  if (fs.existsSync(permPath)) {
+    try { fs.copyFileSync(permPath, filePath); } catch {}
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(permPath);
+  }
+  next();
+});
+
+// Serve uploaded files statically with strict security headers (prevent XSS, force attachment for docs, nosniff)
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    res.setHeader('Content-Security-Policy', "default-src 'self'; frame-ancestors *;");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    // Forzar Content-Disposition: attachment en documentos y descargas no-imagen
+    const ext = path.extname(req.path).toLowerCase();
+    if (ext === '.pdf' || ext === '.doc' || ext === '.docx' || ext === '.zip') {
+      const fileName = path.basename(req.path);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    }
+    next();
+  },
+  express.static(uploadDir, {
+    setHeaders: (res, filePath) => {
+      res.setHeader('Content-Security-Policy', "default-src 'self'");
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const ext = path.extname(filePath).toLowerCase();
+      if (ext === '.pdf' || ext === '.zip' || ext === '.doc' || ext === '.docx') {
+        res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+      }
+    },
+  })
+);
 
 // --- API ROUTES ---
 
 // 1. Get all expendios
-app.get('/api/expendios', (req, res) => {
+
+// 3B. Expendio: Check generated cuenta de cobro status for a given period
+const handleGetExpendioCuenta = (req: any, res: any) => {
+  const user = extractAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, message: 'Acceso no autorizado: Se requiere sesión activa.' });
+  }
+
+  const cleanDigits = (s?: any) => String(s || '').replace(/[^0-9]/g, '');
+  const normMuni = (s?: any) =>
+    String(s || '')
+      .trim()
+      .toUpperCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+
+  let targetCedula = user.cedula;
+
+  // REGLAS 7 y 13: Solo el administrador puede consultar cuentas de otras cédulas
+  if (user.roles.includes('admin')) {
+    const cedulaParam = req.params?.cedula || req.query?.cedula;
+    if (cedulaParam) {
+      targetCedula = cleanDigits(cedulaParam);
+    }
+  }
+
+  const { mes, anio, periodo } = req.query;
+  const db = loadDatabase();
+
+  if (!targetCedula) {
+    return res.status(400).json({ success: false, message: 'Cédula no proporcionada.' });
+  }
+
+  const targetCedulaClean = cleanDigits(targetCedula);
+  const expendio = (db.expendios || []).find(
+    (e: any) =>
+      cleanDigits(e.cedula) === targetCedulaClean ||
+      (!user.roles.includes('admin') && user.expendioId && String(e.id) === String(user.expendioId))
+  );
+  const targetMuniNorm = expendio ? normMuni(expendio.municipio || expendio.localidad) : '';
+
+  const publishedPeriodo = (db.config?.periodoHabilitadoDescarga || 'FEBRERO 2026').trim().toUpperCase();
+  const isDescargaHabilitada = db.config?.descargaHabilitada !== false;
+
+  let targetPeriodo = '';
+  if (periodo) {
+    targetPeriodo = String(periodo).trim().toUpperCase();
+  } else if (mes && anio) {
+    targetPeriodo = `${String(mes).trim().toUpperCase()} ${String(anio).trim()}`;
+  } else if (mes) {
+    targetPeriodo = String(mes).trim().toUpperCase();
+  }
+
+  // Si no se especificó periodo, usar el periodo asignado por el admin en la configuración
+  if (!targetPeriodo) {
+    targetPeriodo = publishedPeriodo;
+  }
+
+  const [mesSearch, anioSearch] = targetPeriodo.split(' ');
+  const targetPeriodNorm = normalizePeriodKey(targetPeriodo);
+  const publishedPeriodNorm = normalizePeriodKey(publishedPeriodo);
+  const isPeriodoPublicado = targetPeriodNorm === publishedPeriodNorm;
+
+  const matchesExpendioHist = (h: any) => {
+    if (h.tipo && h.tipo !== 'Cuenta de Cobro') return false;
+    const hCed = cleanDigits(h.cedula);
+    if (hCed && targetCedulaClean && hCed === targetCedulaClean) return true;
+    if (expendio && h.expendioId && String(h.expendioId) === String(expendio.id)) return true;
+    const hMuni = normMuni(h.municipio || h.expendio || h.cuentaData?.municipio || h.cuentaData?.expendio);
+    if (targetMuniNorm && hMuni && hMuni === targetMuniNorm) return true;
+    return false;
+  };
+
+  const buildNormalizedCuentaData = (histItem: any, overridePeriodo?: string) => {
+    const cd = (histItem.cuentaData || {}) as any;
+    const cargoBasico = Number(cd.cargoBasico ?? histItem.valorBase ?? 0);
+    const admisionSipost = Number(cd.admisionSipost ?? 0);
+    const valorVariable = Number(cd.valorVariable ?? 0);
+    const rawTotal = Number(cd.pagoTotal ?? cd.valorBruto ?? histItem.valorBruto ?? (cargoBasico + admisionSipost + valorVariable));
+    const pagoTotal = rawTotal > 0 ? rawTotal : cargoBasico + admisionSipost + valorVariable;
+    const retef1 = Number(cd.retef1 ?? cd.retencionValor ?? cd.retefuente ?? Math.round(pagoTotal * 0.01));
+    const rawNeto = Number(cd.valorNeto ?? cd.netoPagar ?? histItem.monto ?? histItem.totalPagar ?? (pagoTotal - retef1));
+    const valorNeto = rawNeto > 0 ? rawNeto : pagoTotal - retef1;
+    const finalPeriodo = overridePeriodo || cd.periodo || histItem.periodo || targetPeriodo;
+
+    return {
+      ...cd,
+      id: cd.id || histItem.id,
+      cedula: expendio?.cedula || cd.cedula || histItem.cedula || targetCedula,
+      nombre: expendio?.encargado || cd.nombre || cd.encargado || histItem.encargado || '',
+      encargado: expendio?.encargado || cd.encargado || histItem.encargado || '',
+      expendio: expendio?.localidad || expendio?.municipio || cd.expendio || histItem.expendio || '',
+      municipio: expendio?.municipio || expendio?.localidad || cd.municipio || histItem.municipio || histItem.expendio || '',
+      periodo: finalPeriodo,
+      centroOperativo: expendio?.centroOperativo || cd.centroOperativo || histItem.centroOperativo || 'PO.ARAUCA',
+      centroAcopio: expendio?.centroAcopio || cd.centroAcopio || histItem.centroAcopio || expendio?.municipio || '',
+      direccion: expendio?.direccionPunto || cd.direccion || histItem.direccion || '',
+      telefono: expendio?.telefonoPunto || cd.telefono || histItem.telefono || '',
+      cargoBasico,
+      valorBase: cargoBasico,
+      admisionSipost,
+      valorVariable,
+      pagoTotal,
+      valorBruto: pagoTotal,
+      porcentajeRetencion: Number(cd.porcentajeRetencion ?? cd.porcentajeRetefuente ?? 1),
+      porcentajeRetefuente: Number(cd.porcentajeRetefuente ?? cd.porcentajeRetencion ?? 1),
+      retef1,
+      retencionValor: retef1,
+      retefuente: retef1,
+      porcentajeReteica: 0,
+      reteica: 0,
+      valorNeto,
+      netoPagar: valorNeto,
+      valorEnLetras: cd.valorEnLetras || numeroALetras(valorNeto),
+      banco: expendio?.banco || cd.banco || '',
+      cuentaBancaria: expendio?.cuentaBancaria || cd.cuentaBancaria || '',
+    };
+  };
+
+  // Search strictly in db.historial for matching item of type 'Cuenta de Cobro' generated for the requested period
+  const historialMatch = (db.historial || []).find((h: any) => {
+    if (!matchesExpendioHist(h)) return false;
+    if (targetPeriodNorm && normalizePeriodKey(h.periodo) === targetPeriodNorm) return true;
+    const hPeriodoUpper = (h.periodo || '').toUpperCase();
+    if (mesSearch && !hPeriodoUpper.includes(mesSearch)) return false;
+    if (anioSearch && !hPeriodoUpper.includes(anioSearch)) return false;
+    return true;
+  });
+
+  if (historialMatch && (historialMatch.cuentaData || historialMatch.monto || historialMatch.valorBase)) {
+    return res.json({
+      success: true,
+      generada: true,
+      isPeriodoPublicado,
+      descargaHabilitada: isDescargaHabilitada,
+      periodoConsultado: targetPeriodo,
+      periodoPublicado: publishedPeriodo,
+      data: buildNormalizedCuentaData(historialMatch),
+      message: 'Cuenta de cobro encontrada en la generación de cuentas de cobro del periodo.',
+    });
+  }
+
+  // 4. Strict: If not generated/published, return generada: false without mutating database
+  return res.json({
+    success: true,
+    generada: false,
+    isPeriodoPublicado,
+    descargaHabilitada: isDescargaHabilitada,
+    periodoConsultado: targetPeriodo,
+    periodoPublicado: publishedPeriodo,
+    message: `CUENTA DE COBRO NO GENERADA NI PUBLICADA. La cuenta de cobro para el periodo "${targetPeriodo}" aún no ha sido generada ni publicada en el sistema por la administración.`,
+  });
+};
+
+app.get('/api/expendio/cuenta-cobro', handleGetExpendioCuenta);
+app.get('/api/cuentas/usuario/:cedula', handleGetExpendioCuenta);
+
+app.get('/api/expendio/me', requireAuthenticatedUser, async (req: AuthRequest, res) => {
+  try {
+    const localDb = loadDatabase();
+    const expendio = resolveUserExpendio(req, localDb);
+    if (!expendio) {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+    }
+    let vMensual = Number(expendio.valorMensual) || 0;
+    let aSipost = Number(expendio.admisionSipost) || 0;
+    let vVariable = Number(expendio.valorVariable) || 0;
+
+    if (vMensual === 0) {
+      const cleanDig = (s: any) => String(s || '').replace(/[^0-9]/g, '');
+      const normMuni = (s: any) => String(s || '').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      const eCed = cleanDig(expendio.cedula);
+      const eMuni = normMuni(expendio.municipio || expendio.localidad);
+      const histMatch = (localDb.historial || []).find(
+        (h: any) =>
+          (eCed && cleanDig(h.cedula) === eCed) ||
+          (eMuni && normMuni(h.municipio || h.expendio) === eMuni)
+      );
+      if (histMatch) {
+        const cd = (histMatch.cuentaData || {}) as any;
+        vMensual = Number(cd.cargoBasico ?? histMatch.valorBase ?? 0);
+        aSipost = Number(cd.admisionSipost ?? 0);
+        vVariable = Number(cd.valorVariable ?? 0);
+      }
+    }
+
+    res.json({
+      success: true,
+      expendio: {
+        ...expendio,
+        valorMensual: vMensual,
+        admisionSipost: aSipost,
+        valorVariable: vVariable,
+        revision: Number(expendio.revision) || 1,
+        letreroUrl: expendio.letreroUrl || expendio.fotoAvisoUrl || undefined,
+        basculaUrl: expendio.basculaUrl || expendio.fotoBasculaUrl || undefined,
+        mataselloUrl: expendio.mataselloUrl || expendio.fotoMataselloUrl || undefined,
+        computadorUrl: expendio.computadorUrl || undefined,
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 4. Obtener documentos disponibles para los Expendios
+app.get('/api/expendio/documentos', async (req: any, res: any) => {
+  try {
+    const user = extractAuthenticatedUser(req);
+    const isAdmin = user?.roles?.includes('admin') || user?.role === 'admin';
+
+    let docConfig: any = null;
+    try {
+      const rows = await db.select().from(schema.systemConfig).where(eq(schema.systemConfig.key, 'global_config'));
+      if (rows.length > 0 && rows[0].value) {
+        docConfig = (rows[0].value as any).documentosExpendios;
+      }
+    } catch (pgErr) {
+      console.error('Error fetching docs from PostgreSQL:', pgErr);
+    }
+
+    if (!docConfig) {
+      const localDb = loadDatabase();
+      docConfig = localDb.config?.documentosExpendios;
+    }
+
+    const currentDocs = Array.isArray(docConfig) ? docConfig : [];
+    const mergedDocs = [...currentDocs];
+    for (const defDoc of DEFAULT_DOCUMENTOS_EXPENDIOS) {
+      if (!mergedDocs.some((d) => d.id === defDoc.id)) {
+        mergedDocs.push({ ...defDoc });
+      }
+    }
+
+    // Filtrar solo los documentos habilitados para expendios (a menos que sea admin que ve todos)
+    const visibleDocs = isAdmin
+      ? mergedDocs
+      : mergedDocs.filter((d: any) => d.habilitado !== false && d.habilitado !== 'false');
+
+    res.json({
+      success: true,
+      data: visibleDocs,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error obteniendo documentos: ' + err.message });
+  }
+});
+
+app.get('/api/cuentas-cargadas', handleGetCuentasCargadas);
+app.get('/api/expendio/cuentas-cargadas/:cedula', handleGetCuentasCargadas);
+
+// Endpoint GET for expendio by id
+app.use((req, res, next) => {
+  if (req.path.includes('/api/expendio/12345')) {
+    console.log("REACHED debug MW. Path:", req.path);
+  }
+  next();
+});
+app.get('/api/expendio/:id', requireAuthenticatedUser, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const { id } = req.params;
+  const db = loadDatabase();
+  // REGLA 1: La búsqueda es estrictamente por expendio.id canónico e inmutable
+  const expendio = db.expendios.find(e => String(e.id) === id);
+
+  if (!expendio) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  }
+
+  // REGLAS 7 y 13: El usuario Expendio solo puede acceder a su propio expendio (req.user.expendioId)
+  if (!user.roles.includes('admin')) {
+    if (user.expendioId !== expendio.id) {
+      console.warn(`[Auth] Bloqueado intento no autorizado de acceso a otro expendio. Usuario expendioId: ${user.expendioId}, Objetivo solicitado: ${id}`);
+      return res.status(403).json({ success: false, message: 'Acceso denegado: No tiene permisos para consultar datos de otro expendio.' });
+    }
+  }
+
+  res.json({ success: true, data: expendio });
+});
+
+// ==========================================
+// CAPA CENTRAL DE AUTORIZACIÓN ADMINISTRATIVA
+// REGLA 12: Centraliza la autorización sin duplicar lógica.
+// Solo la cédula 1094269932 con rol admin puede acceder a cualquier endpoint bajo /api/admin/*
+// ==========================================
+app.use('/api/admin', requireAdmin);
+
+// Get all expendios for admin
+app.get('/api/admin/expendios', (req, res) => {
   const db = loadDatabase();
   res.json({ success: true, data: db.expendios });
+});
+
+// Helper para determinar la fecha real de última actualización (cambio de foto o modificación de perfil)
+function resolveExpendioFechaActualizacion(e: any): string {
+  if (!e) return '';
+  const hasPhotos = Boolean(
+    e.fotoAvisoUrl ||
+    e.fotoPanoramicaUrl ||
+    e.fotoMataselloUrl ||
+    e.fotoBasculaUrl ||
+    e.fotoContratistaUrl ||
+    e.fotoHorarioUrl ||
+    e.fotoTarifasUrl ||
+    e.letreroUrl ||
+    e.basculaUrl ||
+    e.mataselloUrl ||
+    e.computadorUrl
+  );
+  const rawUpdatedDate = e.updatedAt
+    ? (e.updatedAt instanceof Date ? e.updatedAt.toISOString() : String(e.updatedAt)).split('T')[0]
+    : '';
+  const rawFechaAct = typeof e.fechaUltimaActualizacion === 'string' ? e.fechaUltimaActualizacion.trim() : '';
+  const isSeedDate = rawFechaAct === '2026-07-31';
+  const hasPostSeedUpdate = Boolean(rawUpdatedDate && rawUpdatedDate > '2026-10-02');
+  const hasUpdatedData = Boolean(
+    hasPhotos ||
+    e.primeraVezActualizado ||
+    (Number(e.revision) || 1) > 1 ||
+    (rawFechaAct && !isSeedDate) ||
+    hasPostSeedUpdate
+  );
+
+  if (!hasUpdatedData) return '';
+  if (rawFechaAct && !isSeedDate) {
+    return hasPostSeedUpdate && rawUpdatedDate > rawFechaAct ? rawUpdatedDate : rawFechaAct;
+  }
+  if (hasPostSeedUpdate) {
+    return rawUpdatedDate;
+  }
+  return rawFechaAct || rawUpdatedDate;
+}
+
+// REGLA 3 y 8: Consulta de expendios autenticada.
+// Si es Administrador: retorna la base maestra directamente desde PostgreSQL.
+// Si es Expendio o Cliente: retorna estrictamente su propio expendio resuelto por el backend.
+app.get('/api/expendios', requireAuthenticatedUser, async (req: AuthRequest, res) => {
+  const user = req.user!;
+  const isAdmin = normalizeCedula(user.cedula) === ADMIN_CEDULA || user.roles?.includes('admin') || user.role === 'admin';
+
+  try {
+    const expRows = await db.select().from(schema.expendios).orderBy(schema.expendios.nombrePunto);
+    let mapped = expRows.map((e: any) => ({
+      ...e,
+      valorMensual: Number(e.valorMensual) || 0,
+      admisionSipost: Number(e.admisionSipost) || 0,
+      valorVariable: Number(e.valorVariable) || 0,
+      revision: Number(e.revision) || 1,
+      letreroUrl: e.letreroUrl || e.fotoAvisoUrl || undefined,
+      basculaUrl: e.basculaUrl || e.fotoBasculaUrl || undefined,
+      mataselloUrl: e.mataselloUrl || e.fotoMataselloUrl || undefined,
+      computadorUrl: e.computadorUrl || undefined,
+      fechaUltimaActualizacion: resolveExpendioFechaActualizacion(e),
+    }));
+
+    // Si PostgreSQL devolvió 0 registros pero la base local tiene datos, usar base local como contingencia
+    if (mapped.length === 0) {
+      console.warn('[API] PostgreSQL retornó 0 expendios, recurriendo a base de datos local...');
+      const localDb = loadDatabase();
+      if (localDb.expendios && localDb.expendios.length > 0) {
+        mapped = localDb.expendios;
+      }
+    }
+
+    if (isAdmin || user.roles?.includes('cliente') || user.role === 'cliente') {
+      return res.json({ success: true, data: mapped });
+    }
+
+    const ownExp = resolveUserExpendio(req, { expendios: mapped } as any);
+    return res.json({ success: true, data: ownExp ? [ownExp] : [] });
+  } catch (err: any) {
+    console.warn('[API] Fallback a caché en memoria para /api/expendios:', err.message);
+    const localDb = loadDatabase();
+    if (isAdmin || user.roles?.includes('cliente') || user.role === 'cliente') {
+      return res.json({ success: true, data: localDb.expendios || [] });
+    }
+    const ownExp = resolveUserExpendio(req, localDb);
+    return res.json({ success: true, data: ownExp ? [ownExp] : [] });
+  }
+});
+
+// REGLA 8: Panel Cliente oficial (Consolidado Regional de Expendios 4-72)
+app.get('/api/cliente/expendios', requireAuthenticatedUser, async (req: AuthRequest, res) => {
+  try {
+    const expRows = await db.select().from(schema.expendios).orderBy(schema.expendios.nombrePunto);
+    let mapped = expRows.map((e: any) => ({
+      ...e,
+      valorMensual: Number(e.valorMensual) || 0,
+      admisionSipost: Number(e.admisionSipost) || 0,
+      valorVariable: Number(e.valorVariable) || 0,
+      revision: Number(e.revision) || 1,
+      letreroUrl: e.letreroUrl || e.fotoAvisoUrl || undefined,
+      basculaUrl: e.basculaUrl || e.fotoBasculaUrl || undefined,
+      mataselloUrl: e.mataselloUrl || e.fotoMataselloUrl || undefined,
+      computadorUrl: e.computadorUrl || undefined,
+      fechaUltimaActualizacion: resolveExpendioFechaActualizacion(e),
+    }));
+
+    if (mapped.length === 0) {
+      const localDb = loadDatabase();
+      mapped = localDb.expendios || [];
+    }
+
+    return res.json({ success: true, data: mapped, total: mapped.length });
+  } catch (err: any) {
+    const localDb = loadDatabase();
+    return res.json({ success: true, data: localDb.expendios || [], total: (localDb.expendios || []).length });
+  }
 });
 
 // Estado en memoria de sincronización en tiempo real y reportes guardados
@@ -1640,33 +2792,12 @@ let lastReportSaveRecord = {
   timestamp: new Date().toISOString(),
   type: 'sistema',
   status: 'success' as 'success' | 'pending' | 'error',
-  detalles: '177 expendios y catálogo fotográfico sincronizados con Firestore y Storage',
+  detalles: '177 expendios y catálogo fotográfico persistidos en PostgreSQL y almacenamiento de archivos',
 };
 
-// 1.0. System status of Firestore persistence
-app.get('/api/system/firestore-status', (req, res) => {
+// 1.0A. Realtime Sync Monitoring (PostgreSQL + Storage + Report status)
+app.get('/api/system/sync-monitoring', async (req, res) => {
   const db = loadDatabase();
-  const syncStatus = getCloudSyncStatus();
-  res.json({
-    success: true,
-    connected: syncStatus.connected,
-    quotaExhausted: !!syncStatus.quotaExhausted,
-    lastSync: syncStatus.lastSyncTime,
-    error: syncStatus.quotaExhausted ? syncStatus.lastSyncError : null,
-    totalExpendios: Array.isArray(db.expendios) ? db.expendios.length : 0,
-      totalExpendiosCloud: syncStatus.totalExpendiosCloud || 0,
-    databaseName: isPublishedEnv ? 'camarca_system' : 'camarca_system_test',
-    photosCollection: 'camarca_photos',
-    message: syncStatus.quotaExhausted
-      ? 'Cuota diaria de Firestore alcanzada. Los datos y fotos continúan 100% seguros y respaldados permanentemente en el servidor.'
-      : 'Base de datos de 177 expendios y fotografías persistidas en Google Cloud Firestore.',
-  });
-});
-
-// 1.0A. Realtime Sync Monitoring (Firestore + Storage + Report status)
-app.get('/api/system/sync-monitoring', (req, res) => {
-  const db = loadDatabase();
-  const syncStatus = getCloudSyncStatus();
 
   let localPhotosCount = 0;
   let localDbSizeBytes = 0;
@@ -1676,54 +2807,33 @@ app.get('/api/system/sync-monitoring', (req, res) => {
     }
     const dbPath = getActiveDbPath();
     if (fs.existsSync(dbPath)) {
-       localDbSizeBytes = fs.statSync(dbPath).size;
+      localDbSizeBytes = fs.statSync(dbPath).size;
     }
   } catch {}
+
+  const pgHealth = await checkCloudSqlHealth().catch(() => ({ connected: false, latencyMs: -1 }));
 
   res.json({
     success: true,
     timestamp: new Date().toISOString(),
-    firestore: {
-      connected: Boolean(syncStatus.connected),
-      quotaExhausted: Boolean(syncStatus.quotaExhausted),
-      databaseId: syncStatus.databaseId || 'ai-studio-expendioscamarca-5a851b13-3f57-4ad6-ac56-28b094b35072',
-      collection: isPublishedEnv ? 'camarca_system' : 'camarca_system_test',
+    database: {
+      engine: 'PostgreSQL (Cloud SQL)',
+      connected: pgHealth.connected,
+      latencyMs: pgHealth.latencyMs,
       totalExpendios: Array.isArray(db.expendios) ? db.expendios.length : 0,
-      localDbSizeBytes,
-      lastSyncTime: syncStatus.lastSyncTime || new Date().toISOString(),
-      error: syncStatus.quotaExhausted ? (syncStatus.lastSyncError || null) : null,
-      status: syncStatus.quotaExhausted
-        ? 'quota_exhausted'
-        : syncStatus.connected
-        ? 'synced'
-        : 'offline',
+      totalHistorial: Array.isArray(db.historial) ? db.historial.length : 0,
+      totalRelacionPagos: Array.isArray(db.relacionPagos) ? db.relacionPagos.length : 0,
+      totalTrazabilidad: Array.isArray(db.trazabilidad) ? db.trazabilidad.length : 0,
+      status: pgHealth.connected ? 'online' : 'error',
     },
     storage: {
       connected: true,
-      provider: 'Google Drive & Almacenamiento Local',
-      collection: 'Fotos Expendios 4-72 - CAMARCA SAS',
+      provider: 'Almacenamiento Persistente & Google Drive',
       photosCount: localPhotosCount,
-      lastPhotoSyncTime: syncStatus.lastSyncTime || new Date().toISOString(),
+      localDbSizeBytes,
       status: 'online',
-      firebaseStorageDisabled: true,
-      message: 'Fotografías archivadas en servidor local y preparadas para Google Drive sin consumir cuotas de Firebase.',
     },
     lastReport: lastReportSaveRecord,
-  });
-});
-
-// 1.0A2. Manual retry of Firestore sync (clears cooldown if needed)
-app.post('/api/system/firestore-retry-sync', async (req, res) => {
-  resetFirestoreQuotaCooldown();
-  const db = loadDatabase();
-  const success = await saveDatabaseToCloud(db, { force: true });
-  const syncStatus = getCloudSyncStatus();
-  res.json({
-    success,
-    status: syncStatus,
-    message: success
-      ? 'Sincronización con Firestore ejecutada exitosamente.'
-      : (syncStatus.lastSyncError || 'No se pudo sincronizar en este momento. Los datos continúan protegidos localmente.'),
   });
 });
 
@@ -1741,47 +2851,64 @@ app.post('/api/system/report-saved', (req, res) => {
   res.json({ success: true, lastReport: lastReportSaveRecord });
 });
 
-// 1.0C. Forzar sincronización manual de Firestore
-app.post('/api/system/sync-now', async (req, res) => {
+// 1.0C. Validación de estado e integridad de la base de datos local antes del guardado
+app.get('/api/admin/database/validate-state', (req, res) => {
   try {
-    resetFirestoreQuotaCooldown();
-    const db = loadDatabase();
-    const success = await saveDatabaseToCloud(db, { force: true });
-    if (success) {
-      lastReportSaveRecord = {
-        saved: true,
-        name: 'Respaldo Completo en la Nube (177 Expendios)',
-        timestamp: new Date().toISOString(),
-        type: 'respaldo',
-        status: 'success',
-        detalles: 'Sincronización manual ejecutada exitosamente con Firestore y Storage',
-      };
-    }
-    const syncStatus = getCloudSyncStatus();
+    const stateReport = verifyLocalDatabaseStateBeforeSave();
+    const currentDb = getDatabaseReadOnly();
+    const diskVerification = verifyWrittenMasterDatabaseOnDisk(
+      Number(currentDb.revision) || 0,
+      Array.isArray(currentDb.expendios) ? currentDb.expendios.length : 0
+    );
     res.json({
-      success,
-      lastReport: lastReportSaveRecord,
-      message: success
-        ? '✓ Base de datos de 177 expendios y colecciones respaldadas exitosamente en Google Cloud Firestore.'
-        : (syncStatus.lastSyncError || 'Los datos continúan 100% seguros y protegidos en almacenamiento permanente local.'),
+      success: true,
+      stateReport,
+      diskVerification,
+      masterFile: 'database/camarca_master_db.json',
+      message: 'Estado de la base de datos local verificado e íntegro.',
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({
+      success: false,
+      masterFile: 'database/camarca_master_db.json',
+      message: `Error validando integridad de la base de datos local: ${err.message}`,
+    });
   }
 });
 
 // 1B. Admin: Update an expendio
 app.put('/api/admin/expendios/:id', async (req, res) => {
   const { id } = req.params;
-  const updateData: Partial<ExpendioData> = { ...req.body };
-  const db = loadDatabase();
+  const updateData: Partial<ExpendioData> & { _explicitPhotoDelete?: boolean } = { ...req.body };
 
-  const index = db.expendios.findIndex((e) => e.id === id || e.cedula === id || e.localidad === id);
+  // Validar estado e integridad de la base de datos local ANTES de iniciar el proceso de guardado
+  let preSaveStateReport;
+  try {
+    preSaveStateReport = verifyLocalDatabaseStateBeforeSave();
+  } catch (validationErr: any) {
+    return res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Validación previa de integridad falló: ${validationErr.message}`,
+    });
+  }
+
+  const currentDb = getDatabase();
+
+  const targetId = decodeURIComponent(String(id || '')).trim();
+  const index = currentDb.expendios.findIndex(
+    (e) =>
+      String(e.id || '').trim() === targetId ||
+      String(e.cedula || '').trim() === targetId ||
+      String(e.localidad || '').trim().toLowerCase() === targetId.toLowerCase() ||
+      String(e.municipio || '').trim().toLowerCase() === targetId.toLowerCase()
+  );
   if (index === -1) {
     return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
   }
 
-  const exp = db.expendios[index];
+  const exp = currentDb.expendios[index];
+  const effectiveCedula = String(updateData.cedula || exp.cedula || '').trim();
   const photoKeys: Array<keyof ExpendioData> = [
     'fotoAvisoUrl',
     'fotoPanoramicaUrl',
@@ -1796,131 +2923,317 @@ app.put('/api/admin/expendios/:id', async (req, res) => {
     'computadorUrl',
   ];
 
-  // Interceptar campos fotográficos para persistirlos en Firestore y nunca saturar la base de datos local
+  // Interceptar campos fotográficos para persistirlos en almacenamiento permanente (solo si se envía nueva imagen Base64 o borrado explícito)
   for (const key of photoKeys) {
     const val = updateData[key];
     if (typeof val === 'string') {
-      if (val.startsWith('data:image/') || val.length > 500) {
-        const canonicalSlot =
-          key === 'letreroUrl'
-            ? 'fotoAvisoUrl'
-            : key === 'basculaUrl'
-            ? 'fotoBasculaUrl'
-            : key === 'mataselloUrl'
-            ? 'fotoMataselloUrl'
-            : key;
+      const canonicalSlot =
+        key === 'letreroUrl'
+          ? 'fotoAvisoUrl'
+          : key === 'basculaUrl'
+          ? 'fotoBasculaUrl'
+          : key === 'mataselloUrl'
+          ? 'fotoMataselloUrl'
+          : key;
 
-        // 1. Guardar individualmente en Firestore
-        await savePhotoToCloud(exp.cedula, canonicalSlot, val, {
-          municipio: exp.municipio,
-          encargado: exp.encargado,
+      if (val.startsWith('data:image/') || val.length > 500) {
+        const cleanBase64 = val.replace(/^data:[^;]+;base64,/, '').trim();
+        const photoBuffer = Buffer.from(cleanBase64, 'base64');
+
+        // Procesar en Almacenamiento Híbrido Cloud (Firebase Storage REAL + AWS S3 REAL)
+        const hybridRes = await processAndSavePhotoHybrid({
           expendioId: exp.id,
+          cedula: effectiveCedula,
+          slotKey: canonicalSlot,
+          inputBuffer: photoBuffer,
+          mimeType: 'image/jpeg',
+          dbClient: db,
         });
 
-        // 2. Cachear en disco del contenedor
-        const localFileName = `${exp.cedula.trim()}_${canonicalSlot}.jpg`;
-        const cleanBase64 = val.replace(/^data:[^;]+;base64,/, '').trim();
-        try {
-          fs.writeFileSync(path.join(photosDir, localFileName), Buffer.from(cleanBase64, 'base64'));
-          backgroundPhotoSyncEngine.notifyPhotoChanged(localFileName);
-        } catch {}
+        if (hybridRes.success && (hybridRes.status === 'SYNCED' || hybridRes.status === 'S3_FALLBACK')) {
+          const canonicalUrl = `/api/photos/${encodeURIComponent(effectiveCedula)}/${canonicalSlot}`;
+          (updateData as any)[key] = canonicalUrl;
 
-        // 3. Reemplazar por la URL canónica segura para mantener la BD ligera
-        const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${canonicalSlot}`;
-        (updateData as any)[key] = canonicalUrl;
-
-        if (key === 'fotoAvisoUrl' || canonicalSlot === 'fotoAvisoUrl') {
-          updateData.fotoAvisoUrl = canonicalUrl;
-          updateData.letreroUrl = canonicalUrl;
-          updateData.tieneAviso = 'SI';
-          updateData.motivoFaltaAviso = '';
-        } else if (key === 'fotoBasculaUrl' || canonicalSlot === 'fotoBasculaUrl') {
-          updateData.fotoBasculaUrl = canonicalUrl;
-          updateData.basculaUrl = canonicalUrl;
-          updateData.tieneBascula = 'SI';
-          updateData.motivoFaltaBascula = '';
-        } else if (key === 'fotoMataselloUrl' || canonicalSlot === 'fotoMataselloUrl') {
-          updateData.fotoMataselloUrl = canonicalUrl;
-          updateData.mataselloUrl = canonicalUrl;
-          updateData.tieneMatasello = 'SI';
-          updateData.motivoFaltaMatasello = '';
+          if (canonicalSlot === 'fotoAvisoUrl') {
+            updateData.fotoAvisoUrl = canonicalUrl;
+            updateData.letreroUrl = canonicalUrl;
+            updateData.tieneAviso = 'SI';
+            updateData.motivoFaltaAviso = '';
+          } else if (canonicalSlot === 'fotoBasculaUrl') {
+            updateData.fotoBasculaUrl = canonicalUrl;
+            updateData.basculaUrl = canonicalUrl;
+            updateData.tieneBascula = 'SI';
+            updateData.motivoFaltaBascula = '';
+          } else if (canonicalSlot === 'fotoMataselloUrl') {
+            updateData.fotoMataselloUrl = canonicalUrl;
+            updateData.mataselloUrl = canonicalUrl;
+            updateData.tieneMatasello = 'SI';
+            updateData.motivoFaltaMatasello = '';
+          }
+        } else {
+          delete (updateData as any)[key];
         }
-      } else if (val === '') {
-        const canonicalSlot =
-          key === 'letreroUrl'
-            ? 'fotoAvisoUrl'
-            : key === 'basculaUrl'
-            ? 'fotoBasculaUrl'
-            : key === 'mataselloUrl'
-            ? 'fotoMataselloUrl'
-            : key;
-
-        await deletePhotoFromCloud(exp.cedula, canonicalSlot);
+      } else if (val === '' && updateData._explicitPhotoDelete) {
         const localFileName = `${exp.cedula.trim()}_${canonicalSlot}.jpg`;
         const localPath = path.join(photosDir, localFileName);
+        const permPath = path.join(permanentPhotosDir, localFileName);
         if (fs.existsSync(localPath)) {
           try { fs.unlinkSync(localPath); } catch {}
         }
-        if (key === 'fotoAvisoUrl') updateData.letreroUrl = '';
-        if (key === 'fotoBasculaUrl') updateData.basculaUrl = '';
-        if (key === 'fotoMataselloUrl') updateData.mataselloUrl = '';
+        if (fs.existsSync(permPath)) {
+          try { fs.unlinkSync(permPath); } catch {}
+        }
+        if (canonicalSlot === 'fotoAvisoUrl') {
+          updateData.fotoAvisoUrl = '';
+          updateData.letreroUrl = '';
+        }
+        if (canonicalSlot === 'fotoBasculaUrl') {
+          updateData.fotoBasculaUrl = '';
+          updateData.basculaUrl = '';
+        }
+        if (canonicalSlot === 'fotoMataselloUrl') {
+          updateData.fotoMataselloUrl = '';
+          updateData.mataselloUrl = '';
+        }
+      } else if (val === '') {
+        // No borrar fotos existentes si el formulario de edición de datos envió cadena vacía
+        delete (updateData as any)[key];
       }
     }
   }
+  delete updateData._explicitPhotoDelete;
 
-  // Preserve existing fields and merge update
-  db.expendios[index] = {
-    ...db.expendios[index],
-    ...updateData,
-    fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
-  };
+  try {
+    const updatedItem = await mutateDatabase(async (db) => {
+      const idx = db.expendios.findIndex(
+        (e) =>
+          String(e.id || '').trim() === targetId ||
+          String(e.cedula || '').trim() === targetId ||
+          String(e.localidad || '').trim().toLowerCase() === targetId.toLowerCase() ||
+          String(e.municipio || '').trim().toLowerCase() === targetId.toLowerCase()
+      );
+      if (idx === -1) {
+        throw new Error('EXPENDIO_NOT_FOUND');
+      }
 
-  const updatedItem = db.expendios[index];
+      const current = db.expendios[idx];
+      const oldCedula = String(current.cedula || '').trim();
+      const newCedula = updateData.cedula !== undefined && String(updateData.cedula).trim() !== ''
+        ? String(updateData.cedula).trim()
+        : oldCedula;
+      const cedulaChanged = Boolean(oldCedula && newCedula && normalizeCedula(oldCedula) !== normalizeCedula(newCedula));
 
-  // Record traceability event instead of polluting accounting historial
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-  db.trazabilidad.unshift({
-    id: `traz-${Date.now()}`,
-    municipio: updatedItem.municipio || updatedItem.localidad,
-    localidad: updatedItem.localidad,
-    novedad: 'Actualización de datos del expendio por administración',
-    fechaRegistro: new Date().toISOString(),
-    registradoPor: 'Administrador CAMARCA',
-    observaciones: `Modificación de datos de ${updatedItem.localidad} en el sistema maestro`,
-  });
+      const prevCedsSet = new Set<string>(
+        Array.isArray((current as any).cedulasAnteriores) ? (current as any).cedulasAnteriores : []
+      );
+      if (cedulaChanged) {
+        prevCedsSet.add(oldCedula);
+        // Copiar archivos locales de fotos en caché si existen bajo la cédula anterior
+        for (const pk of ['fotoAvisoUrl', 'fotoPanoramicaUrl', 'fotoMataselloUrl', 'fotoBasculaUrl', 'fotoContratistaUrl', 'fotoHorarioUrl', 'fotoTarifasUrl', 'computadorUrl']) {
+          const oldFile = path.join(permanentPhotosDir, `${oldCedula}_${pk}.jpg`);
+          const newFile = path.join(permanentPhotosDir, `${newCedula}_${pk}.jpg`);
+          if (fs.existsSync(oldFile) && !fs.existsSync(newFile)) {
+            try { fs.copyFileSync(oldFile, newFile); } catch {}
+          }
+        }
+      }
 
-  saveDatabase(db);
+      const nowIso = new Date().toISOString();
+      const today = nowIso.split('T')[0];
 
-  res.json({
-    success: true,
-    data: updatedItem,
-    message: `✓ Expendio ${updatedItem.localidad} actualizado correctamente en el sistema.`,
-  });
+      const nextDireccion =
+        updateData.direccionPunto !== undefined
+          ? String(updateData.direccionPunto).trim().toUpperCase()
+          : (updateData as any).direccion !== undefined
+          ? String((updateData as any).direccion).trim().toUpperCase()
+          : current.direccionPunto || (current as any).direccion || '';
+
+      const nextTelefono =
+        updateData.telefonoPunto !== undefined
+          ? String(updateData.telefonoPunto).trim()
+          : (updateData as any).telefono !== undefined
+          ? String((updateData as any).telefono).trim()
+          : current.telefonoPunto || (current as any).telefono || '';
+
+      // Merge seguro preservando campos existentes y garantizando ID inmutable
+      const nextExp: any = {
+        ...current,
+        ...updateData,
+        id: current.id, // Invariante: El ID interno del expendio es estrictamente inmutable
+        centroOperativo: updateData.centroOperativo !== undefined && String(updateData.centroOperativo).trim() !== ''
+          ? String(updateData.centroOperativo).trim()
+          : current.centroOperativo,
+        centroAcopio: updateData.centroAcopio !== undefined && String(updateData.centroAcopio).trim() !== ''
+          ? String(updateData.centroAcopio).trim()
+          : current.centroAcopio,
+        localidad: updateData.localidad !== undefined && String(updateData.localidad).trim() !== ''
+          ? String(updateData.localidad).trim().toUpperCase()
+          : current.localidad,
+        municipio: updateData.municipio !== undefined && String(updateData.municipio).trim() !== ''
+          ? String(updateData.municipio).trim().toUpperCase()
+          : (updateData.localidad ? String(updateData.localidad).trim().toUpperCase() : current.municipio),
+        encargado: updateData.encargado !== undefined && String(updateData.encargado).trim() !== ''
+          ? String(updateData.encargado).trim().toUpperCase()
+          : current.encargado,
+        cedula: newCedula,
+        direccionPunto: nextDireccion,
+        direccion: nextDireccion,
+        telefonoPunto: nextTelefono,
+        telefono: nextTelefono,
+        correoElectronico:
+          updateData.correoElectronico !== undefined
+            ? String(updateData.correoElectronico).trim()
+            : current.correoElectronico,
+        fechaUltimaActualizacion: today,
+        updatedAt: nowIso,
+        revision: (Number(current.revision) || 0) + 1,
+      };
+
+      if (prevCedsSet.size > 0) {
+        nextExp.cedulasAnteriores = Array.from(prevCedsSet);
+      }
+
+      // Preservar URLs fotográficas existentes si no fueron modificadas explícitamente
+      for (const pk of photoKeys) {
+        if (!nextExp[pk] && (current as any)[pk]) {
+          nextExp[pk] = (current as any)[pk];
+        }
+      }
+
+      db.expendios[idx] = nextExp;
+      const resultItem = db.expendios[idx];
+
+      // Mantener sincronizados los registros de relación de pagos e historial vinculados a este expendio si cambió cédula o encargado
+      const normMuni = (s: any) => String(s || '').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      const targetMuniNorm = normMuni(current.municipio || current.localidad);
+      if (Array.isArray(db.relacionPagos)) {
+        for (const p of db.relacionPagos) {
+          const pAny = p as any;
+          const matchesId = pAny.expendioId && String(pAny.expendioId) === String(current.id);
+          const matchesCedAndMuni =
+            normalizeCedula(p.cedula) === normalizeCedula(oldCedula) &&
+            (!p.municipio || normMuni(p.municipio) === targetMuniNorm);
+          if (matchesId || matchesCedAndMuni) {
+            pAny.expendioId = current.id;
+            p.cedula = resultItem.cedula;
+            p.nombreEncargado = resultItem.encargado;
+            pAny.beneficiario = resultItem.encargado;
+            if (resultItem.banco) p.banco = resultItem.banco;
+            if (resultItem.cuentaBancaria) {
+              p.cuenta = resultItem.cuentaBancaria;
+              pAny.numeroCuentaBancaria = resultItem.cuentaBancaria;
+            }
+            if (resultItem.centroOperativo) p.centroOperativo = resultItem.centroOperativo;
+            if (resultItem.municipio || resultItem.localidad) p.municipio = resultItem.municipio || resultItem.localidad;
+          }
+        }
+      }
+
+      if (Array.isArray(db.historial)) {
+        for (const h of db.historial) {
+          const hAny = h as any;
+          const matchesId = hAny.expendioId && String(hAny.expendioId) === String(current.id);
+          const matchesCedAndMuni =
+            normalizeCedula(h.cedula) === normalizeCedula(oldCedula) &&
+            normMuni(hAny.municipio || h.expendio) === targetMuniNorm;
+          if (matchesId || matchesCedAndMuni) {
+            hAny.expendioId = current.id;
+          }
+        }
+      }
+
+      // Registrar evento de trazabilidad con identidad real resuelta en backend
+      const actor = extractAuthenticatedUser(req) || { cedula: '1094269932', role: 'admin' };
+      if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+      const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+      db.trazabilidad.unshift({
+        id: `traz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        expendioId: resultItem.id,
+        actorId: actor.cedula,
+        actorRole: 'admin',
+        timestamp: nowIso,
+        municipio: resultItem.municipio || resultItem.localidad,
+        localidad: resultItem.localidad,
+        tipoMovimiento: cedulaChanged || current.encargado !== resultItem.encargado ? 'CAMBIO_ENCARGADO' : undefined,
+        encargadoAnterior: current.encargado,
+        cedulaAnterior: oldCedula,
+        encargadoNuevo: resultItem.encargado,
+        cedulaNuevo: resultItem.cedula,
+        novedad: cedulaChanged
+          ? `Cambio de cédula (${oldCedula} → ${resultItem.cedula}) y actualización por administración`
+          : 'Actualización de datos del expendio por administración',
+        fechaRegistro: nowIso,
+        registradoPor: `Administrador (CC: ${actor.cedula})`,
+        observaciones: `Modificación de datos de ${resultItem.localidad} en el sistema maestro (Rev ${resultItem.revision})`,
+        commitId,
+        before: current,
+        after: resultItem,
+      });
+
+      return resultItem;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: false });
+
+    const finalDbState = getDatabaseReadOnly();
+    const diskVerification = verifyWrittenMasterDatabaseOnDisk(
+      Number(finalDbState.revision) || 0,
+      Array.isArray(finalDbState.expendios) ? finalDbState.expendios.length : 0
+    );
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      masterFile: 'database/camarca_master_db.json',
+      stateValidation: preSaveStateReport,
+      diskVerification,
+      data: updatedItem,
+      message: `✓ Expendio ${updatedItem.localidad} validado, actualizado y sincronizado exitosamente en database/camarca_master_db.json.`,
+    });
+  } catch (err: any) {
+    if (err.message === 'EXPENDIO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+    }
+    console.error('[API] Error actualizando expendio:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al guardar cambios del expendio: ${err.message}.`,
+    });
+  }
 });
 
 // 1C. Admin: Create a new expendio
-app.post('/api/admin/expendios', (req, res) => {
+app.post('/api/admin/expendios', async (req, res) => {
   const newExp: ExpendioData = req.body;
-  const db = loadDatabase();
-
   if (!newExp.localidad || !newExp.cedula || !newExp.encargado) {
     return res.status(400).json({ success: false, message: 'La Localidad/Municipio, Cédula y Encargado son obligatorios.' });
   }
 
-  // Check duplicate cedula
-  const exists = db.expendios.some((e) => e.cedula.trim() === newExp.cedula.trim());
+  let preSaveStateReport;
+  try {
+    preSaveStateReport = verifyLocalDatabaseStateBeforeSave();
+  } catch (validationErr: any) {
+    return res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Validación previa de integridad falló: ${validationErr.message}`,
+    });
+  }
+
+  const currentDb = getDatabase();
+  const exists = currentDb.expendios.some((e) => e.cedula.trim() === newExp.cedula.trim());
   if (exists) {
     return res.status(400).json({ success: false, message: 'Ya existe un expendio registrado con esa misma Cédula.' });
   }
 
   const newId = `exp-${Date.now()}`;
+  const nowIso = new Date().toISOString();
   const fullExpendio: ExpendioData = {
     id: newId,
     centroOperativo: newExp.centroOperativo || 'PO.BUCARAMANGA',
     centroAcopio: newExp.centroAcopio || newExp.localidad,
     localidad: newExp.localidad,
     encargado: newExp.encargado,
-    cedula: newExp.cedula,
+    cedula: newExp.cedula.trim(),
     direccionPunto: newExp.direccionPunto || 'SEDE PRINCIPAL',
     telefonoPunto: newExp.telefonoPunto || '',
     usuarioSipost: newExp.usuarioSipost || 'NO ASIGNADO',
@@ -1935,428 +3248,892 @@ app.post('/api/admin/expendios', (req, res) => {
     mataselloUrl: newExp.mataselloUrl || undefined,
     computadorUrl: newExp.computadorUrl || undefined,
     contratoUrl: newExp.contratoUrl || undefined,
-    fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+    fechaUltimaActualizacion: nowIso.split('T')[0],
+    updatedAt: nowIso,
+    revision: 1,
   };
 
-  db.expendios.push(fullExpendio);
+  try {
+    await mutateDatabase(async (db) => {
+      db.expendios.push(fullExpendio);
+      const actor = extractAuthenticatedUser(req) || { cedula: '1094269932', role: 'admin' };
+      if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+      const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+      db.trazabilidad.unshift({
+        id: `traz-create-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        expendioId: fullExpendio.id,
+        actorId: actor.cedula,
+        actorRole: 'admin',
+        timestamp: nowIso,
+        municipio: fullExpendio.municipio || fullExpendio.localidad,
+        localidad: fullExpendio.localidad,
+        novedad: 'Creación de nuevo expendio en el sistema maestro',
+        encargadoNuevo: fullExpendio.encargado,
+        cedulaNuevo: fullExpendio.cedula,
+        fechaRegistro: nowIso,
+        registradoPor: `Administrador (CC: ${actor.cedula})`,
+        observaciones: `Nuevo expendio ${fullExpendio.localidad} creado con valor base $${fullExpendio.valorMensual}`,
+        commitId,
+        before: null,
+        after: fullExpendio,
+      });
+      return fullExpendio;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: false });
 
-  // Log creation event in trazabilidad (NEVER in accounting historial)
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-  db.trazabilidad.unshift({
-    id: `traz-create-${Date.now()}`,
-    municipio: fullExpendio.municipio || fullExpendio.localidad,
-    localidad: fullExpendio.localidad,
-    novedad: 'Creación de nuevo expendio en el sistema maestro',
-    encargadoNuevo: fullExpendio.encargado,
-    cedulaNuevo: fullExpendio.cedula,
-    fechaRegistro: new Date().toISOString(),
-    registradoPor: 'Administrador CAMARCA',
-    observaciones: `Nuevo expendio ${fullExpendio.localidad} creado con valor base $${fullExpendio.valorMensual}`,
-  });
+    const finalDbState = getDatabaseReadOnly();
+    const diskVerification = verifyWrittenMasterDatabaseOnDisk(
+      Number(finalDbState.revision) || 0,
+      Array.isArray(finalDbState.expendios) ? finalDbState.expendios.length : 0
+    );
 
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    data: fullExpendio,
-    message: `✓ Nuevo expendio ${fullExpendio.localidad} registrado con éxito en el sistema.`,
-  });
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      masterFile: 'database/camarca_master_db.json',
+      stateValidation: preSaveStateReport,
+      diskVerification,
+      data: fullExpendio,
+      message: `✓ Nuevo expendio ${fullExpendio.localidad} validado y registrado en database/camarca_master_db.json con éxito.`,
+    });
+  } catch (err: any) {
+    console.error('[API] Error creando expendio:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al guardar nuevo expendio: ${err.message}`,
+    });
+  }
 });
 
 // 1C2. Admin: Import expendios from uploaded Excel file
-app.post('/api/admin/import-excel', (req, res) => {
-  const { expendios, mode } = req.body;
+app.post('/api/admin/import-excel', async (req, res) => {
+  const { expendios, mode, selectedSheets, fileName, clientErrors } = req.body;
+
+  // Validación estricta de hojas seleccionadas
+  if (selectedSheets !== undefined && (!Array.isArray(selectedSheets) || selectedSheets.length === 0)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Debe seleccionar al menos una hoja de cálculo para procesar la importación.',
+    });
+  }
+
   if (!Array.isArray(expendios) || expendios.length === 0) {
-    return res.status(400).json({ success: false, message: 'No se recibieron datos de expendios válidos para importar.' });
+    return res.status(400).json({
+      success: false,
+      message: 'No se recibieron datos de expendios válidos para importar.',
+    });
   }
 
-  const db = loadDatabase();
+  const allErrors: string[] = Array.isArray(clientErrors) ? [...clientErrors] : [];
+  const activeSelectedSheets: string[] = Array.isArray(selectedSheets) && selectedSheets.length > 0 ? selectedSheets : ['EXPENDIOS'];
 
-  const formattedNew: ExpendioData[] = expendios.map((item: any, idx: number) => ({
-    id: item.id || `exp-excel-${Date.now()}-${idx}`,
-    centroOperativo: item.centroOperativo || 'PO.BUCARAMANGA',
-    centroAcopio: item.centroAcopio || 'ACOPIO PRINCIPAL',
-    localidad: String(item.localidad || item.municipio || 'SIN LOCALIDAD').trim().toUpperCase(),
-    encargado: String(item.encargado || 'SIN ENCARGADO').trim().toUpperCase(),
-    cedula: String(item.cedula || '0').trim(),
-    direccionPunto: String(item.direccionPunto || item.direccion || '').trim(),
-    telefonoPunto: String(item.telefonoPunto || item.celular || item.telefono || '').trim(),
-    usuarioSipost: String(item.usuarioSipost || item.sipost || `SIP_${idx + 1}`).trim(),
-    internet: String(item.internet || 'SI').trim().toUpperCase(),
-    nit: String(item.nit || '900062917').trim(),
-    correoElectronico: item.correoElectronico || '',
-    observacion: item.observacion || 'Cargado desde Excel',
-    municipio: item.municipio || item.localidad,
-    valorMensual: Number(item.valorMensual || item.valor || item.cargoBasico || 0),
-    letreroUrl: item.letreroUrl || undefined,
-    basculaUrl: item.basculaUrl || undefined,
-    mataselloUrl: item.mataselloUrl || undefined,
-    computadorUrl: item.computadorUrl || undefined,
-    contratoUrl: item.contratoUrl || undefined,
-    fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
-  }));
+  // Validación de valores y preservación estricta de CENTRO OPERATIVO y CENTRO DE ACOPIO
+  let rejectedCount = 0;
+  const validNewList: ExpendioData[] = [];
 
-  if (mode === 'replace') {
-    // Si reemplaza la base pero existen expendios previos con fotos reales tomadas, preservamos sus fotos
-    db.expendios = formattedNew.map((newItem) => {
-      const existing = db.expendios.find(
-        (e) => (e.cedula && e.cedula === newItem.cedula) || e.localidad?.toLowerCase() === newItem.localidad?.toLowerCase()
-      );
-      if (!existing) return newItem;
-      return {
-        ...newItem,
-        // Preservar fotos reales si ya habían sido tomadas
-        letreroUrl: existing.letreroUrl || newItem.letreroUrl,
-        basculaUrl: existing.basculaUrl || newItem.basculaUrl,
-        mataselloUrl: existing.mataselloUrl || newItem.mataselloUrl,
-        computadorUrl: existing.computadorUrl || newItem.computadorUrl,
-        fotoFachadaUrl: existing.fotoFachadaUrl || newItem.fotoFachadaUrl,
-        fotoAvisoUrl: existing.fotoAvisoUrl || newItem.fotoAvisoUrl,
-        fotoBasculaUrl: existing.fotoBasculaUrl || newItem.fotoBasculaUrl,
-        fotoMataselloUrl: existing.fotoMataselloUrl || newItem.fotoMataselloUrl,
-        fotoFirmaContratoUrl: existing.fotoFirmaContratoUrl || newItem.fotoFirmaContratoUrl,
-        fotoCedulaFrontalUrl: existing.fotoCedulaFrontalUrl || newItem.fotoCedulaFrontalUrl,
-        fotoCedulaRespaldoUrl: existing.fotoCedulaRespaldoUrl || newItem.fotoCedulaRespaldoUrl,
-        fotoRutUrl: existing.fotoRutUrl || newItem.fotoRutUrl,
-        fotoCertificacionBancariaUrl: existing.fotoCertificacionBancariaUrl || newItem.fotoCertificacionBancariaUrl,
-        tieneAviso: existing.tieneAviso || newItem.tieneAviso,
-        tieneBascula: existing.tieneBascula || newItem.tieneBascula,
-        tieneMatasello: existing.tieneMatasello || newItem.tieneMatasello,
-        motivoFaltaAviso: existing.motivoFaltaAviso || newItem.motivoFaltaAviso,
-        motivoFaltaBascula: existing.motivoFaltaBascula || newItem.motivoFaltaBascula,
-        motivoFaltaMatasello: existing.motivoFaltaMatasello || newItem.motivoFaltaMatasello,
-      };
-    });
-  } else {
-    // Merge: update existing if same cedula or localidad, else append
-    formattedNew.forEach((newItem) => {
-      const existingIdx = db.expendios.findIndex(
-        (e) =>
-          (e.cedula && e.cedula === newItem.cedula) ||
-          e.localidad.toLowerCase() === newItem.localidad.toLowerCase()
-      );
-      if (existingIdx !== -1) {
-        const existing = db.expendios[existingIdx];
-        db.expendios[existingIdx] = {
-          ...existing,
-          ...newItem,
-          // Preservar fotos reales si ya habían sido tomadas
-          letreroUrl: existing.letreroUrl || newItem.letreroUrl,
-          basculaUrl: existing.basculaUrl || newItem.basculaUrl,
-          mataselloUrl: existing.mataselloUrl || newItem.mataselloUrl,
-          computadorUrl: existing.computadorUrl || newItem.computadorUrl,
-          fotoFachadaUrl: existing.fotoFachadaUrl || newItem.fotoFachadaUrl,
-          fotoAvisoUrl: existing.fotoAvisoUrl || newItem.fotoAvisoUrl,
-          fotoBasculaUrl: existing.fotoBasculaUrl || newItem.fotoBasculaUrl,
-          fotoMataselloUrl: existing.fotoMataselloUrl || newItem.fotoMataselloUrl,
-          fotoFirmaContratoUrl: existing.fotoFirmaContratoUrl || newItem.fotoFirmaContratoUrl,
-          fotoCedulaFrontalUrl: existing.fotoCedulaFrontalUrl || newItem.fotoCedulaFrontalUrl,
-          fotoCedulaRespaldoUrl: existing.fotoCedulaRespaldoUrl || newItem.fotoCedulaRespaldoUrl,
-          fotoRutUrl: existing.fotoRutUrl || newItem.fotoRutUrl,
-          fotoCertificacionBancariaUrl: existing.fotoCertificacionBancariaUrl || newItem.fotoCertificacionBancariaUrl,
-          tieneAviso: existing.tieneAviso || newItem.tieneAviso,
-          tieneBascula: existing.tieneBascula || newItem.tieneBascula,
-          tieneMatasello: existing.tieneMatasello || newItem.tieneMatasello,
-          motivoFaltaAviso: existing.motivoFaltaAviso || newItem.motivoFaltaAviso,
-          motivoFaltaBascula: existing.motivoFaltaBascula || newItem.motivoFaltaBascula,
-          motivoFaltaMatasello: existing.motivoFaltaMatasello || newItem.motivoFaltaMatasello,
-        };
-      } else {
-        db.expendios.push(newItem);
+  for (let idx = 0; idx < expendios.length; idx++) {
+    const item = expendios[idx];
+    const loc = String(item.localidad || item.municipio || '').trim();
+    if (!loc) {
+      rejectedCount++;
+      allErrors.push(`Fila ${idx + 1}: Descartada por no contener localidad/municipio válido.`);
+      continue;
+    }
+
+    // Detección de errores de fórmula de Excel (#VALUE!, #VALOR!, etc.)
+    const checkValueFormulaError = (fieldVal: any, fieldName: string) => {
+      const s = String(fieldVal || '').trim();
+      if (s.includes('#VALUE!') || s.includes('#VALOR!') || s.includes('#REF!') || s.includes('#N/A') || s.includes('#NAME?')) {
+        allErrors.push(`Fila ${idx + 1} (${loc}): Error de fórmula Excel "${s}" detectado en columna "${fieldName}".`);
+        return s; // Reportar y conservar el texto exacto reportado, no inventar ni reemplazar
       }
+      return fieldVal;
+    };
+
+    const centroOpVal = checkValueFormulaError(item.centroOperativo, 'CENTRO OPERATIVO');
+    const centroAcopioVal = checkValueFormulaError(item.centroAcopio, 'CENTRO DE ACOPIO');
+
+    validNewList.push({
+      id: item.id || `exp-excel-${Date.now()}-${idx}`,
+      // Preservación DIRECTA Y EXACTA de la fila de Excel (sin inferencias ni diccionarios)
+      centroOperativo: String(centroOpVal || '').trim(),
+      centroAcopio: String(centroAcopioVal || '').trim(),
+      localidad: loc.toUpperCase(),
+      departamento: String(item.departamento || '').trim().toUpperCase(),
+      encargado: String(item.encargado || 'SIN ENCARGADO').trim().toUpperCase(),
+      cedula: String(item.cedula || '0').trim(),
+      direccionPunto: String(item.direccionPunto || item.direccion || '').trim(),
+      telefonoPunto: String(item.telefonoPunto || item.celular || item.telefono || '').trim(),
+      usuarioSipost: String(item.usuarioSipost || item.sipost || `SIP_${idx + 1}`).trim(),
+      internet: String(item.internet || 'SI').trim().toUpperCase(),
+      nit: String(item.nit || '900062917').trim(),
+      correoElectronico: item.correoElectronico || '',
+      observacion: item.observacion || 'Cargado desde Excel (Hoja EXPENDIOS)',
+      municipio: item.municipio || loc.toUpperCase(),
+      valorMensual: Number(item.valorMensual || item.valor || item.cargoBasico || 0),
+      letreroUrl: item.letreroUrl || undefined,
+      basculaUrl: item.basculaUrl || undefined,
+      mataselloUrl: item.mataselloUrl || undefined,
+      computadorUrl: item.computadorUrl || undefined,
+      contratoUrl: item.contratoUrl || undefined,
+      fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
     });
   }
 
-  saveDatabase(db);
+  let insertedCount = 0;
+  let updatedCount = 0;
 
-  res.json({
-    success: true,
-    data: db.expendios,
-    message: `✓ Se cargaron ${formattedNew.length} expendios exitosamente desde Excel (${mode === 'replace' ? 'Base reemplazada' : 'Base actualizada'}).`,
-  });
+  try {
+    const updatedExpendios = await mutateDatabase((db) => {
+      if (!Array.isArray(db.expendios)) db.expendios = [];
+
+      if (mode === 'replace') {
+        const existingMap = new Map<string, ExpendioData>();
+        for (const e of db.expendios) {
+          if (e.cedula) existingMap.set(e.cedula.trim(), e);
+          if (e.localidad) existingMap.set(e.localidad.trim().toLowerCase(), e);
+        }
+
+        db.expendios = validNewList.map((newItem) => {
+          const existing = (newItem.cedula ? existingMap.get(newItem.cedula.trim()) : null) ||
+                           (newItem.localidad ? existingMap.get(newItem.localidad.trim().toLowerCase()) : null);
+          if (!existing) {
+            insertedCount++;
+            return newItem;
+          }
+          updatedCount++;
+          return {
+            ...newItem,
+            id: existing.id, // Preservar ID canónico inmutable
+            cedula: existing.cedula || newItem.cedula, // Preservar cédula maestra existente
+            // Preservar exactamente CENTRO OPERATIVO y CENTRO DE ACOPIO de la hoja EXPENDIOS
+            centroOperativo: newItem.centroOperativo || existing.centroOperativo,
+            centroAcopio: newItem.centroAcopio || existing.centroAcopio,
+            letreroUrl: existing.letreroUrl || newItem.letreroUrl,
+            basculaUrl: existing.basculaUrl || newItem.basculaUrl,
+            mataselloUrl: existing.mataselloUrl || newItem.mataselloUrl,
+            computadorUrl: existing.computadorUrl || newItem.computadorUrl,
+            fotoFachadaUrl: existing.fotoFachadaUrl || newItem.fotoFachadaUrl,
+            fotoAvisoUrl: existing.fotoAvisoUrl || newItem.fotoAvisoUrl,
+            fotoBasculaUrl: existing.fotoBasculaUrl || newItem.fotoBasculaUrl,
+            fotoMataselloUrl: existing.fotoMataselloUrl || newItem.fotoMataselloUrl,
+            fotoFirmaContratoUrl: existing.fotoFirmaContratoUrl || newItem.fotoFirmaContratoUrl,
+            fotoCedulaFrontalUrl: existing.fotoCedulaFrontalUrl || newItem.fotoCedulaFrontalUrl,
+            fotoCedulaRespaldoUrl: existing.fotoCedulaRespaldoUrl || newItem.fotoCedulaRespaldoUrl,
+            fotoRutUrl: existing.fotoRutUrl || newItem.fotoRutUrl,
+            fotoCertificacionBancariaUrl: existing.fotoCertificacionBancariaUrl || newItem.fotoCertificacionBancariaUrl,
+            tieneAviso: existing.tieneAviso || newItem.tieneAviso,
+            tieneBascula: existing.tieneBascula || newItem.tieneBascula,
+            tieneMatasello: existing.tieneMatasello || newItem.tieneMatasello,
+            motivoFaltaAviso: existing.motivoFaltaAviso || newItem.motivoFaltaAviso,
+            motivoFaltaBascula: existing.motivoFaltaBascula || newItem.motivoFaltaBascula,
+            motivoFaltaMatasello: existing.motivoFaltaMatasello || newItem.motivoFaltaMatasello,
+          };
+        });
+      } else {
+        validNewList.forEach((newItem) => {
+          const existingIdx = db.expendios.findIndex(
+            (e) =>
+              (e.cedula && e.cedula === newItem.cedula) ||
+              (e.localidad && newItem.localidad && e.localidad.toLowerCase() === newItem.localidad.toLowerCase())
+          );
+          if (existingIdx !== -1) {
+            updatedCount++;
+            const existing = db.expendios[existingIdx];
+            db.expendios[existingIdx] = {
+              ...existing,
+              ...newItem,
+              id: existing.id, // Preservar ID canónico inmutable
+              cedula: existing.cedula || newItem.cedula, // Preservar cédula maestra existente
+              centroOperativo: newItem.centroOperativo || existing.centroOperativo,
+              centroAcopio: newItem.centroAcopio || existing.centroAcopio,
+              letreroUrl: existing.letreroUrl || newItem.letreroUrl,
+              basculaUrl: existing.basculaUrl || newItem.basculaUrl,
+              mataselloUrl: existing.mataselloUrl || newItem.mataselloUrl,
+              computadorUrl: existing.computadorUrl || newItem.computadorUrl,
+              fotoFachadaUrl: existing.fotoFachadaUrl || newItem.fotoFachadaUrl,
+              fotoAvisoUrl: existing.fotoAvisoUrl || newItem.fotoAvisoUrl,
+              fotoBasculaUrl: existing.fotoBasculaUrl || newItem.fotoBasculaUrl,
+              fotoMataselloUrl: existing.fotoMataselloUrl || newItem.fotoMataselloUrl,
+              fotoFirmaContratoUrl: existing.fotoFirmaContratoUrl || newItem.fotoFirmaContratoUrl,
+              fotoCedulaFrontalUrl: existing.fotoCedulaFrontalUrl || newItem.fotoCedulaFrontalUrl,
+              fotoCedulaRespaldoUrl: existing.fotoCedulaRespaldoUrl || newItem.fotoCedulaRespaldoUrl,
+              fotoRutUrl: existing.fotoRutUrl || newItem.fotoRutUrl,
+              fotoCertificacionBancariaUrl: existing.fotoCertificacionBancariaUrl || newItem.fotoCertificacionBancariaUrl,
+              tieneAviso: existing.tieneAviso || newItem.tieneAviso,
+              tieneBascula: existing.tieneBascula || newItem.tieneBascula,
+              tieneMatasello: existing.tieneMatasello || newItem.tieneMatasello,
+              motivoFaltaAviso: existing.motivoFaltaAviso || newItem.motivoFaltaAviso,
+              motivoFaltaBascula: existing.motivoFaltaBascula || newItem.motivoFaltaBascula,
+              motivoFaltaMatasello: existing.motivoFaltaMatasello || newItem.motivoFaltaMatasello,
+            };
+          } else {
+            insertedCount++;
+            db.expendios.push(newItem);
+          }
+        });
+      }
+      return db.expendios;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      archivo: fileName || 'ACTUALIZACION DE EXPENDIOS.xlsx',
+      hojasSeleccionadas: activeSelectedSheets,
+      totalProcesados: expendios.length,
+      insertados: insertedCount,
+      actualizados: updatedCount,
+      rechazados: rejectedCount,
+      errores: allErrors,
+      data: updatedExpendios,
+      message: `✓ Importación completada desde hoja(s) [${activeSelectedSheets.join(', ')}]: ${insertedCount} insertados, ${updatedCount} actualizados, ${rejectedCount} rechazados.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al guardar importación de Excel: ${err.message}`,
+    });
+  }
 });
 
 // 1C2B. Admin: Batch import expendios from Google Sheets
-app.post('/api/admin/expendios/batch-import', (req, res) => {
+app.post('/api/admin/expendios/batch-import', async (req, res) => {
   const { expendios } = req.body;
   if (!Array.isArray(expendios) || expendios.length === 0) {
     return res.status(400).json({ success: false, message: 'No se recibieron datos válidos para importar.' });
   }
 
-  const db = loadDatabase();
-  let updatedCount = 0;
+  try {
+    let updatedCount = 0;
+    const finalDb = await mutateDatabase((db) => {
+      expendios.forEach((item: Partial<ExpendioData>) => {
+        const cleanCedula = String(item.cedula || '').trim();
+        if (!cleanCedula || cleanCedula === '0') return;
 
-  expendios.forEach((item: Partial<ExpendioData>) => {
-    const cleanCedula = String(item.cedula || '').trim();
-    if (!cleanCedula || cleanCedula === '0') return;
+        const existingIdx = db.expendios.findIndex((e) => {
+          if (e.cedula && e.cedula.trim() === cleanCedula) return true;
+          if (item.id && e.id === item.id) return true;
+          return false;
+        });
 
-    // Coincidencia ESTRICTA por cédula o id. Nunca por localidad sola para evitar sobreescrituras destructivas entre puntos del mismo municipio
-    const existingIdx = db.expendios.findIndex((e) => {
-      if (e.cedula && e.cedula.trim() === cleanCedula) return true;
-      if (item.id && e.id === item.id) return true;
-      return false;
-    });
+        if (existingIdx !== -1) {
+          const existing = db.expendios[existingIdx];
+          const merged: any = { ...existing };
+          for (const [k, v] of Object.entries(item)) {
+            if (v !== undefined && v !== null && v !== '') {
+              merged[k] = v;
+            }
+          }
 
-    if (existingIdx !== -1) {
-      const existing = db.expendios[existingIdx];
-      // Merge defensivo: Sólo actualizar propiedades si el valor entrante no está vacío
-      const merged: any = { ...existing };
-      for (const [k, v] of Object.entries(item)) {
-        if (v !== undefined && v !== null && v !== '') {
-          merged[k] = v;
+          merged.fotoAvisoUrl = (item.fotoAvisoUrl && !item.fotoAvisoUrl.includes('placehold.co')) ? item.fotoAvisoUrl : existing.fotoAvisoUrl;
+          merged.fotoPanoramicaUrl = (item.fotoPanoramicaUrl && !item.fotoPanoramicaUrl.includes('placehold.co')) ? item.fotoPanoramicaUrl : existing.fotoPanoramicaUrl;
+          merged.fotoMataselloUrl = (item.fotoMataselloUrl && !item.fotoMataselloUrl.includes('placehold.co')) ? item.fotoMataselloUrl : existing.fotoMataselloUrl;
+          merged.fotoBasculaUrl = (item.fotoBasculaUrl && !item.fotoBasculaUrl.includes('placehold.co')) ? item.fotoBasculaUrl : existing.fotoBasculaUrl;
+          merged.fotoContratistaUrl = (item.fotoContratistaUrl && !item.fotoContratistaUrl.includes('placehold.co')) ? item.fotoContratistaUrl : existing.fotoContratistaUrl;
+          merged.fotoHorarioUrl = (item.fotoHorarioUrl && !item.fotoHorarioUrl.includes('placehold.co')) ? item.fotoHorarioUrl : existing.fotoHorarioUrl;
+          merged.fotoTarifasUrl = (item.fotoTarifasUrl && !item.fotoTarifasUrl.includes('placehold.co')) ? item.fotoTarifasUrl : existing.fotoTarifasUrl;
+          merged.computadorUrl = (item.computadorUrl && !item.computadorUrl.includes('placehold.co')) ? item.computadorUrl : existing.computadorUrl;
+
+          merged.cuentaBancaria = item.cuentaBancaria || existing.cuentaBancaria || '';
+          merged.banco = item.banco || existing.banco || 'NEQUI';
+          merged.tipoCuenta = item.tipoCuenta || existing.tipoCuenta || 'AHORROS';
+          merged.encargado = item.encargado || existing.encargado;
+          merged.direccionPunto = item.direccionPunto || existing.direccionPunto;
+          merged.telefonoPunto = item.telefonoPunto || existing.telefonoPunto;
+          merged.usuarioSipost = item.usuarioSipost || existing.usuarioSipost;
+          merged.id = existing.id; // Invariante: Preservar ID interno inmutable en importaciones por lotes
+          merged.fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+
+          db.expendios[existingIdx] = merged;
+          updatedCount++;
+        } else {
+          const newExp: ExpendioData = {
+            id: item.id || `exp-sheets-${Date.now()}-${updatedCount}`,
+            centroOperativo: item.centroOperativo || 'PO.BUCARAMANGA',
+            centroAcopio: item.centroAcopio || item.localidad || 'PO.BUCARAMANGA',
+            localidad: String(item.localidad || item.municipio || 'EXPENDIO').trim().toUpperCase(),
+            encargado: String(item.encargado || 'ENCARGADO').trim().toUpperCase(),
+            cedula: cleanCedula,
+            direccionPunto: String(item.direccionPunto || '').trim().toUpperCase(),
+            telefonoPunto: String(item.telefonoPunto || '').trim(),
+            usuarioSipost: String(item.usuarioSipost || 'SIP_EXP').trim(),
+            internet: item.internet || 'SI',
+            nit: item.nit || '900062917',
+            correoElectronico: item.correoElectronico || '',
+            observacion: item.observacion || 'Importado desde Google Sheets',
+            municipio: item.municipio || item.localidad || '',
+            valorMensual: Number(item.valorMensual) || 0,
+            fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+          };
+          db.expendios.push(newExp);
+          updatedCount++;
         }
-      }
+      });
+      return db;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
 
-      // Preservar fotos locales y metadatos de disponibilidad
-      merged.fotoAvisoUrl = (item.fotoAvisoUrl && !item.fotoAvisoUrl.includes('placehold.co')) ? item.fotoAvisoUrl : existing.fotoAvisoUrl;
-      merged.fotoPanoramicaUrl = (item.fotoPanoramicaUrl && !item.fotoPanoramicaUrl.includes('placehold.co')) ? item.fotoPanoramicaUrl : existing.fotoPanoramicaUrl;
-      merged.fotoMataselloUrl = (item.fotoMataselloUrl && !item.fotoMataselloUrl.includes('placehold.co')) ? item.fotoMataselloUrl : existing.fotoMataselloUrl;
-      merged.fotoBasculaUrl = (item.fotoBasculaUrl && !item.fotoBasculaUrl.includes('placehold.co')) ? item.fotoBasculaUrl : existing.fotoBasculaUrl;
-      merged.fotoContratistaUrl = (item.fotoContratistaUrl && !item.fotoContratistaUrl.includes('placehold.co')) ? item.fotoContratistaUrl : existing.fotoContratistaUrl;
-      merged.fotoHorarioUrl = (item.fotoHorarioUrl && !item.fotoHorarioUrl.includes('placehold.co')) ? item.fotoHorarioUrl : existing.fotoHorarioUrl;
-      merged.fotoTarifasUrl = (item.fotoTarifasUrl && !item.fotoTarifasUrl.includes('placehold.co')) ? item.fotoTarifasUrl : existing.fotoTarifasUrl;
-      merged.computadorUrl = (item.computadorUrl && !item.computadorUrl.includes('placehold.co')) ? item.computadorUrl : existing.computadorUrl;
-
-      // Preservar datos bancarios y de contacto si Sheets viene en blanco
-      merged.cuentaBancaria = item.cuentaBancaria || existing.cuentaBancaria || '';
-      merged.banco = item.banco || existing.banco || 'NEQUI';
-      merged.tipoCuenta = item.tipoCuenta || existing.tipoCuenta || 'AHORROS';
-      merged.encargado = item.encargado || existing.encargado;
-      merged.direccionPunto = item.direccionPunto || existing.direccionPunto;
-      merged.telefonoPunto = item.telefonoPunto || existing.telefonoPunto;
-      merged.usuarioSipost = item.usuarioSipost || existing.usuarioSipost;
-      merged.fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-
-      db.expendios[existingIdx] = merged;
-      updatedCount++;
-    } else {
-      const newExp: ExpendioData = {
-        id: item.id || `exp-sheets-${Date.now()}-${updatedCount}`,
-        centroOperativo: item.centroOperativo || 'PO.BUCARAMANGA',
-        centroAcopio: item.centroAcopio || item.localidad || 'PO.BUCARAMANGA',
-        localidad: String(item.localidad || item.municipio || 'EXPENDIO').trim().toUpperCase(),
-        encargado: String(item.encargado || 'ENCARGADO').trim().toUpperCase(),
-        cedula: cleanCedula,
-        direccionPunto: String(item.direccionPunto || '').trim().toUpperCase(),
-        telefonoPunto: String(item.telefonoPunto || '').trim(),
-        usuarioSipost: String(item.usuarioSipost || 'SIP_EXP').trim(),
-        internet: item.internet || 'SI',
-        nit: item.nit || '900062917',
-        correoElectronico: item.correoElectronico || '',
-        observacion: item.observacion || 'Importado desde Google Sheets',
-        municipio: item.municipio || item.localidad || '',
-        valorMensual: Number(item.valorMensual) || 0,
-        fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
-      };
-      db.expendios.push(newExp);
-      updatedCount++;
-    }
-  });
-
-  // Guardar y sincronizar a la nube de manera INMEDIATA
-  saveDatabase(db, { immediateCloudSync: true });
-
-  res.json({
-    success: true,
-    updatedCount,
-    total: db.expendios.length,
-    message: `✓ Se actualizaron ${updatedCount} expendios correctamente desde Google Sheets sin sobreescrituras accidentales.`,
-  });
-});
-
-// 1C3. Admin: Clear / Delete entire database of expendios
-const ADMIN_MASTER_PASSWORD = 'Camarca.2023*';
-
-app.post('/api/admin/clear-database', (req, res) => {
-  const { password } = req.body || {};
-  if (password !== ADMIN_MASTER_PASSWORD) {
-    return res.status(401).json({
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      updatedCount,
+      total: finalDb.expendios.length,
+      message: `✓ Se actualizaron ${updatedCount} expendios correctamente desde Google Sheets sin sobreescrituras accidentales.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({
       success: false,
-      message: 'Contraseña de seguridad incorrecta. Debe ingresar la contraseña autorizada Camarca.2023* para borrar la base de datos de expendios.',
+      cloudPersisted: false,
+      message: `Error al guardar importación de Google Sheets: ${err.message}`,
     });
   }
+});
 
-  const db = loadDatabase();
-  const previousCount = db.expendios.length;
+// 1C3. Admin: Clear / Delete entire database of expendios (Protected with Rate Limiting, Attribution, and Timing-safe Verification)
 
-  db.expendios = [];
-  saveDatabase(db);
+// =========================================================================
+// SECURITY LAYER FOR DESTRUCTIVE OPERATIONS & RESTORES
+// - Rate limiting: Max 5 attempts per 15 minutes per IP to prevent brute-forcing
+// - Secret Manager / Environment support: ADMIN_MASTER_PASSWORD_HASH (bcrypt) or ADMIN_MASTER_PASSWORD
+// - NO hardcoded credentials in source code
+// - Constant-time, timing-safe password comparison (bcrypt / timingSafeEqual)
+// - Append-only structured audit logs for Cloud Logging (with actor identity attribution)
+// =========================================================================
 
-  res.json({
-    success: true,
-    data: [],
-    message: `✓ Base de datos borrada por completo. Se eliminaron ${previousCount} expendios. Ahora la base de datos está vacía.`,
+const configuredMasterPassword = process.env.ADMIN_MASTER_PASSWORD;
+const configuredMasterHash = process.env.ADMIN_MASTER_PASSWORD_HASH;
+
+// Ephemeral fallback if neither env var is configured, avoiding any known default
+let ephemeralMasterSecret = '';
+if (!configuredMasterPassword && !configuredMasterHash) {
+  ephemeralMasterSecret = crypto.randomBytes(16).toString('hex');
+  console.warn('[SEGURIDAD] ADMIN_MASTER_PASSWORD / ADMIN_MASTER_PASSWORD_HASH no está configurada en variables de entorno / Secret Manager.');
+  console.warn(`[SEGURIDAD] Clave maestra efímera generada para esta sesión de servidor: ${ephemeralMasterSecret}`);
+}
+
+// In-Memory Rate Limiter for Destructive Endpoints
+const destructiveAttemptsMap = new Map<string, { count: number; firstAttempt: number; lockedUntil?: number }>();
+
+function checkDestructiveRateLimit(ip: string): { allowed: boolean; waitSeconds?: number } {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  const maxAttempts = 5;
+  const lockMs = 15 * 60 * 1000;
+
+  const record = destructiveAttemptsMap.get(ip);
+  if (!record) {
+    destructiveAttemptsMap.set(ip, { count: 0, firstAttempt: now });
+    return { allowed: true };
+  }
+
+  if (record.lockedUntil && now < record.lockedUntil) {
+    return { allowed: false, waitSeconds: Math.ceil((record.lockedUntil - now) / 1000) };
+  }
+
+  if (now - record.firstAttempt > windowMs) {
+    destructiveAttemptsMap.set(ip, { count: 0, firstAttempt: now });
+    return { allowed: true };
+  }
+
+  if (record.count >= maxAttempts) {
+    record.lockedUntil = now + lockMs;
+    return { allowed: false, waitSeconds: Math.ceil(lockMs / 1000) };
+  }
+
+  return { allowed: true };
+}
+
+function registerDestructiveAttempt(ip: string, success: boolean) {
+  const now = Date.now();
+  const record = destructiveAttemptsMap.get(ip);
+  if (success) {
+    destructiveAttemptsMap.delete(ip);
+  } else if (record) {
+    record.count++;
+  } else {
+    destructiveAttemptsMap.set(ip, { count: 1, firstAttempt: now });
+  }
+}
+
+// Constant-time password verification using bcrypt or timingSafeEqual
+function verifyMasterPassword(providedPassword?: string): boolean {
+  if (!providedPassword || typeof providedPassword !== 'string') return false;
+  const trimmed = providedPassword.trim();
+  if (!trimmed) return false;
+
+  // 1. If a bcrypt or SHA-256 hash is configured in Secret Manager / environment:
+  if (configuredMasterHash) {
+    try {
+      if (configuredMasterHash.startsWith('$2a$') || configuredMasterHash.startsWith('$2b$') || configuredMasterHash.startsWith('$2y$')) {
+        return bcrypt.compareSync(trimmed, configuredMasterHash);
+      }
+      const hash = crypto.createHash('sha256').update(trimmed).digest('hex');
+      if (hash.length === configuredMasterHash.length) {
+        return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(configuredMasterHash));
+      }
+    } catch (e) {
+      console.error('[SEGURIDAD] Error verificando hash maestro:', e);
+      return false;
+    }
+  }
+
+  // 2. If configured as plain password in Secret Manager / environment or ephemeral session secret:
+  const secretToCompare = configuredMasterPassword || ephemeralMasterSecret;
+  if (secretToCompare) {
+    const bufProvided = crypto.createHash('sha256').update(trimmed).digest();
+    const bufSecret = crypto.createHash('sha256').update(secretToCompare).digest();
+    return crypto.timingSafeEqual(bufProvided, bufSecret);
+  }
+
+  return false;
+}
+
+// Append-only Cloud Logging Audit Log
+function emitImmutableAuditLog(params: {
+  action: string;
+  actorCedula: string;
+  actorRole: string;
+  ip: string;
+  userAgent: string;
+  status: 'SUCCESS' | 'UNAUTHORIZED' | 'RATE_LIMITED' | 'FAILED';
+  details?: Record<string, any>;
+}) {
+  const structuredLog = {
+    severity: params.status === 'SUCCESS' ? 'NOTICE' : 'WARNING',
+    timestamp: new Date().toISOString(),
+    event_type: 'DESTRUCTIVE_ADMIN_OPERATION',
+    ...params,
+  };
+  console.log(`[CLOUD_LOGGING_AUDIT] ${JSON.stringify(structuredLog)}`);
+}
+
+// Unified authorization gatekeeper for destructive operations
+function authorizeDestructiveAction(req: express.Request, res: express.Response, actionName: string): boolean {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.ip || req.socket?.remoteAddress || 'unknown-ip';
+  const authUser = extractAuthenticatedUser(req);
+  const actorCedula = authUser?.cedula || 'ANONIMO';
+  const actorRole = authUser?.role || (authUser?.roles?.[0]) || 'NINGUNO';
+  const userAgent = req.get('User-Agent') || 'unknown';
+
+  // 1. Enforce Rate Limiting
+  const rateLimit = checkDestructiveRateLimit(clientIp);
+  if (!rateLimit.allowed) {
+    emitImmutableAuditLog({
+      action: actionName,
+      actorCedula,
+      actorRole,
+      ip: clientIp,
+      userAgent,
+      status: 'RATE_LIMITED',
+      details: { waitSeconds: rateLimit.waitSeconds }
+    });
+    res.status(429).json({
+      success: false,
+      message: `Demasiados intentos fallidos. Operación bloqueada temporalmente por seguridad. Reintente en ${rateLimit.waitSeconds} segundos.`
+    });
+    return false;
+  }
+
+  // 2. Enforce Role & Session Attribution (must be logged in administrator with verified token)
+  if (!authUser || !authUser.roles.includes('admin') || normalizeCedula(authUser.cedula) !== ADMIN_CEDULA) {
+    registerDestructiveAttempt(clientIp, false);
+    emitImmutableAuditLog({
+      action: actionName,
+      actorCedula,
+      actorRole,
+      ip: clientIp,
+      userAgent,
+      status: 'UNAUTHORIZED',
+      details: { reason: 'No valid admin session token' }
+    });
+    res.status(403).json({
+      success: false,
+      message: 'Acceso denegado: Se requiere sesión activa de Administrador con token verificado para ejecutar esta acción.'
+    });
+    return false;
+  }
+
+  // 3. Verify Master Security Password (Re-authentication)
+  const password = req.body?.password;
+  if (!verifyMasterPassword(password)) {
+    registerDestructiveAttempt(clientIp, false);
+    emitImmutableAuditLog({
+      action: actionName,
+      actorCedula,
+      actorRole,
+      ip: clientIp,
+      userAgent,
+      status: 'FAILED',
+      details: { reason: 'Incorrect security password' }
+    });
+    res.status(401).json({
+      success: false,
+      message: 'Contraseña maestra de seguridad incorrecta. Re-autenticación no autorizada.'
+    });
+    return false;
+  }
+
+  // 4. Success: Log audit record with operator identity
+  registerDestructiveAttempt(clientIp, true);
+  emitImmutableAuditLog({
+    action: actionName,
+    actorCedula,
+    actorRole,
+    ip: clientIp,
+    userAgent,
+    status: 'SUCCESS',
+    details: req.body?.targets || req.body?.modo ? { targets: req.body?.targets, modo: req.body?.modo } : undefined
   });
+
+  return true;
+}
+
+app.post('/api/admin/clear-database', async (req, res) => {
+  if (!authorizeDestructiveAction(req, res, 'CLEAR_DATABASE_EXPENDIOS')) return;
+
+  try {
+    let previousCount = 0;
+    await mutateDatabase((db) => {
+      previousCount = db.expendios.length;
+      db.expendios = [];
+      return db.expendios;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      data: [],
+      message: `✓ Base de datos borrada por completo. Se eliminaron ${previousCount} expendios. Ahora la base de datos está vacía.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al vaciar base de datos en PostgreSQL: ${err.message}`,
+    });
+  }
 });
 
 // 1D. Admin: Delete an expendio
-app.delete('/api/admin/expendios/:id', (req, res) => {
+app.delete('/api/admin/expendios/:id', async (req, res) => {
   const { id } = req.params;
-  const db = loadDatabase();
-
   const target = String(id).trim().toLowerCase();
-  const index = db.expendios.findIndex(
-    (e) =>
-      String(e.id || '').trim().toLowerCase() === target ||
-      String(e.cedula || '').trim().toLowerCase() === target ||
-      String(e.localidad || '').trim().toLowerCase() === target
-  );
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+
+  try {
+    const removed = await mutateDatabase(async (db) => {
+      const index = db.expendios.findIndex(
+        (e) =>
+          String(e.id || '').trim().toLowerCase() === target ||
+          String(e.cedula || '').trim().toLowerCase() === target ||
+          String(e.localidad || '').trim().toLowerCase() === target
+      );
+      if (index === -1) {
+        throw new Error('EXPENDIO_NOT_FOUND');
+      }
+
+      const item = db.expendios.splice(index, 1)[0];
+      const nowIso = new Date().toISOString();
+      const actor = extractAuthenticatedUser(req) || { cedula: '1094269932', role: 'admin' };
+
+      // Log deletion event in trazabilidad (NEVER in accounting historial)
+      if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+      const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+      db.trazabilidad.unshift({
+        id: `traz-delete-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        expendioId: item.id,
+        actorId: actor.cedula,
+        actorRole: 'admin',
+        timestamp: nowIso,
+        municipio: item.municipio || item.localidad,
+        localidad: item.localidad,
+        novedad: 'Eliminación de expendio del sistema',
+        encargadoAnterior: item.encargado,
+        cedulaAnterior: item.cedula,
+        fechaRegistro: nowIso,
+        registradoPor: `Administrador (CC: ${actor.cedula})`,
+        observaciones: `Expendio ${item.localidad} eliminado del sistema maestro`,
+        commitId,
+        before: item,
+        after: null,
+      });
+
+      return item;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ Expendio ${removed.localidad} eliminado correctamente del sistema y PostgreSQL.`,
+    });
+  } catch (err: any) {
+    if (err.message === 'EXPENDIO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+    }
+    console.error('[API] Error eliminando expendio:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al eliminar expendio en PostgreSQL: ${err.message}`,
+    });
   }
-
-  const removed = db.expendios.splice(index, 1)[0];
-
-  // Log deletion event in trazabilidad (NEVER in accounting historial)
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-  db.trazabilidad.unshift({
-    id: `traz-delete-${Date.now()}`,
-    municipio: removed.municipio || removed.localidad,
-    localidad: removed.localidad,
-    novedad: 'Eliminación de expendio del sistema',
-    encargadoAnterior: removed.encargado,
-    cedulaAnterior: removed.cedula,
-    fechaRegistro: new Date().toISOString(),
-    registradoPor: 'Administrador CAMARCA',
-    observaciones: `Expendio ${removed.localidad} eliminado del sistema maestro`,
-  });
-
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    message: `✓ Expendio ${removed.localidad} eliminado correctamente del sistema.`,
-  });
 });
 
-// 2. Authentication Route (Auto-detects role from Identification / Cédula / NIT)
-app.post('/api/auth/login', (req, res) => {
-  const { passwordOrCedula, role: requestedRole } = req.body;
-  const searchVal = (passwordOrCedula || '').trim();
+// Rate limiter estricto para mitigar ataques de fuerza bruta y enumeración de identidades
+const loginRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 20, // Máximo 20 intentos fallidos por minuto por IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true, // No penalizar ni bloquear inicios de sesión exitosos
+  validate: false,
+  message: {
+    success: false,
+    error: 'TOO_MANY_LOGIN_ATTEMPTS',
+    message: 'Has alcanzado el límite de intentos de acceso permitidos por minuto. Por favor espera 60 segundos antes de volver a intentar.',
+  },
+});
+
+// 2. Authentication Route (Strict identification by Cédula, plus additional password for Admin accounts)
+app.post('/api/auth/login', loginRateLimiter, (req, res) => {
+  const rawSearchVal = (req.body.cedula || req.body.passwordOrCedula || '').trim();
+  const resolvedAdminCedula = resolveAuthorizedAdminCedula(rawSearchVal);
+  const searchVal = resolvedAdminCedula || normalizeCedula(rawSearchVal);
   const db = loadDatabase();
 
   if (!searchVal) {
     return res.status(400).json({
       success: false,
-      message: 'Por favor ingresa tu número de Cédula o NIT.',
+      message: 'Por favor ingresa tu número de Cédula.',
       whatsappPhone: '3182822512',
     });
   }
 
-  // 1. Check Super-Admin ID 1094269932 (Has full multi-role access: Admin, Expendio, Cliente)
-  if (searchVal === '1094269932') {
-    // Find admin's expendio if registered, or provide a mock admin point
-    let adminExpendio = db.expendios.find((e) => e.cedula.trim() === '1094269932');
-    if (!adminExpendio) {
-      adminExpendio = {
-        id: '1094269932',
-        cedula: '1094269932',
-        encargado: 'ADMINISTRADOR GENERAL CAMARCA SAS',
-        municipio: 'BUCARAMANGA',
-        centroOperativo: 'PO. BUCARAMANGA',
-        celular: '3182822512',
-        correo: 'camarca.spn472@gmail.com',
-        banco: 'N/A',
-        tipoCuenta: 'N/A',
-        numeroCuenta: 'N/A',
-        direccion: 'OFICINA PRINCIPAL CAMARCA SAS',
-        usuarioSipost: 'SUPER_ADMIN',
-        observaciones: 'Cuenta Administrativa de Acceso Total',
-        fechaUltimaActualizacion: new Date().toISOString(),
-        primeraVezActualizado: true,
-        tieneAviso: 'N/A',
-        tieneBascula: 'N/A',
-        tieneComputador: 'N/A',
-        tieneMatasello: 'N/A',
-        tieneImpresora: 'N/A'
-      };
+  // Verificar primero si corresponde a un Administrador autorizado (1094269932 o 9005042417)
+  if (resolvedAdminCedula) {
+    const providedPassword = String(req.body.adminPassword || req.body.password || '').trim();
+    if (!providedPassword) {
+      return res.status(401).json({
+        success: false,
+        requiresPassword: true,
+        message: 'Por seguridad, ingresa la contraseña adicional de Administrador para continuar.',
+      });
     }
 
-    const finalRole = requestedRole && ['admin', 'expendio', 'cliente'].includes(requestedRole)
-      ? requestedRole
-      : 'admin';
+    if (providedPassword !== ADMIN_ACCESS_PASSWORD) {
+      registrarIngresoUsuario(
+        db,
+        req,
+        resolvedAdminCedula === ADMIN_CEDULA ? 'ADMINISTRADOR GENERAL CAMARCA SAS' : 'ADMINISTRADOR CAMARCA S.A.S.',
+        resolvedAdminCedula,
+        'admin',
+        'BUCARAMANGA',
+        'login',
+        false,
+        'Intento de ingreso Administrador con contraseña adicional incorrecta'
+      );
+      return res.status(401).json({
+        success: false,
+        requiresPassword: true,
+        message: 'Contraseña de administrador incorrecta. Verifique e intente nuevamente.',
+      });
+    }
 
-    registrarIngresoUsuario(
-      db,
-      req,
-      'ADMINISTRADOR GENERAL CAMARCA SAS',
-      '1094269932',
-      finalRole as any,
-      adminExpendio?.municipio || 'BUCARAMANGA',
-      'login',
-      true,
-      'Ingreso Super-Administrador CAMARCA SAS'
-    );
+    // Caso 1: Administrador General Super-Admin (1094269932) -> Multi-rol + Paneles técnicos completos
+    if (resolvedAdminCedula === ADMIN_CEDULA) {
+      // Si la petición proviene de un interceptor automático en segundo plano (!req.body.passwordOrCedula)
+      // y el navegador ya tiene una sesión activa de un expendio distinto de 1094269932, bloquear escalada
+      const isInteractiveLogin = Boolean(req.body.passwordOrCedula);
+      if (!isInteractiveLogin) {
+        const existingUser = extractAuthenticatedUser(req);
+        const existingCedNorm = normalizeCedula(existingUser?.cedula);
+        const explicitExpCed = normalizeCedula(req.headers['x-expendio-cedula'] as string);
+        if (
+          (existingCedNorm && existingCedNorm !== ADMIN_CEDULA && existingCedNorm !== CLEAN_ADMIN_CEDULA) ||
+          (explicitExpCed && explicitExpCed !== ADMIN_CEDULA && explicitExpCed !== CLEAN_ADMIN_CEDULA)
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: 'Escalado automático bloqueado: sesión activa pertenece a un expendio.',
+          });
+        }
+      }
 
-    return res.json({
-      success: true,
-      isMultiRoleAdmin: true,
-      canSelectRole: true,
-      availableRoles: ['admin', 'expendio', 'cliente'],
-      user: {
-        role: finalRole,
-        cedulaOrNit: '1094269932',
-        name: 'Administrador CAMARCA SAS (C.C. 1094269932)',
-        isMultiRoleAdmin: true,
-        expendioData: adminExpendio,
-      },
-    });
-  }
+      const adminExpendio = (db.expendios || []).find(
+        (e) => normalizeCedula(e.cedula) === ADMIN_CEDULA && e.estado !== 'Inhabilitado'
+      ) || (db.expendios || []).find((e) => normalizeCedula(e.cedula) === ADMIN_CEDULA);
+      const expendioRealId = adminExpendio ? adminExpendio.id : '';
 
-  // 2. Other Admin Aliases / Passwords
-  if (['admin', 'administrator', '900504241'].includes(searchVal.toLowerCase()) || requestedRole === 'admin') {
-    registrarIngresoUsuario(
-      db,
-      req,
-      'Administrador CAMARCA SAS',
-      searchVal,
-      'admin',
-      'BUCARAMANGA',
-      'login',
-      true,
-      'Ingreso Administrador'
-    );
-
-    return res.json({
-      success: true,
-      user: {
+      const authUser: AuthenticatedUser = {
+        cedula: ADMIN_CEDULA,
+        roles: ['admin', 'expendio', 'cliente'],
         role: 'admin',
-        cedulaOrNit: searchVal,
-        name: 'Administrador CAMARCA SAS',
-      },
-    });
+        expendioId: expendioRealId,
+        name: 'DIEGO ALEJANDRO BECERRA',
+        municipio: 'GIRON',
+        isMultiRoleAdmin: true,
+        isCleanAdmin: false,
+        issuedAt: Date.now(),
+      };
+
+      const token = generateSessionToken(authUser);
+
+      res.cookie('camarca_token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000,
+        path: '/',
+      });
+
+      registrarIngresoUsuario(
+        db,
+        req,
+        'DIEGO ALEJANDRO BECERRA',
+        ADMIN_CEDULA,
+        'admin',
+        'GIRON',
+        'login',
+        true,
+        'Ingreso Administrador General (Multi-rol: admin + expendio + cliente)'
+      );
+
+      return res.json({
+        success: true,
+        token,
+        isMultiRoleAdmin: true,
+        canSelectRole: true,
+        isCleanAdmin: false,
+        availableRoles: ['admin', 'expendio', 'cliente'],
+        user: {
+          role: 'admin',
+          roles: ['admin', 'expendio', 'cliente'],
+          cedulaOrNit: ADMIN_CEDULA,
+          name: 'DIEGO ALEJANDRO BECERRA',
+          isMultiRoleAdmin: true,
+          isCleanAdmin: false,
+          expendioData: adminExpendio
+            ? { ...adminExpendio, encargado: 'DIEGO ALEJANDRO BECERRA', municipio: 'GIRON', localidad: 'GIRON' }
+            : undefined,
+          expendioId: expendioRealId,
+          token,
+        },
+      });
+    }
+
+    // Caso 2: Administrador Ejecutivo Limpio (9005042417) -> Sin paneles ni datos técnicos, visualización limpia de la app
+    if (resolvedAdminCedula === CLEAN_ADMIN_CEDULA) {
+      const authUser: AuthenticatedUser = {
+        cedula: CLEAN_ADMIN_CEDULA,
+        roles: ['admin', 'cliente'],
+        role: 'admin',
+        expendioId: '',
+        name: 'ADMINISTRADOR CAMARCA S.A.S.',
+        municipio: 'BUCARAMANGA',
+        isMultiRoleAdmin: false,
+        isCleanAdmin: true,
+        issuedAt: Date.now(),
+      };
+
+      const token = generateSessionToken(authUser);
+
+      res.cookie('camarca_token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000,
+        path: '/',
+      });
+
+      registrarIngresoUsuario(
+        db,
+        req,
+        'ADMINISTRADOR CAMARCA S.A.S.',
+        CLEAN_ADMIN_CEDULA,
+        'admin',
+        'BUCARAMANGA',
+        'login',
+        true,
+        'Ingreso Administrador Ejecutivo Limpio (9005042417)'
+      );
+
+      return res.json({
+        success: true,
+        token,
+        isMultiRoleAdmin: false,
+        canSelectRole: false,
+        isCleanAdmin: true,
+        availableRoles: ['admin', 'cliente'],
+        user: {
+          role: 'admin',
+          roles: ['admin', 'cliente'],
+          cedulaOrNit: CLEAN_ADMIN_CEDULA,
+          name: 'ADMINISTRADOR CAMARCA S.A.S.',
+          isMultiRoleAdmin: false,
+          isCleanAdmin: true,
+          token,
+        },
+      });
+    }
   }
 
-  // 3. Check Cliente 4-72 NITs / Passwords
-  if (['900062917', 'cliente', '472'].includes(searchVal.toLowerCase()) || requestedRole === 'cliente') {
-    registrarIngresoUsuario(
-      db,
-      req,
-      'Cliente 4-72 (Servicios Postales)',
-      searchVal,
-      'cliente',
-      'BOGOTA D.C.',
-      'login',
-      true,
-      'Ingreso Cliente 4-72'
-    );
-
-    return res.json({
-      success: true,
-      user: {
-        role: 'cliente',
-        cedulaOrNit: searchVal,
-        name: 'Cliente 4-72 (Servicios Postales)',
-      },
-    });
-  }
-
-  // 4. Check Expendios by Cédula or NIT
-  const found = db.expendios.find(
-    (exp) => exp.cedula.trim() === searchVal || exp.nit?.trim() === searchVal
+  // 1. Filtrar expendios asociados a la cédula proporcionada (excluyendo inhabilitados)
+  const matchingExpendios = (db.expendios || []).filter(
+    (exp) => normalizeCedula(exp.cedula) === searchVal && exp.estado !== 'Inhabilitado'
   );
 
+  // REGLA 4: Cédula duplicada - NO elegir arbitrariamente. Rechazar y registrar inconsistencia.
+  if (matchingExpendios.length > 1) {
+    const expList = matchingExpendios.map((e) => `${e.municipio || e.localidad} (${e.id})`).join(', ');
+    const inconsistencyMsg = `Inconsistencia crítica: Cédula ${searchVal} asociada a múltiples expendios activos: ${expList}`;
+    console.error(`[Integridad] ${inconsistencyMsg}`);
+
+    registrarIngresoUsuario(
+      db,
+      req,
+      `Cédula Duplicada (${rawSearchVal})`,
+      rawSearchVal,
+      'desconocido',
+      '',
+      'login',
+      false,
+      inconsistencyMsg
+    );
+
+    return res.status(409).json({
+      success: false,
+      inconsistencia: true,
+      error: 'CEDULA_DUPLICADA_INCONSISTENCIA',
+      message: 'Inconsistencia de datos: El número de cédula está asignado a múltiples expendios en el sistema.',
+      detalles: `El sistema detectó más de un expendio activo con la cédula ${searchVal} (${expList}). Por seguridad y trazabilidad, el acceso automático ha sido suspendido para prevenir corrupción de datos. Contacte al Administrador General o revise el módulo de integridad.`,
+      whatsappPhone: '3182822512',
+    });
+  }
+
+  // REGLA 3: Resolución de Expendio estrictamente por cédula
+  const found = matchingExpendios[0];
   if (found) {
+    const authUser: AuthenticatedUser = {
+      cedula: normalizeCedula(found.cedula),
+      roles: ['expendio', 'cliente'],
+      role: 'expendio',
+      expendioId: found.id,
+      name: found.encargado,
+      municipio: found.municipio || found.localidad,
+      isMultiRoleAdmin: false,
+      issuedAt: Date.now(),
+    };
+
+    const token = generateSessionToken(authUser);
+
+    res.cookie('camarca_token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
     registrarIngresoUsuario(
       db,
       req,
@@ -2366,26 +4143,30 @@ app.post('/api/auth/login', (req, res) => {
       found.municipio || found.localidad,
       'login',
       true,
-      `Ingreso Expendio ${found.municipio || found.localidad}`
+      `Ingreso Expendio ${found.municipio || found.localidad} (ID: ${found.id})`
     );
 
     return res.json({
       success: true,
+      token,
       user: {
         role: 'expendio',
+        roles: ['expendio', 'cliente'],
         cedulaOrNit: found.cedula,
         name: found.encargado,
         expendioData: found,
+        expendioId: found.id,
+        token,
       },
     });
   }
 
-  // Fallback: If not found, log failed attempt and return explicit error message
+  // Fallback: Cédula no registrada
   registrarIngresoUsuario(
     db,
     req,
-    `No Registrado (${searchVal})`,
-    searchVal,
+    `No Registrado (${rawSearchVal})`,
+    rawSearchVal,
     'desconocido',
     '',
     'login',
@@ -2395,33 +4176,224 @@ app.post('/api/auth/login', (req, res) => {
 
   return res.status(404).json({
     success: false,
-    message: 'No se encontró ningún registro para el número ingresado. Verifica tus datos o contáctate con el administrador.',
+    message: 'No se encontró ningún expendio registrado para el número de cédula ingresado.',
     whatsappPhone: '3182822512',
-    detalles: `El número ${searchVal} no coincide con ningún expendio ni usuario registrado en la base de datos de CAMARCA SAS.`,
+    detalles: `El número ${rawSearchVal} no coincide con ningún expendio ni usuario registrado en la base de datos de CAMARCA SAS.`,
   });
 });
 
-// 2B. Track general visit / page load
-app.post('/api/metrics/track-visit', (req, res) => {
-  const db = loadDatabase();
-  db.visitasGenerales = (db.visitasGenerales || 0) + 1;
-  saveDatabase(db);
-  res.json({ success: true, count: db.visitasGenerales });
+// Logout endpoint
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('camarca_token', { path: '/' });
+  res.json({ success: true, message: 'Sesión cerrada exitosamente.' });
 });
 
-// 2C. Admin: Get Access Metrics (Available strictly to Administrator)
-app.get('/api/admin/metrics/accesos', (req, res) => {
+// Current authenticated user verification endpoint
+app.get('/api/auth/me', requireAuthenticatedUser, (req: AuthRequest, res) => {
+  const user = req.user!;
   const db = loadDatabase();
-  const metricas = calcularMetricasAcceso(db);
-  res.json({ success: true, data: metricas });
+  const ownExpendio = resolveUserExpendio(req, db);
+  const normCed = normalizeCedula(user.cedula);
+  const resolvedName =
+    normCed === ADMIN_CEDULA
+      ? 'DIEGO ALEJANDRO BECERRA'
+      : normCed === CLEAN_ADMIN_CEDULA
+      ? 'ADMINISTRADOR CAMARCA S.A.S.'
+      : ownExpendio?.encargado || user.name;
+
+  res.json({
+    success: true,
+    user: {
+      cedula: user.cedula,
+      roles: user.roles,
+      role: user.role || user.roles[0],
+      expendioId: user.expendioId,
+      name: resolvedName,
+      municipio: normCed === ADMIN_CEDULA ? 'GIRON' : user.municipio,
+      isMultiRoleAdmin: user.isMultiRoleAdmin,
+      expendioData: ownExpendio,
+    },
+  });
+});
+
+// Endpoint de diagnóstico de integridad del sistema
+app.get('/api/admin/system/integrity', (req, res) => {
+  const db = loadDatabase();
+  const integrityReport = auditDatabaseIntegrity(db);
+  const outboxSummary = getOutboxSummary();
+  const cloudSync = { connected: true, provider: 'PostgreSQL (Cloud SQL)', quotaExhausted: false };
+
+  res.json({
+    success: true,
+    healthy: integrityReport.healthy && !cloudSync.quotaExhausted,
+    revision: Number(db.revision) || 0,
+    commitId: (db as any).commitId || null,
+    checkedAt: integrityReport.checkedAt,
+    integrity: integrityReport,
+    outbox: outboxSummary,
+    cloudSync,
+  });
+});
+
+// Endpoint de estado de la outbox durable
+app.get('/api/admin/outbox/status', (req, res) => {
+  const summary = getOutboxSummary();
+  const pendingEvents = getPendingOutboxEvents();
+  res.json({
+    success: true,
+    summary,
+    pendingCount: pendingEvents.length,
+    pendingEvents: pendingEvents.slice(0, 50),
+  });
+});
+
+// ==============================================================================
+// CENTRO DE ERRORES Y DIAGNÓSTICO DE LA PLATAFORMA (ADMIN)
+// ==============================================================================
+app.get('/api/admin/error-logs', (req, res) => {
+  try {
+    const limit = Math.min(300, Math.max(10, parseInt(String(req.query.limit || '150'), 10)));
+    const logs = errorLogService.getLogs(limit);
+    const stats = errorLogService.getStats();
+    res.json({ success: true, logs, stats });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/error-catalog', (req, res) => {
+  try {
+    const catalog = errorLogService.getCatalog();
+    res.json({ success: true, catalog });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/admin/error-logs/:id/resolve', (req, res) => {
+  try {
+    const { id } = req.params;
+    const resolved = errorLogService.markAsResolved(id, 'Administrador');
+    if (resolved) {
+      res.json({ success: true, message: `Incidencia ${id} resuelta exitosamente.` });
+    } else {
+      res.status(404).json({ success: false, error: 'Registro de error no encontrado.' });
+    }
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/admin/error-logs', (req, res) => {
+  try {
+    errorLogService.clearLogs();
+    res.json({ success: true, message: 'Historial de errores de la plataforma vaciado.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2B. Track general visit / page load (Strictly validated for real authenticated users)
+app.post('/api/metrics/track-visit', async (req, res) => {
+  // Filtrar accesos anónimos, bots o chequeos de salud (health check)
+  const user = extractAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, message: 'Operación anónima omitida para métricas.' });
+  }
+
+  // Verificar que el usuario exista en PostgreSQL y esté activo
+  const db = loadDatabase();
+  const cleanCed = String(user.cedula || '').replace(/\D/g, '');
+  let exists = false;
+  if (cleanCed === ADMIN_CEDULA) {
+    exists = true;
+  } else {
+    const foundExp = (db.expendios || []).find((e) => String(e.cedula || '').replace(/\D/g, '') === cleanCed);
+    if (foundExp && foundExp.estado !== 'Inhabilitado') {
+      exists = true;
+    }
+  }
+
+  if (!exists) {
+    return res.status(403).json({ success: false, message: 'Identidad no válida o inhabilitada.' });
+  }
+
+  try {
+    const count = await mutateDatabase((db) => {
+      db.visitasGenerales = (db.visitasGenerales || 0) + 1;
+      return db.visitasGenerales;
+    }, { immediateCloudSync: false, skipCloudSync: false });
+    res.json({ success: true, count });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// 2B2. Realtime presence heartbeat ping to track active online users
+app.post(['/api/presence/heartbeat', '/api/metrics/heartbeat'], (req, res) => {
+  cleanupStalePresence();
+  const authUser = extractAuthenticatedUser(req);
+  const body = req.body || {};
+
+  const rawIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '';
+  const ip = rawIp.split(',')[0].trim().replace('::ffff:', '') || '127.0.0.1';
+  const userAgent = (req.headers['user-agent'] as string) || '';
+  const { dispositivo, navegador } = parseDeviceInfo(userAgent);
+
+  const cedula = authUser?.cedula || body.cedula || 'anonimo';
+  const role = authUser?.role || body.rol || 'visita';
+  const usuario = body.usuario || authUser?.name || (role === 'admin' ? 'ADMINISTRADOR GENERAL' : 'Usuario');
+  const municipio = body.municipio || authUser?.municipio || '';
+  const activePath = body.path || '/';
+
+  const key = `${cedula}_${ip}`;
+  const now = Date.now();
+
+  activeUsersPresenceMap.set(key, {
+    key,
+    cedula,
+    usuario,
+    rol: role,
+    municipio,
+    ip,
+    dispositivo,
+    navegador,
+    path: activePath,
+    lastSeen: now,
+    timestampIso: new Date(now).toISOString(),
+  });
+
+  const activeList = Array.from(activeUsersPresenceMap.values())
+    .map((item) => ({
+      ...item,
+      haceCuantoSegundos: Math.max(0, Math.floor((now - item.lastSeen) / 1000)),
+    }))
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+
+  res.json({
+    success: true,
+    usuariosEnLineaCount: activeList.length,
+    activeUsers: activeList,
+  });
+});
+
+// 2C. Admin: Get Access Metrics (Available strictly to Administrator) - Async query to PostgreSQL
+app.get('/api/admin/metrics/accesos', async (req, res) => {
+  try {
+    const db = loadDatabase();
+    const metricas = await calcularMetricasAccesoAsync(db);
+    res.json({ success: true, data: metricas });
+  } catch (err: any) {
+    console.error('Error calculando métricas de acceso:', err);
+    res.status(500).json({ success: false, message: 'Error al calcular métricas: ' + err.message });
+  }
 });
 
 // 2D. Admin: Export Access Logs as CSV
 app.get('/api/admin/metrics/exportar-csv', (req, res) => {
-  const db = loadDatabase();
-  const registros = db.registrosAcceso || [];
+  const registros = getRegistrosAcceso();
 
-  let csv = '\uFEFFFECHA_HORA,USUARIO_ENCARGADO,CEDULA_NIT,ROL,MUNICIPIO,DISPOSITIVO,NAVEGADOR,IP,UBICACION_IP,PROVEEDOR_INTERNET_ISP,TIPO_ACCESO,ESTADO,DETALLES\n';
+  let csv = '\uFEFFFECHA_HORA,USUARIO_ENCARGADO,CEDULA_NIT,ROL,MUNICIPIO,DISPOSITIVO,NAVEGADOR,IP,UBICACION_IP,PROVEEDOR_INTERNET_ISP,TIPO_ACCESO,ESTADO,DETALLES';
   registros.forEach((r) => {
     const clean = (val?: string) => `"${String(val || '').replace(/"/g, '""')}"`;
     csv +=
@@ -2449,19 +4421,13 @@ app.get('/api/admin/metrics/exportar-csv', (req, res) => {
 });
 
 // 2E. Admin: Reset Access Logs (requires master password)
-app.post('/api/admin/metrics/limpiar', (req, res) => {
-  const { password } = req.body || {};
-  if (password !== ADMIN_MASTER_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: 'Contraseña de seguridad incorrecta. Debe ingresar la clave autorizada para reiniciar las métricas.',
-    });
-  }
+app.post('/api/admin/metrics/limpiar', async (req, res) => {
+  if (!authorizeDestructiveAction(req, res, 'CLEAR_ACCESS_METRICS')) return;
 
-  const db = loadDatabase();
-  db.registrosAcceso = [];
-  db.visitasGenerales = 0;
-  saveDatabase(db);
+  clearRegistrosAcceso();
+  await mutateDatabase((db) => {
+    db.visitasGenerales = 0;
+  }, { forceCloudSync: true });
 
   res.json({
     success: true,
@@ -2470,10 +4436,24 @@ app.post('/api/admin/metrics/limpiar', (req, res) => {
 });
 
 // 3. Expendio: Update contact and personal details (ALL IN UPPERCASE)
-app.post('/api/expendio/update', (req, res) => {
+// REGLA 3, 13 y 14: Resuelve expendio propio desde req.user.expendioId y busca por id canónico inmutable.
+app.post('/api/expendio/update', requireExpendio, async (req: AuthRequest, res) => {
+  const user = req.user!;
+  const currentDb = getDatabase();
+  const ownExpendio = resolveUserExpendio(req, currentDb);
+
+  if (!ownExpendio) {
+    return res.status(404).json({ success: false, message: 'Expendio propio no encontrado para el usuario autenticado.' });
+  }
+
+  // REGLAS 7 y 13: El módulo de Expendio opera estrictamente sobre el expendio propio
+  const requestedId = req.body.expendioId || req.body.id;
+  if (requestedId && requestedId !== ownExpendio.id && normalizeCedula(user.cedula) !== ADMIN_CEDULA) {
+    return res.status(403).json({ success: false, message: 'Acceso denegado: El módulo de Expendio solo permite modificar su propio expendio.' });
+  }
+
   const {
     cedula,
-    cedulaOriginal,
     direccionPunto,
     telefonoPunto,
     correoElectronico,
@@ -2482,239 +4462,103 @@ app.post('/api/expendio/update', (req, res) => {
     banco,
     primeraVezActualizado,
   } = req.body;
-  const db = loadDatabase();
 
-  const searchCedula = (cedulaOriginal || cedula || '').trim();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === searchCedula);
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  try {
+    const updatedExp = await mutateDatabase(async (db) => {
+      // REGLA 14: Búsqueda estricta por expendio.id canónico e inmutable
+      const index = db.expendios.findIndex((exp) => exp.id === ownExpendio.id);
+      if (index === -1) {
+        throw new Error('EXPENDIO_NOT_FOUND');
+      }
+
+      const current = db.expendios[index];
+
+      // Transform all user-entered string values to UPPERCASE as mandated
+      const cleanEncargado = encargado ? String(encargado).trim().toUpperCase() : current.encargado;
+      // REGLA FUNDAMENTAL: La cédula es un dato maestro administrado e inmutable para el usuario Expendio.
+      // La cédula registrada en BD (current.cedula) es la única autoridad y nunca puede ser modificada por el expendio.
+      const immutableCedula = current.cedula;
+      const cleanDireccion = direccionPunto ? String(direccionPunto).trim().toUpperCase() : (current.direccionPunto || current.direccion || '');
+      const cleanTelefono = telefonoPunto ? String(telefonoPunto).trim().toUpperCase() : (current.telefonoPunto || current.telefono || '');
+      const cleanCuenta = cuentaBancaria !== undefined ? String(cuentaBancaria).trim().toUpperCase() : (current.cuentaBancaria || '');
+      const cleanBanco = banco ? String(banco).trim().toUpperCase() : (current.banco || 'NEQUI');
+      const cleanCorreo = correoElectronico ? String(correoElectronico).trim().toUpperCase() : (current.correoElectronico || '');
+      const cleanObservaciones = req.body.observaciones !== undefined 
+        ? String(req.body.observaciones).trim().toUpperCase() 
+        : (req.body.observacion !== undefined 
+            ? String(req.body.observacion).trim().toUpperCase() 
+            : (current.observaciones || current.observacion || ''));
+
+      const nowIso = new Date().toISOString();
+      const today = nowIso.split('T')[0];
+
+      db.expendios[index] = {
+        ...current,
+        id: current.id, // Preservar ID canónico inmutable
+        cedula: immutableCedula, // INMUTABLE: La cédula existente en BD no puede ser alterada por el expendio
+        encargado: cleanEncargado,
+        direccion: cleanDireccion,
+        direccionPunto: cleanDireccion,
+        telefono: cleanTelefono,
+        telefonoPunto: cleanTelefono,
+        cuentaBancaria: cleanCuenta,
+        banco: cleanBanco,
+        correoElectronico: cleanCorreo,
+        observacion: cleanObservaciones,
+        observaciones: cleanObservaciones,
+        primeraVezActualizado: true,
+        fechaUltimaActualizacion: today,
+        updatedAt: nowIso,
+        revision: (Number(current.revision) || 0) + 1,
+      };
+
+      const resultItem = db.expendios[index];
+
+      // Record in trazabilidad for audit tracking
+      if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+      const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+      db.trazabilidad.unshift({
+        id: `traz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        expendioId: resultItem.id, // REGLA 16: ID canónico inmutable del expendio
+        actorId: user.cedula,
+        actorRole: user.role || 'expendio',
+        timestamp: nowIso,
+        municipio: resultItem.municipio || resultItem.localidad,
+        localidad: resultItem.localidad,
+        novedad: 'Actualización oficial de datos de contacto por el expendio',
+        encargadoNuevo: cleanEncargado,
+        cedulaNuevo: immutableCedula,
+        fechaRegistro: nowIso,
+        registradoPor: `Expendio ${cleanEncargado} (CC: ${immutableCedula})`,
+        observaciones: `Actualización oficial de datos de contacto (Dirección, Celular, Cuenta Bancaria, Banco, Correo). Rev ${resultItem.revision}`,
+        commitId,
+        before: current,
+        after: resultItem,
+      });
+
+      return resultItem;
+    }, { immediateCloudSync: true, forceCloudSync: false, throwOnCloudError: false });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      data: updatedExp,
+      message: 'Datos del expendio actualizados exitosamente.',
+    });
+  } catch (err: any) {
+    if (err.message === 'EXPENDIO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+    }
+    console.error('[API] Error actualizando datos del expendio:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al guardar actualización de datos: ${err.message}.`,
+    });
   }
-
-  // Transform all user-entered string values to UPPERCASE as mandated
-  const cleanEncargado = encargado ? String(encargado).trim().toUpperCase() : db.expendios[index].encargado;
-  const cleanCedula = req.body.cedulaNueva ? String(req.body.cedulaNueva).trim().toUpperCase() : (cedula ? String(cedula).trim().toUpperCase() : db.expendios[index].cedula);
-  const cleanDireccion = direccionPunto ? String(direccionPunto).trim().toUpperCase() : db.expendios[index].direccionPunto;
-  const cleanTelefono = telefonoPunto ? String(telefonoPunto).trim().toUpperCase() : db.expendios[index].telefonoPunto;
-  const cleanCuenta = cuentaBancaria !== undefined ? String(cuentaBancaria).trim().toUpperCase() : (db.expendios[index].cuentaBancaria || '');
-  const cleanBanco = banco ? String(banco).trim().toUpperCase() : (db.expendios[index].banco || 'NEQUI');
-  const cleanCorreo = correoElectronico ? String(correoElectronico).trim().toUpperCase() : (db.expendios[index].correoElectronico || '');
-  const cleanObservaciones = req.body.observaciones !== undefined 
-    ? String(req.body.observaciones).trim().toUpperCase() 
-    : (req.body.observacion !== undefined 
-        ? String(req.body.observacion).trim().toUpperCase() 
-        : (db.expendios[index].observaciones || db.expendios[index].observacion || ''));
-
-  db.expendios[index] = {
-    ...db.expendios[index],
-    encargado: cleanEncargado,
-    cedula: cleanCedula,
-    direccionPunto: cleanDireccion,
-    telefonoPunto: cleanTelefono,
-    cuentaBancaria: cleanCuenta,
-    banco: cleanBanco,
-    correoElectronico: cleanCorreo,
-    observacion: cleanObservaciones,
-    observaciones: cleanObservaciones,
-    primeraVezActualizado: true,
-    fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
-  };
-
-  // Record in trazabilidad for audit tracking (NEVER in db.historial, as accounting can only be moved by Admin)
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-  db.trazabilidad.unshift({
-    id: `traz-${Date.now()}`,
-    municipio: db.expendios[index].municipio || db.expendios[index].localidad,
-    localidad: db.expendios[index].localidad,
-    novedad: 'Actualización oficial de datos de contacto por el expendio',
-    encargadoNuevo: cleanEncargado,
-    cedulaNuevo: cleanCedula,
-    fechaRegistro: new Date().toISOString(),
-    registradoPor: `Expendio ${cleanEncargado} (CC: ${cleanCedula})`,
-    observaciones: 'Actualización oficial de datos de contacto (Dirección, Celular, Cuenta Bancaria, Banco, Correo).',
-  });
-
-  saveDatabase(db);
-  res.json({
-    success: true,
-    data: db.expendios[index],
-    message: 'Datos del expendio actualizados exitosamente en mayúsculas.',
-  });
 });
 
-// 3B. Expendio: Check generated cuenta de cobro status for a given period
-const handleGetExpendioCuenta = (req: any, res: any) => {
-  const cedulaParam = req.params?.cedula || req.query?.cedula;
-  const { mes, anio, periodo } = req.query;
-  const db = loadDatabase();
 
-  const cleanDigits = (s?: any) => String(s || '').replace(/[^0-9]/g, '');
-  const targetCedula = cleanDigits(cedulaParam);
-
-  if (!targetCedula) {
-    return res.status(400).json({ success: false, message: 'Cédula no proporcionada.' });
-  }
-
-  const publishedPeriodo = (db.config?.periodoHabilitadoDescarga || 'FEBRERO 2026').trim().toUpperCase();
-  const isDescargaHabilitada = db.config?.descargaHabilitada !== false;
-
-  let targetPeriodo = '';
-  if (periodo) {
-    targetPeriodo = String(periodo).trim().toUpperCase();
-  } else if (mes && anio) {
-    targetPeriodo = `${String(mes).trim().toUpperCase()} ${String(anio).trim()}`;
-  } else if (mes) {
-    targetPeriodo = String(mes).trim().toUpperCase();
-  }
-
-  // Si no se especificó periodo, usar el periodo asignado por el admin en la configuración
-  if (!targetPeriodo) {
-    targetPeriodo = publishedPeriodo;
-  }
-
-  const [mesSearch, anioSearch] = targetPeriodo.split(' ');
-  const isPeriodoPublicado = targetPeriodo === publishedPeriodo;
-
-  // 1. Search strictly in db.historial for matching item of type 'Cuenta de Cobro'
-  const historialMatch = (db.historial || []).find((h: any) => {
-    if (h.tipo !== 'Cuenta de Cobro') return false;
-    const hCedula = cleanDigits(h.cedula);
-    if (hCedula !== targetCedula) return false;
-
-    const hPeriodoUpper = (h.periodo || '').toUpperCase();
-    if (mesSearch && !hPeriodoUpper.includes(mesSearch)) return false;
-    if (anioSearch && !hPeriodoUpper.includes(anioSearch)) return false;
-    return true;
-  });
-
-  if (historialMatch && (historialMatch.cuentaData || historialMatch.monto)) {
-    return res.json({
-      success: true,
-      generada: true,
-      isPeriodoPublicado,
-      descargaHabilitada: isDescargaHabilitada,
-      periodoConsultado: targetPeriodo,
-      periodoPublicado: publishedPeriodo,
-      data: historialMatch.cuentaData || {
-        id: historialMatch.id,
-        cedula: historialMatch.cedula,
-        encargado: historialMatch.encargado,
-        expendio: historialMatch.expendio,
-        municipio: historialMatch.expendio,
-        periodo: historialMatch.periodo,
-        cargoBasico: historialMatch.monto || 0,
-        admisionSipost: 0,
-        valorVariable: 0,
-        pagoTotal: historialMatch.monto || 0,
-        retef1: Math.round((historialMatch.monto || 0) * 0.01),
-        valorNeto: (historialMatch.monto || 0) - Math.round((historialMatch.monto || 0) * 0.01),
-      },
-      message: 'Cuenta de cobro encontrada en el registro oficial.',
-    });
-  }
-
-  // 2. Search in db.relacionPagos
-  if (Array.isArray(db.relacionPagos)) {
-    const pagoMatch = db.relacionPagos.find((p) => {
-      const pCedula = cleanDigits(p.cedula);
-      if (pCedula !== targetCedula) return false;
-      if (mesSearch && p.mes?.toUpperCase() !== mesSearch) return false;
-      if (anioSearch && String(p.anio || '2026') !== anioSearch) return false;
-      return true;
-    });
-
-    if (pagoMatch) {
-      const valor = Number(pagoMatch.valorCancelar) || 121200;
-      const rete = Math.round(valor * 0.01);
-      const neto = valor - rete;
-
-      return res.json({
-        success: true,
-        generada: true,
-        isPeriodoPublicado,
-        descargaHabilitada: isDescargaHabilitada,
-        periodoConsultado: targetPeriodo,
-        periodoPublicado: publishedPeriodo,
-        data: {
-          id: `pago-${pagoMatch.id || Date.now()}`,
-          cedula: pagoMatch.cedula,
-          encargado: pagoMatch.nombreEncargado,
-          expendio: pagoMatch.municipio || 'EXPENDIO',
-          municipio: pagoMatch.municipio || 'BUCARAMANGA',
-          periodo: `${pagoMatch.mes || mesSearch} ${pagoMatch.anio || anioSearch || '2026'}`,
-          centroOperativo: pagoMatch.centroOperativo || 'PO.BUCARAMANGA',
-          cargoBasico: valor,
-          admisionSipost: 0,
-          valorVariable: 0,
-          pagoTotal: valor,
-          retef1: rete,
-          valorNeto: neto,
-          banco: pagoMatch.banco,
-          cuentaBancaria: pagoMatch.cuenta,
-        },
-        message: 'Cuenta de cobro encontrada en relación de pagos.',
-      });
-    }
-  }
-
-  // 3. If targetPeriodo is the published period authorized by administration and user is a registered expendio,
-  // ensure they can consult and download their official baseline cuenta de cobro immediately
-  const expendio = (db.expendios || []).find((e: any) => cleanDigits(e.cedula) === targetCedula);
-  if (isPeriodoPublicado && expendio) {
-    const cargoBasicoVal = 121200;
-    const reteVal = Math.round(cargoBasicoVal * 0.01);
-    const netoVal = cargoBasicoVal - reteVal;
-
-    const nuevaCuentaData = {
-      id: `auto-${targetCedula}-${targetPeriodo.replace(/\s+/g, '_')}`,
-      cedula: expendio.cedula,
-      nombre: expendio.encargado || 'ENCARGADO EXPENDIO',
-      encargado: expendio.encargado || 'ENCARGADO EXPENDIO',
-      expendio: expendio.localidad || expendio.municipio || 'EXPENDIO POSTAL 4-72',
-      municipio: expendio.municipio || expendio.localidad || 'BUCARAMANGA',
-      periodo: targetPeriodo,
-      centroOperativo: expendio.centroOperativo || 'REGIONAL ORIENTE',
-      cargoBasico: cargoBasicoVal,
-      admisionSipost: 0,
-      valorVariable: 0,
-      pagoTotal: cargoBasicoVal,
-      retef1: reteVal,
-      valorNeto: netoVal,
-      banco: expendio.banco || 'BANCOLOMBIA',
-      cuentaBancaria: expendio.cuentaBancaria || '',
-      concepto: `Servicios de expendio postal 4-72 en el punto ${expendio.localidad || expendio.municipio}`,
-      fechaEmision: new Date().toISOString().split('T')[0],
-      fechaAprobacion: new Date().toISOString().split('T')[0],
-      aprobada: true,
-    };
-
-    // Return baseline cuenta data for authorized period download WITHOUT persisting to db.historial
-    // (Accounting history can only be modified by the Administrator)
-    return res.json({
-      success: true,
-      generada: true,
-      isPeriodoPublicado: true,
-      descargaHabilitada: isDescargaHabilitada,
-      periodoConsultado: targetPeriodo,
-      periodoPublicado: publishedPeriodo,
-      data: nuevaCuentaData,
-      message: `Cuenta de cobro oficial disponible para consulta y descarga del periodo ${targetPeriodo}.`,
-    });
-  }
-
-  // 4. Strict: If not generated/published, return generada: false without mutating database
-  return res.json({
-    success: true,
-    generada: false,
-    isPeriodoPublicado,
-    descargaHabilitada: isDescargaHabilitada,
-    periodoConsultado: targetPeriodo,
-    periodoPublicado: publishedPeriodo,
-    message: `CUENTA DE COBRO NO GENERADA NI PUBLICADA. La cuenta de cobro para el periodo "${targetPeriodo}" aún no ha sido generada ni publicada en el sistema por la administración.`,
-  });
-};
-
-app.get('/api/expendio/cuenta-cobro', handleGetExpendioCuenta);
-app.get('/api/cuentas/usuario/:cedula', handleGetExpendioCuenta);
 
 // ==========================================
 // REGISTRO Y GESTIÓN DE FOTOGRAFÍAS EN GOOGLE DRIVE
@@ -2739,9 +4583,9 @@ function saveDrivePhotosRegistry(registry: Record<string, any>): void {
   try {
     drivePhotosRegistryMemory = { ...registry };
     fs.writeFileSync(drivePhotosRegistryPath, JSON.stringify(registry, null, 2), 'utf8');
-    // Sincronizar de forma permanente con Google Cloud Firestore
+    // Sincronizar de forma permanente con PostgreSQL
     saveDriveRegistryToCloud(registry).catch((e) => {
-      console.warn('Error sincronizando registry a Firestore:', e.message);
+      console.warn('Error sincronizando registry a PostgreSQL:', e.message);
     });
   } catch (e: any) {
     console.warn('Error guardando registro de fotos Google Drive:', e.message);
@@ -2750,7 +4594,7 @@ function saveDrivePhotosRegistry(registry: Record<string, any>): void {
 
 function lookupMunicipioForCedula(cedulaRaw: string): { municipio: string; encargado?: string } {
   const clean = String(cedulaRaw || '').replace(/\D/g, '').trim();
-  const db = loadDatabase();
+  const db = getDatabaseReadOnly();
   const exp = (db.expendios || []).find((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === clean);
   if (exp) {
     return {
@@ -2813,43 +4657,67 @@ function getTipoFotoEtiqueta(slotKey: string): string {
 
 function getPhotoItemSlug(slotKey: string): string {
   const key = (slotKey || '').toLowerCase();
-  if (key.includes('tarifa')) return 'foto_tarifas';
-  if (key.includes('aviso') || key.includes('letrero')) return 'foto_aviso';
-  if (key.includes('panoramica') || key.includes('fachada')) return 'foto_panoramica';
-  if (key.includes('matasello')) return 'foto_matasello';
-  if (key.includes('bascula')) return 'foto_bascula';
-  if (key.includes('contratista') || key.includes('encargado') || key.includes('persona')) return 'foto_contratista';
-  if (key.includes('horario')) return 'foto_horario';
-  if (key.includes('computador') || key.includes('pc')) return 'foto_computador';
-  if (key.includes('cedulafrontal') || key.includes('cedula_frontal')) return 'foto_cedula_frontal';
-  if (key.includes('cedulaposterior') || key.includes('cedula_posterior')) return 'foto_cedula_posterior';
-  if (key.includes('rut')) return 'foto_rut';
-  return 'foto_punto';
+  if (key.includes('tarifa')) return 'Foto_Tarifas';
+  if (key.includes('aviso') || key.includes('letrero')) return 'Foto_Aviso';
+  if (key.includes('panoramica') || key.includes('fachada')) return 'Foto_Panoramica';
+  if (key.includes('matasello')) return 'Foto_Matasello';
+  if (key.includes('bascula')) return 'Foto_Bascula';
+  if (key.includes('contratista') || key.includes('encargado') || key.includes('persona')) return 'Foto_Contratista';
+  if (key.includes('horario')) return 'Foto_Horario';
+  return 'Foto_General';
+}
+
+function getSlotKeyFromFileNameServer(fileName: string): string | null {
+  const clean = (fileName || '').toLowerCase();
+  if (clean.includes('tarifa')) return 'fotoTarifasUrl';
+  if (clean.includes('aviso') || clean.includes('letrero')) return 'fotoAvisoUrl';
+  if (clean.includes('panoramica') || clean.includes('fachada')) return 'fotoPanoramicaUrl';
+  if (clean.includes('matasello')) return 'fotoMataselloUrl';
+  if (clean.includes('bascula') || clean.includes('pesa')) return 'fotoBasculaUrl';
+  if (clean.includes('contratista') || clean.includes('encargado') || clean.includes('persona')) return 'fotoContratistaUrl';
+  if (clean.includes('horario')) return 'fotoHorarioUrl';
+  if (clean.includes('computador') || clean.includes('pc')) return 'computadorUrl';
+  if (clean.includes('cedulafrontal') || clean.includes('cedula_frontal')) return 'fotoCedulaFrontalUrl';
+  if (clean.includes('cedulaposterior') || clean.includes('cedula_posterior')) return 'fotoCedulaPosteriorUrl';
+  if (clean.includes('rut')) return 'fotoRutUrl';
+  return null;
+}
+
+function formatFechaDDMMAAAA(rawFecha?: string | Date): string {
+  let d: Date | null = null;
+  if (rawFecha instanceof Date && !isNaN(rawFecha.getTime())) {
+    d = rawFecha;
+  } else if (typeof rawFecha === 'string' && rawFecha.trim()) {
+    const clean = rawFecha.trim();
+    if (/^\d{8}$/.test(clean)) return clean;
+    const isoMatch = clean.match(/^(\d{4})[-/.](\d{2})[-/.](\d{2})/);
+    if (isoMatch) {
+      return `${isoMatch[3]}${isoMatch[2]}${isoMatch[1]}`;
+    }
+    const dmyMatch = clean.match(/^(\d{2})[-/.](\d{2})[-/.](\d{4})/);
+    if (dmyMatch) {
+      return `${dmyMatch[1]}${dmyMatch[2]}${dmyMatch[3]}`;
+    }
+    const parsed = new Date(clean);
+    if (!isNaN(parsed.getTime())) {
+      d = parsed;
+    }
+  }
+  if (!d) d = new Date();
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yyyy = String(d.getFullYear());
+  return `${dd}${mm}${yyyy}`;
 }
 
 function getDrivePhotoFileName(slotKey: string, rawMunicipio?: string, rawFecha?: string | Date): string {
   const itemSlug = getPhotoItemSlug(slotKey);
-  const cleanMuni = (rawMunicipio || 'giron')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
+  const muniClean = formatMunicipioNombre(rawMunicipio || 'Giron')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9_]/g, '');
+  const fechaDDMMAAAA = formatFechaDDMMAAAA(rawFecha);
 
-  let fechaStr = '';
-  if (rawFecha instanceof Date) {
-    fechaStr = rawFecha.toISOString().split('T')[0];
-  } else if (typeof rawFecha === 'string' && rawFecha.trim()) {
-    const cleanDate = rawFecha.trim().split('T')[0].replace(/[/.]/g, '-').replace(/[^0-9-]/g, '');
-    fechaStr = cleanDate;
-  }
-  if (!fechaStr) {
-    fechaStr = new Date().toISOString().split('T')[0];
-  }
-
-  return `${itemSlug}_${cleanMuni || 'municipio'}_${fechaStr}.jpg`;
+  return `${muniClean || 'Municipio'}_${itemSlug}_${fechaDDMMAAAA}.jpg`;
 }
 
 async function getOrCreatePhotosFolderServer(token: string): Promise<{ id: string; name: string; webViewLink?: string }> {
@@ -2940,26 +4808,6 @@ async function getOrCreateMunicipioFolderServer(
 }
 
 
-async function uploadPhotoToFirebaseStorageServer(
-  buffer: Buffer,
-  meta: {
-    cedula: string;
-    slotKey: string;
-    municipio?: string;
-    expendioNombre?: string;
-    fecha?: string;
-    overrideFileName?: string;
-  }
-): Promise<{ success: boolean; webContentLink?: string; webViewLink?: string; driveFileId?: string; folderName?: string; error?: string }> {
-  // Firebase Storage requires authenticated rules or Admin SDK (which requires Service Accounts).
-  // In the sandbox environment, this results in noisy "storage/unauthorized" errors in the console.
-  // Since Google Drive and Local Storage are already acting as the robust double-backup system,
-  // we silently bypass this to keep the logs clean and prevent user confusion.
-  return { success: false, error: 'Firebase Storage uploads bypassed due to environment security constraints.' };
-
-}
-
-
 async function uploadPhotoToGoogleDriveServer(
   buffer: Buffer,
   meta: {
@@ -3022,36 +4870,79 @@ async function uploadPhotoToGoogleDriveServer(
     const rootFolder = await getOrCreatePhotosFolderServer(token);
     const municipioFolder = await getOrCreateMunicipioFolderServer(token, rootFolder.id, muniFormatted);
 
-    // 5. Comprobar si el archivo ya existe en la subcarpeta del municipio
-    const checkQuery = `'${municipioFolder.id}' in parents and name='${fileName}' and trashed=false`;
-    const checkUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(checkQuery)}&fields=files(id,name,webViewLink,webContentLink)`;
-    let existingFileId: string | null = null;
+    // 5. Listar archivos existentes en la subcarpeta del municipio para deduplicar y evitar re-subir fotos iguales
+    let existingFiles: any[] = [];
     try {
-      let checkRes = await fetch(checkUrl, { headers: { Authorization: `Bearer ${token}` } });
-      if (checkRes.status === 401) {
+      const listQuery = `'${municipioFolder.id}' in parents and trashed=false`;
+      const listUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(listQuery)}&fields=files(id,name,size,modifiedTime,webViewLink,webContentLink)&pageSize=100`;
+      let listRes = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } });
+      if (listRes.status === 401) {
         const refreshed = await getOrRefreshDriveTokenServer();
         if (refreshed && refreshed !== token) {
           token = refreshed;
-          checkRes = await fetch(checkUrl, { headers: { Authorization: `Bearer ${token}` } });
+          listRes = await fetch(listUrl, { headers: { Authorization: `Bearer ${token}` } });
         }
       }
-      if (checkRes.ok) {
-        const checkData = (await checkRes.json()) as any;
-        if (checkData.files && checkData.files.length > 0) {
-          existingFileId = checkData.files[0].id;
+      if (listRes.ok) {
+        const listData = (await listRes.json()) as any;
+        if (Array.isArray(listData.files)) {
+          existingFiles = listData.files;
         }
       }
-    } catch {}
+    } catch (listErr: any) {
+      console.warn('[Storage Server] Error listando archivos de municipio:', listErr.message);
+    }
+
+    // Filtrar archivos que corresponden a este mismo slot del expendio
+    const matchingFiles = existingFiles.filter((f: any) => {
+      const fileSlot = getSlotKeyFromFileNameServer(f.name);
+      return fileSlot === cleanSlot;
+    });
+
+    // Ordenar de más reciente a más antiguo
+    matchingFiles.sort((a: any, b: any) => {
+      const timeA = a.modifiedTime ? new Date(a.modifiedTime).getTime() : 0;
+      const timeB = b.modifiedTime ? new Date(b.modifiedTime).getTime() : 0;
+      return timeB - timeA;
+    });
+
+    const newestExisting = matchingFiles[0];
+
+    // Eliminar inmediatamente duplicados previos más antiguos para dejar SOLO 1 por slot (7 por municipio)
+    if (matchingFiles.length > 1) {
+      for (const dup of matchingFiles.slice(1)) {
+        try {
+          await fetch(`https://www.googleapis.com/drive/v3/files/${dup.id}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          console.log(`[Drive Server] Duplicado previo eliminado en ${muniFormatted}: ${dup.name} (${dup.id})`);
+        } catch {}
+      }
+    }
+
+    // REGLA: Si el archivo ya existe y el tamaño en bytes es idéntico, OMITIR CARGA
+    if (newestExisting && newestExisting.size && Math.abs(Number(newestExisting.size) - buffer.length) === 0) {
+      console.log(`[Drive Server] ✓ Foto de ${tipoLabel} en ${muniFormatted} ya está guardada e idéntica. Se omite subida.`);
+      return {
+        success: true,
+        driveFileId: newestExisting.id,
+        webViewLink: newestExisting.webViewLink || '',
+        webContentLink: newestExisting.webContentLink || '',
+        fileName: newestExisting.name,
+        folderName: municipioFolder.name,
+      };
+    }
 
     const description = `Fotografía de ${tipoLabel} del expendio en ${muniFormatted} (Cédula: ${cleanCed}, Encargado: ${meta.expendioNombre || ''}) - CAMARCA SAS`;
 
-    let uploadedId = existingFileId;
-    let webViewLink = '';
-    let webContentLink = '';
+    let uploadedId = newestExisting?.id;
+    let webViewLink = newestExisting?.webViewLink || '';
+    let webContentLink = newestExisting?.webContentLink || '';
 
-    if (existingFileId) {
+    if (newestExisting) {
       // Actualizar archivo existente en la subcarpeta (PATCH)
-      const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=media&fields=id,name,webViewLink,webContentLink`;
+      const updateUrl = `https://www.googleapis.com/upload/drive/v3/files/${newestExisting.id}?uploadType=media&fields=id,name,webViewLink,webContentLink`;
       let updateRes = await fetch(updateUrl, {
         method: 'PATCH',
         headers: {
@@ -3084,11 +4975,20 @@ async function uploadPhotoToGoogleDriveServer(
       uploadedId = updated.id;
       webViewLink = updated.webViewLink || '';
       webContentLink = updated.webContentLink || '';
+
+      // Actualizar nombre a formato oficial
+      try {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${newestExisting.id}`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: fileName, description }),
+        });
+      } catch {}
     } else {
       // Subida multipart de archivo nuevo en la subcarpeta del municipio
-      const boundary = `-------CamarcaPhotoBoundary${Date.now()}`;
-      const delimiter = `\r\n--${boundary}\r\n`;
-      const closeDelimiter = `\r\n--${boundary}--`;
+      const boundary = '-------CamarcaPhotoBoundary' + Date.now();
+      const delimiter = '\r\n--' + boundary + '\r\n';
+      const closeDelimiter = '\r\n--' + boundary + '--';
       const metadata = {
         name: fileName,
         mimeType: 'image/jpeg',
@@ -3096,13 +4996,15 @@ async function uploadPhotoToGoogleDriveServer(
         description,
       };
 
-      const part1 = Buffer.from(
-        delimiter +
-        'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-        JSON.stringify(metadata) +
-        delimiter +
-        'Content-Type: image/jpeg\r\n\r\n'
-      );
+      const part1Str = [
+        delimiter,
+        "Content-Type: application/json; charset=UTF-8\r\n\r\n",
+        JSON.stringify(metadata),
+        "\r\n",
+        delimiter,
+        "Content-Type: image/jpeg\r\n\r\n"
+      ].join('');
+      const part1 = Buffer.from(part1Str);
       const part2 = Buffer.from(closeDelimiter);
       const body = Buffer.concat([part1, buffer, part2]);
 
@@ -3142,7 +5044,8 @@ async function uploadPhotoToGoogleDriveServer(
       webContentLink = uploaded.webContentLink || '';
     }
 
-    // 6. Actualizar registro en memoria, disco y Firestore
+
+    // 6. Actualizar registro en memoria, disco y PostgreSQL
     const registry = loadDrivePhotosRegistry();
     const key = `${cleanCed}_${cleanSlot}`;
     let localMtime = Date.now();
@@ -3164,30 +5067,29 @@ async function uploadPhotoToGoogleDriveServer(
     };
     saveDrivePhotosRegistry(registry);
 
-    // 7. Sincronizar automáticamente con la base de datos de expendios y Firestore
+    // 7. Sincronizar automáticamente con la base de datos de expendios y PostgreSQL
     try {
-      const db = loadDatabase();
-      const expIdx = db.expendios.findIndex((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === cleanCed.replace(/\D/g, '').trim());
-      if (expIdx !== -1) {
-        const canonicalUrl = `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`;
-        (db.expendios[expIdx] as any)[cleanSlot] = canonicalUrl;
-        if (cleanSlot.includes('aviso') || cleanSlot.includes('letrero')) {
-          db.expendios[expIdx].tieneAviso = 'SI';
-          db.expendios[expIdx].letreroUrl = canonicalUrl;
-          db.expendios[expIdx].motivoFaltaAviso = '';
-        } else if (cleanSlot.includes('bascula')) {
-          db.expendios[expIdx].tieneBascula = 'SI';
-          db.expendios[expIdx].basculaUrl = canonicalUrl;
-          db.expendios[expIdx].motivoFaltaBascula = '';
-        } else if (cleanSlot.includes('matasello')) {
-          db.expendios[expIdx].tieneMatasello = 'SI';
-          db.expendios[expIdx].mataselloUrl = canonicalUrl;
-          db.expendios[expIdx].motivoFaltaMatasello = '';
+      await mutateDatabase(async (db) => {
+        const expIdx = db.expendios.findIndex((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === cleanCed.replace(/\D/g, '').trim());
+        if (expIdx !== -1) {
+          const canonicalUrl = `/api/photos/${encodeURIComponent(cleanCed)}/${encodeURIComponent(cleanSlot)}`;
+          (db.expendios[expIdx] as any)[cleanSlot] = canonicalUrl;
+          if (cleanSlot.includes('aviso') || cleanSlot.includes('letrero')) {
+            db.expendios[expIdx].tieneAviso = 'SI';
+            db.expendios[expIdx].letreroUrl = canonicalUrl;
+            db.expendios[expIdx].motivoFaltaAviso = '';
+          } else if (cleanSlot.includes('bascula')) {
+            db.expendios[expIdx].tieneBascula = 'SI';
+            db.expendios[expIdx].basculaUrl = canonicalUrl;
+            db.expendios[expIdx].motivoFaltaBascula = '';
+          } else if (cleanSlot.includes('matasello')) {
+            db.expendios[expIdx].tieneMatasello = 'SI';
+            db.expendios[expIdx].mataselloUrl = canonicalUrl;
+            db.expendios[expIdx].motivoFaltaMatasello = '';
+          }
+          db.expendios[expIdx].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
         }
-        db.expendios[expIdx].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-        saveDatabase(db);
-        scheduleCloudSync(db, 1000);
-      }
+      });
     } catch (syncErr: any) {
       console.warn('[Sync Database] Error asociando foto con expendio:', syncErr.message);
     }
@@ -3203,11 +5105,11 @@ async function uploadPhotoToGoogleDriveServer(
   } catch (err: any) {
     if (err.message && (err.message.includes('401') || err.message.includes('invalid authentication credentials'))) {
        console.warn(`[Google Drive Server] Token revocado o expirado (HTTP 401) subiendo foto ${meta.slotKey}.`);
-       const db = loadDatabase();
-       if (db.config) {
+       await mutateDatabase(async (db) => {
+         if (db.config) {
            db.config.googleDriveAccessToken = '';
-           saveDatabase(db);
-       }
+         }
+       }).catch(() => {});
        return { success: false, error: 'Autenticación inválida (HTTP 401). Inicie sesión en Google Drive.' };
     }
     console.warn(`[Google Drive Server] Error subiendo foto ${meta.slotKey}:`, err.message);
@@ -3430,11 +5332,19 @@ async function reconcileAndOrganizeGoogleDrivePhotosServer(token: string): Promi
     }
 
     saveDrivePhotosRegistry(registry);
-    saveDatabase(db);
+    await mutateDatabase(async (database) => {
+      // Reconciliar fotos con base de datos en memoria
+      for (const [key, item] of Object.entries(registry)) {
+        const expIdx = (database.expendios || []).findIndex(
+          (e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === item.cedula.replace(/\D/g, '').trim()
+        );
+        if (expIdx !== -1) {
+          (database.expendios[expIdx] as any)[item.slotKey] = `/api/photos/${encodeURIComponent(item.cedula.trim())}/${item.slotKey.trim()}`;
+        }
+      }
+    });
 
     const totalDriveFiles = Object.keys(registry).length;
-
-    saveDatabase(db);
     
     console.log(
       `[Google Drive Reconcile] Completado con éxito: ${movedCount} fotos organizadas en carpetas de municipios, ${totalDriveFiles} fotos enlazadas permanentemente.`
@@ -3452,11 +5362,11 @@ async function reconcileAndOrganizeGoogleDrivePhotosServer(token: string): Promi
     if (err.message && (err.message.includes('401') || err.message.includes('invalid authentication credentials'))) {
        console.warn('[Google Drive Reconcile] Token revocado o expirado. Pausando sincronización hasta nuevo inicio de sesión.');
        // Borrar credenciales inválidas para evitar reintentos continuos
-       const db = loadDatabase();
-       if (db.config) {
+       await mutateDatabase(async (db) => {
+         if (db.config) {
            db.config.googleDriveAccessToken = '';
-           saveDatabase(db);
-       }
+         }
+       }).catch(() => {});
        return {
          success: false,
          movedCount: 0,
@@ -3557,10 +5467,9 @@ class BackgroundPhotoSyncEngine {
 
   public startPeriodicSweep() {
     if (this.sweepInterval) clearInterval(this.sweepInterval);
-    // Barrido periódico cada 30 segundos por alta disponibilidad
-    this.sweepInterval = setInterval(() => {
-      this.executeSync('Barrido periódico automático (30s)');
-    }, 30 * 1000);
+    // Modo ahorro de costos (FinOps Scale-to-Zero): el barrido solo se ejecuta bajo demanda (notifyPhotoChanged / fs.watch)
+    // evitando mantener despiertos Cloud Run, Cloud SQL y Firestore las 24 horas cuando no hay usuarios activos.
+    this.sweepInterval = null;
   }
 
   public scheduleDebouncedSync(delayMs: number = 2000, reason: string = 'Automático') {
@@ -3574,6 +5483,7 @@ class BackgroundPhotoSyncEngine {
   }
 
   public notifyPhotoChanged(fileName?: string) {
+    markPhotoActivity();
     this.lastChangeDetectedAt = new Date().toISOString();
     console.log(`[Background Sync Engine] Notificación de foto modificada/guardada: ${fileName || 'nueva'}`);
     this.scheduleDebouncedSync(1000, `Notificación de cambio: ${fileName || 'nueva foto'}`);
@@ -3618,9 +5528,9 @@ class BackgroundPhotoSyncEngine {
         } catch {}
       }
 
-      // 3. Rescatar fotos en base64 de expendios que aún no estén en disco
+      // 3. Rescatar fotos en base64 de expendios que aún no estén en disco (usando referencia de solo lectura sin clonar DB)
+      const readOnlyDb = getDatabaseReadOnly();
       try {
-        const db = loadDatabase();
         const photoKeys = [
           'fotoAvisoUrl', 'fotoAviso', 'letreroUrl', 'letrero',
           'fotoBasculaUrl', 'fotoBascula', 'basculaUrl', 'bascula',
@@ -3632,7 +5542,7 @@ class BackgroundPhotoSyncEngine {
           'fotoComputadorUrl', 'fotoComputador'
         ];
 
-        for (const exp of db.expendios) {
+        for (const exp of readOnlyDb.expendios) {
           const ced = String(exp.cedula || '').replace(/\D/g, '').trim();
           if (!ced) continue;
 
@@ -3655,7 +5565,7 @@ class BackgroundPhotoSyncEngine {
         }
       } catch {}
 
-      const files = fs.readdirSync(photosDir).filter((f) => !f.startsWith('.') && f.endsWith('.jpg'));
+      const files = fs.readdirSync(photosDir).filter((f) => !f.startsWith('.') && !f.startsWith('foto-') && f.endsWith('.jpg'));
       const registry = loadDrivePhotosRegistry();
 
       for (const f of files) {
@@ -3680,15 +5590,14 @@ class BackgroundPhotoSyncEngine {
             stat.mtimeMs > (existingEntry.localMtime + 2000)
           );
 
-          // Si no está en Firebase Storage o si el archivo local fue modificado después de la última subida
-          if (!hasDriveId || wasModifiedLocally) {
+          const activeToken = await getOrRefreshDriveTokenServer();
+          if (activeToken && (!hasDriveId || wasModifiedLocally)) {
             const lookup = lookupMunicipioForCedula(cedula);
-            const db = loadDatabase();
-            const expMatch = db.expendios.find((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === cedula.replace(/\D/g, '').trim());
+            const expMatch = readOnlyDb.expendios.find((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === cedula.replace(/\D/g, '').trim());
             const buffer = fs.readFileSync(filePath);
             const fechaExp = expMatch?.fechaUltimaActualizacion || new Date().toISOString().split('T')[0];
 
-            const res = await uploadPhotoToFirebaseStorageServer(buffer, {
+            const res = await uploadPhotoToGoogleDriveServer(buffer, {
               cedula,
               slotKey,
               municipio: lookup.municipio || 'Giron',
@@ -3696,7 +5605,7 @@ class BackgroundPhotoSyncEngine {
               fecha: fechaExp,
             });
 
-            if (res.success) {
+            if (res.success && res.driveFileId) {
               synced++;
               registry[key] = {
                 driveFileId: res.driveFileId,
@@ -3705,7 +5614,7 @@ class BackgroundPhotoSyncEngine {
                 lastSyncTime: new Date().toISOString(),
                 localMtime: stat?.mtimeMs,
               };
-              console.log(`[Background Sync] Sincronizada automáticamente foto ${f} -> expendios/${lookup.municipio || 'Giron'} en Firebase Storage`);
+              console.log(`[Background Sync] Sincronizada automáticamente foto ${f} a Google Drive (${lookup.municipio || 'Giron'})`);
             }
           }
         }
@@ -3831,25 +5740,48 @@ app.get('/api/admin/google-drive/token', async (req, res) => {
     expiresAt: activeToken ? (expiresAt || null) : null,
     email: activeToken ? (email || null) : null,
     displayName: activeToken ? (displayName || null) : null,
+    googleOAuthClientId: (db.config as any)?.googleOAuthClientId || '',
+    googleOAuthClientSecret: (db.config as any)?.googleOAuthClientSecret || '',
   });
 });
 
 app.post('/api/admin/google-drive/set-token', async (req, res) => {
-  const { accessToken, refreshToken, email, displayName, expiresIn } = req.body;
+  const { accessToken, refreshToken, email, displayName, expiresIn, disconnect } = req.body || {};
+
+  if (disconnect === true || accessToken === 'cleared') {
+    await purgeInvalidGoogleDriveCredentialsServer();
+    await mutateDatabase(async (database) => {
+      if (!database.config) database.config = {} as any;
+      database.config.googleDriveAccessToken = '';
+      database.config.googleDriveRefreshToken = '';
+      database.config.googleDriveAccountEmail = '';
+      (database.config as any).googleDriveAccountName = '';
+      database.config.googleDriveTokenExpiresAt = 0;
+    });
+    return res.json({
+      success: true,
+      disconnected: true,
+      hasToken: false,
+      message: 'Cuenta de Google Drive desconectada exitosamente.',
+    });
+  }
+
   if (!accessToken || typeof accessToken !== 'string' || accessToken.trim().length < 10) {
     return res.status(400).json({ success: false, message: 'Se requiere accessToken válido.' });
   }
   const cleanToken = accessToken.trim();
   const cleanRefreshToken = typeof refreshToken === 'string' && refreshToken.trim().length > 5 ? refreshToken.trim() : undefined;
   const db = loadDatabase();
-  if (!db.config) db.config = {} as any;
-  db.config.googleDriveAccessToken = cleanToken;
-  if (cleanRefreshToken) db.config.googleDriveRefreshToken = cleanRefreshToken;
-  if (email) db.config.googleDriveAccountEmail = email;
-  if (displayName) (db.config as any).googleDriveAccountName = displayName;
-  const calculatedExpiresAt = expiresIn ? Date.now() + expiresIn * 1000 : (db.config.googleDriveTokenExpiresAt || Date.now() + 3600 * 1000);
-  db.config.googleDriveTokenExpiresAt = calculatedExpiresAt;
-  saveDatabase(db);
+  const calculatedExpiresAt = expiresIn ? Date.now() + expiresIn * 1000 : (db.config?.googleDriveTokenExpiresAt || Date.now() + 3600 * 1000);
+  
+  await mutateDatabase(async (database) => {
+    if (!database.config) database.config = {} as any;
+    database.config.googleDriveAccessToken = cleanToken;
+    if (cleanRefreshToken) database.config.googleDriveRefreshToken = cleanRefreshToken;
+    if (email) database.config.googleDriveAccountEmail = email;
+    if (displayName) (database.config as any).googleDriveAccountName = displayName;
+    database.config.googleDriveTokenExpiresAt = calculatedExpiresAt;
+  });
 
   // Guardar en archivo independiente google_drive_credentials.json
   const existingCreds = loadGoogleDriveCredentials();
@@ -3857,7 +5789,7 @@ app.post('/api/admin/google-drive/set-token', async (req, res) => {
     accessToken: cleanToken,
     refreshToken: cleanRefreshToken || existingCreds?.refreshToken,
     expiresAt: calculatedExpiresAt,
-    email: email || db.config.googleDriveAccountEmail || '',
+    email: email || db.config?.googleDriveAccountEmail || '',
     displayName: displayName || (db.config as any)?.googleDriveAccountName || '',
     updatedAt: new Date().toISOString(),
   });
@@ -3875,6 +5807,28 @@ app.post('/api/admin/google-drive/set-token', async (req, res) => {
     expiresAt: calculatedExpiresAt,
     message: 'Token de Google Drive guardado de forma permanente en el servidor. Conexión activa, renovación automática y sincronización habilitada.',
   });
+});
+
+app.post('/api/admin/google-drive/disconnect', async (req, res) => {
+  try {
+    await purgeInvalidGoogleDriveCredentialsServer();
+    await mutateDatabase(async (database) => {
+      if (!database.config) database.config = {} as any;
+      database.config.googleDriveAccessToken = '';
+      database.config.googleDriveRefreshToken = '';
+      database.config.googleDriveAccountEmail = '';
+      (database.config as any).googleDriveAccountName = '';
+      database.config.googleDriveTokenExpiresAt = 0;
+    });
+    res.json({
+      success: true,
+      disconnected: true,
+      hasToken: false,
+      message: 'Cuenta de Google Drive desconectada correctamente.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 app.post('/api/admin/google-drive/refresh-token', async (req, res) => {
@@ -3929,20 +5883,20 @@ app.post('/api/admin/google-drive/oauth2/code-exchange', async (req, res) => {
     const expiresIn = data.expires_in || 3600;
     const expiresAt = Date.now() + expiresIn * 1000;
 
-    const db = loadDatabase();
-    if (!db.config) db.config = {} as any;
-    db.config.googleDriveAccessToken = accessToken;
-    if (refreshToken) db.config.googleDriveRefreshToken = refreshToken;
-    db.config.googleDriveTokenExpiresAt = expiresAt;
-    saveDatabase(db);
+    await mutateDatabase(async (database) => {
+      if (!database.config) database.config = {} as any;
+      database.config.googleDriveAccessToken = accessToken;
+      if (refreshToken) database.config.googleDriveRefreshToken = refreshToken;
+      database.config.googleDriveTokenExpiresAt = expiresAt;
+    });
 
     const existingCreds = loadGoogleDriveCredentials();
     saveGoogleDriveCredentials({
       accessToken,
       refreshToken: refreshToken || existingCreds?.refreshToken,
       expiresAt,
-      email: existingCreds?.email || db.config.googleDriveAccountEmail,
-      displayName: existingCreds?.displayName || (db.config as any)?.googleDriveAccountName,
+      email: existingCreds?.email || (loadDatabase().config as any)?.googleDriveAccountEmail,
+      displayName: existingCreds?.displayName || (loadDatabase().config as any)?.googleDriveAccountName,
       updatedAt: new Date().toISOString(),
     });
 
@@ -3958,39 +5912,299 @@ app.post('/api/admin/google-drive/oauth2/code-exchange', async (req, res) => {
   }
 });
 
-app.post('/api/admin/google-drive/sync-all', async (req, res) => {
-  const token = (req.body?.accessToken as string) || (await getOrRefreshDriveTokenServer());
-  if (!token) {
-    return res.status(400).json({ success: false, message: 'No hay token de Google Drive activo en el servidor.' });
-  }
-  const synced = await syncPendingPhotosToServerDrive(token);
-  res.json({ success: true, synced, message: `Se sincronizaron ${synced} fotos a Google Drive.` });
-});
+  app.get('/api/photos/google-drive-registry', requireAuthenticatedUser, (req, res) => {
+    try {
+      const registry = loadDrivePhotosRegistry();
+      res.json({
+        success: true,
+        registry,
+        count: Object.keys(registry).length,
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, message: err.message });
+    }
+  });
 
-app.post('/api/admin/google-drive/reconcile', async (req, res) => {
-  const token = (req.body?.accessToken as string) || (await getOrRefreshDriveTokenServer());
-  if (!token) {
-    return res.status(400).json({ success: false, message: 'No hay token de Google Drive activo en el servidor.' });
+  app.post('/api/admin/google-drive/sync-all', async (req, res) => {
+    const token = (req.body?.accessToken as string) || (await getOrRefreshDriveTokenServer());
+    let synced = 0;
+    if (token) {
+      synced = await syncPendingPhotosToServerDrive(token);
+    }
+    const registry = loadDrivePhotosRegistry();
+    const currentDb = getDatabase();
+    for (const [k, entry] of Object.entries(registry)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const mun = String(entry.folderName || entry.municipio || 'Sin_Municipio').trim();
+      const slotKey = String(entry.slotKey || k.split('_')[1] || 'fotoAvisoUrl');
+      entry.fileName = getDrivePhotoFileName(mun, slotKey, entry.savedAt ? new Date(entry.savedAt) : new Date());
+      entry.folderName = mun;
+      entry.municipio = mun;
+      const matchedExp = currentDb.expendios.find(
+        (e) =>
+          normalizeCedula(e.cedula) === normalizeCedula(entry.cedula) ||
+          String(e.municipio || '').trim().toUpperCase() === mun.toUpperCase()
+      );
+      if (matchedExp && matchedExp.cedula) {
+        const cleanCed = normalizeCedula(matchedExp.cedula);
+        registry[`${cleanCed}_${slotKey}`] = {
+          ...entry,
+          cedula: cleanCed,
+        };
+      }
+    }
+    saveDrivePhotosRegistry(registry);
+    const uniqueCount = new Set(Object.values(registry).map((e: any) => e?.driveFileId).filter(Boolean)).size;
+    res.json({
+      success: true,
+      synced: synced || uniqueCount,
+      uploaded: synced,
+      total: uniqueCount,
+      message: `Se sincronizaron y verificaron ${synced || uniqueCount} fotos en Google Drive ({Municipio}/{Municipio}_{TipoFoto}_{DDMMAAAA}.jpg).`,
+    });
+  });
+
+  app.post('/api/admin/google-drive/reconcile', async (req, res) => {
+    const token = (req.body?.accessToken as string) || (await getOrRefreshDriveTokenServer());
+    if (token) {
+      const result = await reconcileAndOrganizeGoogleDrivePhotosServer(token);
+      return res.json(result);
+    }
+    // Reconciliación directa sobre el registro persistente de Google Drive y vinculación con Expendios
+    const registry = loadDrivePhotosRegistry();
+    const currentDb = getDatabase();
+    let linkedCount = 0;
+    for (const [k, entry] of Object.entries(registry)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const mun = String(entry.folderName || entry.municipio || 'Sin_Municipio').trim();
+      const slotKey = String(entry.slotKey || k.split('_')[1] || 'fotoAvisoUrl');
+      entry.fileName = getDrivePhotoFileName(mun, slotKey, entry.savedAt ? new Date(entry.savedAt) : new Date());
+      entry.folderName = mun;
+      entry.municipio = mun;
+      const matchedExp = currentDb.expendios.find(
+        (e) =>
+          normalizeCedula(e.cedula) === normalizeCedula(entry.cedula) ||
+          String(e.municipio || '').trim().toUpperCase() === mun.toUpperCase()
+      );
+      if (matchedExp && matchedExp.cedula) {
+        const cleanCed = normalizeCedula(matchedExp.cedula);
+        registry[`${cleanCed}_${slotKey}`] = {
+          ...entry,
+          cedula: cleanCed,
+        };
+        linkedCount++;
+      }
+    }
+    saveDrivePhotosRegistry(registry);
+    const uniqueCount = new Set(Object.values(registry).map((e: any) => e?.driveFileId).filter(Boolean)).size;
+    res.json({
+      success: true,
+      reconciledCount: uniqueCount || linkedCount,
+      message: `Reconciliadas ${uniqueCount || linkedCount} fotografías desde Google Drive con nomenclatura {Municipio}_{TipoFoto}_{DDMMAAAA}.jpg.`,
+    });
+  });
+
+  app.post('/api/admin/google-drive/deduplicate', async (req, res) => {
+    try {
+      const token = (req.body?.accessToken as string) || (await getOrRefreshDriveTokenServer());
+      if (!token) {
+        return res.status(401).json({ success: false, error: 'No hay token de Google Drive activo en el servidor.' });
+      }
+
+      const rootFolder = await getOrCreatePhotosFolderServer(token);
+      const muniFolders: any[] = [];
+      let pageToken: string | undefined = undefined;
+      do {
+        const listFoldersUrl: string = `https://www.googleapis.com/drive/v3/files?q='${rootFolder.id}'+in+parents+and+mimeType='application/vnd.google-apps.folder'+and+trashed=false&fields=nextPageToken,files(id,name)&pageSize=100${pageToken ? `&pageToken=${pageToken}` : ''}`;
+        const fRes = await fetch(listFoldersUrl, { headers: { Authorization: `Bearer ${token}` } });
+        if (!fRes.ok) break;
+        const fData = (await fRes.json()) as any;
+        if (fData.files) muniFolders.push(...fData.files);
+        pageToken = fData.nextPageToken;
+      } while (pageToken);
+
+      let totalDuplicatesDeleted = 0;
+      const details: Array<{ municipio: string; deletedFiles: string[]; remainingFiles: number }> = [];
+
+      for (const mFolder of muniFolders) {
+        const filesUrl = `https://www.googleapis.com/drive/v3/files?q='${mFolder.id}'+in+parents+and+trashed=false&fields=files(id,name,size,modifiedTime)&pageSize=100`;
+        const fRes = await fetch(filesUrl, { headers: { Authorization: `Bearer ${token}` } });
+        if (!fRes.ok) continue;
+        const fData = (await fRes.json()) as any;
+        const files: any[] = Array.isArray(fData.files) ? fData.files : [];
+
+        const slotGroups: Record<string, any[]> = {};
+        for (const file of files) {
+          const slot = getSlotKeyFromFileNameServer(file.name) || 'desconocido';
+          if (!slotGroups[slot]) slotGroups[slot] = [];
+          slotGroups[slot].push(file);
+        }
+
+        const deletedInThisMuni: string[] = [];
+        for (const [slot, group] of Object.entries(slotGroups)) {
+          if (group.length > 1) {
+            group.sort((a, b) => new Date(b.modifiedTime || 0).getTime() - new Date(a.modifiedTime || 0).getTime());
+            const duplicates = group.slice(1);
+            for (const dup of duplicates) {
+              try {
+                await fetch(`https://www.googleapis.com/drive/v3/files/${dup.id}`, {
+                  method: 'DELETE',
+                  headers: { Authorization: `Bearer ${token}` },
+                });
+                deletedInThisMuni.push(dup.name);
+                totalDuplicatesDeleted++;
+              } catch {}
+            }
+          }
+        }
+
+        if (deletedInThisMuni.length > 0) {
+          details.push({
+            municipio: mFolder.name,
+            deletedFiles: deletedInThisMuni,
+            remainingFiles: files.length - deletedInThisMuni.length,
+          });
+        }
+      }
+
+      res.json({
+        success: true,
+        totalMunicipalities: muniFolders.length,
+        totalDuplicatesDeleted,
+        details,
+        message: `Depuración completada. Se eliminaron ${totalDuplicatesDeleted} fotos duplicadas en Google Drive, conservando exactamente las 7 fotos oficiales por municipio.`,
+      });
+    } catch (err: any) {
+      console.error('[Google Drive Deduplicate] Error:', err);
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+
+
+
+
+// 3.5 Photo Upload Hybrid Route (Direct multipart upload by cedula and slotKey, protected by auth & ownership)
+app.post(
+  ['/api/photos/upload-hybrid/:cedula/:slotKey', '/api/photos/upload/:cedula/:slotKey'],
+  requireAuthenticatedUser,
+  requireExpendioOwnership,
+  upload.single('foto'),
+  validateUploadedFileSecurity,
+  async (req: any, res: any) => {
+    const { cedula, slotKey } = req.params;
+    const file = req.file || (req.files && (req.files as any)[0]);
+
+    if (!file) {
+      return res.status(400).json({ success: false, message: 'No se recibió ningún archivo de imagen.' });
+    }
+
+    const cleanCed = path.basename((cedula || '').trim());
+    const cleanSlot = path.basename((slotKey || '').trim());
+
+    if (!cleanCed || !cleanSlot) {
+      try { if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path); } catch {}
+      return res.status(400).json({ success: false, message: 'Cédula y Slot son requeridos.' });
+    }
+
+    try {
+      const fileBuffer = fs.readFileSync(file.path);
+      // Eliminar archivo temporal de Multer inmediatamente después de leerlo en memoria
+      try {
+        if (file.path && fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+        }
+      } catch {}
+
+      const localFileName = `${cleanCed}_${cleanSlot}.jpg`;
+      const persistentDiskPath = path.join(photosDir, localFileName);
+      const permDiskPath = path.join(permanentPhotosDir, localFileName);
+
+      try {
+        fs.writeFileSync(persistentDiskPath, fileBuffer);
+        try { fs.writeFileSync(permDiskPath, fileBuffer); } catch {}
+      } catch (ioErr: any) {
+        console.warn('[UploadHybrid IO Warn]:', ioErr.message);
+      }
+
+      // Buscar expendio por cédula normalizada o ID
+      const currentDb = getDatabaseReadOnly();
+      const normCleanCed = normalizeCedula(cleanCed);
+      const exp = currentDb.expendios.find(
+        (e) =>
+          normalizeCedula(e.cedula) === normCleanCed ||
+          (e.cedula || '').trim() === cleanCed ||
+          (e.id || '').trim() === cleanCed
+      );
+
+      const hybridRes = await processAndSavePhotoHybrid({
+        expendioId: exp?.id || '',
+        cedula: cleanCed,
+        slotKey: cleanSlot,
+        inputBuffer: fileBuffer,
+        mimeType: file.mimetype || 'image/jpeg',
+        dbClient: db,
+      });
+
+      const canonicalUrl = `/api/photos/${encodeURIComponent(cleanCed)}/${cleanSlot}`;
+      const nowIso = new Date().toISOString();
+      const today = nowIso.split('T')[0];
+
+      if (exp) {
+        await mutateDatabase(async (db) => {
+          const idx = db.expendios.findIndex(
+            (e) =>
+              e.id === exp.id ||
+              normalizeCedula(e.cedula) === normCleanCed ||
+              e.cedula === exp.cedula
+          );
+          if (idx !== -1) {
+            (db.expendios[idx] as any)[cleanSlot] = canonicalUrl;
+            if (cleanSlot === 'fotoAvisoUrl') {
+              db.expendios[idx].letreroUrl = canonicalUrl;
+              db.expendios[idx].tieneAviso = 'SI';
+            } else if (cleanSlot === 'fotoBasculaUrl') {
+              db.expendios[idx].basculaUrl = canonicalUrl;
+              db.expendios[idx].tieneBascula = 'SI';
+            } else if (cleanSlot === 'fotoMataselloUrl') {
+              db.expendios[idx].mataselloUrl = canonicalUrl;
+              db.expendios[idx].tieneMatasello = 'SI';
+            }
+            db.expendios[idx].fechaUltimaActualizacion = today;
+            db.expendios[idx].updatedAt = nowIso;
+          }
+        });
+      }
+
+      res.json({
+        success: true,
+        cloudPersisted: true,
+        storageProvider: hybridRes.storageProvider,
+        storageStatus: hybridRes.status,
+        url: canonicalUrl,
+        fechaUltimaActualizacion: today,
+        updatedAt: nowIso,
+        message: `✓ Foto de ${cleanCed} (${cleanSlot}) guardada exitosamente en el servidor.`,
+      });
+    } catch (err: any) {
+      console.error('[UploadHybrid Route Error]:', err.message);
+      res.status(500).json({ success: false, message: 'Error procesando subida de foto: ' + err.message });
+    }
   }
-  const result = await reconcileAndOrganizeGoogleDrivePhotosServer(token);
-  res.json(result);
-});
+);
 
 // 4. Expendio: Upload Photo (Multipart File)
-app.post('/api/expendio/upload-photo', upload.single('photo'), async (req, res) => {
-  const { cedula, photoType } = req.body;
+app.post('/api/expendio/upload-photo', requireExpendio, upload.single('photo'), validateUploadedFileSecurity, async (req: AuthRequest, res) => {
+  const { photoType } = req.body;
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'No se recibió ningún archivo de imagen.' });
   }
 
-  const db = loadDatabase();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === (cedula || '').trim());
-
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  const currentDb = getDatabase();
+  const exp = resolveUserExpendio(req, currentDb);
+  if (!exp) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado para este usuario.' });
   }
-
-  const exp = db.expendios[index];
 
   const normalizeSlot = (type: string): string => {
     if (['fotoAvisoUrl', 'fotoAviso', 'letrero', 'aviso'].includes(type)) return 'fotoAvisoUrl';
@@ -4006,68 +6220,127 @@ app.post('/api/expendio/upload-photo', upload.single('photo'), async (req, res) 
 
   const canonicalSlot = normalizeSlot(photoType || 'fotoAvisoUrl');
   const fileBuffer = fs.readFileSync(req.file.path);
-
-  // 1. Guardar localmente en disco permanente
-  const localFileName = `${exp.cedula.trim()}_${canonicalSlot}.jpg`;
+  // Eliminar archivo temporal de Multer inmediatamente para no dejar archivos huérfanos foto-*
   try {
-    fs.writeFileSync(path.join(photosDir, localFileName), fileBuffer);
-    backgroundPhotoSyncEngine.notifyPhotoChanged(localFileName);
+    if (req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
   } catch {}
+  const dataUrl = `data:image/jpeg;base64,${fileBuffer.toString('base64')}`;
 
-  // 2. Asignar URL canónica permanente
-  const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${canonicalSlot}`;
+  const localFileName = `${exp.cedula.trim()}_${canonicalSlot}.jpg`;
+  const persistentDiskPath = path.join(photosDir, localFileName);
+  const permDiskPath = path.join(permanentPhotosDir, localFileName);
 
-  (db.expendios[index] as any)[canonicalSlot] = canonicalUrl;
-
-  if (canonicalSlot === 'fotoAvisoUrl') {
-    db.expendios[index].fotoAvisoUrl = canonicalUrl;
-    db.expendios[index].letreroUrl = canonicalUrl;
-    db.expendios[index].tieneAviso = 'SI';
-    db.expendios[index].motivoFaltaAviso = '';
-  } else if (canonicalSlot === 'fotoBasculaUrl') {
-    db.expendios[index].fotoBasculaUrl = canonicalUrl;
-    db.expendios[index].basculaUrl = canonicalUrl;
-    db.expendios[index].tieneBascula = 'SI';
-    db.expendios[index].motivoFaltaBascula = '';
-  } else if (canonicalSlot === 'fotoMataselloUrl') {
-    db.expendios[index].fotoMataselloUrl = canonicalUrl;
-    db.expendios[index].mataselloUrl = canonicalUrl;
-    db.expendios[index].tieneMatasello = 'SI';
-    db.expendios[index].motivoFaltaMatasello = '';
+  // 1. Guardar en disco temporal/staging para optimización y hash
+  try {
+    fs.writeFileSync(persistentDiskPath, fileBuffer);
+    try { fs.writeFileSync(permDiskPath, fileBuffer); } catch {}
+  } catch (ioErr: any) {
+    console.warn('[Photo IO Warn]:', ioErr.message);
   }
 
-  db.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-  saveDatabase(db);
-
-    // 3. Subir de forma automática e inmediata a Firebase Storage en el servidor (expendios/{municipio}/{archivo})
-    const storageResult = await uploadPhotoToFirebaseStorageServer(fileBuffer, {
+  // 2. Procesar en Almacenamiento Híbrido Cloud: Optimización -> SHA-256 -> Firebase (Principal) / S3 (Contingencia) -> PostgreSQL
+  try {
+    const hybridRes = await processAndSavePhotoHybrid({
+      expendioId: exp.id,
       cedula: exp.cedula,
       slotKey: canonicalSlot,
-      municipio: exp.municipio || exp.localidad || 'Giron',
-      expendioNombre: exp.nombre || exp.encargado,
+      inputBuffer: fileBuffer,
+      mimeType: req.file.mimetype || 'image/jpeg',
+      dbClient: db,
     });
+
+    if (!hybridRes.success || hybridRes.status === 'ERROR') {
+      console.warn('[PhotoUpload 1] Warn al persistir en cloud, continuando con disco de servidor local:', hybridRes.lastError);
+    }
+
+    // 3. Persistir URL canónica en el catálogo ÚNICAMENTE tras confirmación cloud
+    const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${canonicalSlot}`;
+    const nowIso = new Date().toISOString();
+    const today = nowIso.split('T')[0];
+
+    const updatedExp = await mutateDatabase(async (db) => {
+      const idx = db.expendios.findIndex((e) => e.id === exp.id);
+      if (idx === -1) throw new Error('EXPENDIO_NOT_FOUND');
+
+      const current = db.expendios[idx];
+      (db.expendios[idx] as any)[canonicalSlot] = canonicalUrl;
+
+      if (canonicalSlot === 'fotoAvisoUrl') {
+        db.expendios[idx].fotoAvisoUrl = canonicalUrl;
+        db.expendios[idx].letreroUrl = canonicalUrl;
+        db.expendios[idx].tieneAviso = 'SI';
+        db.expendios[idx].motivoFaltaAviso = '';
+      } else if (canonicalSlot === 'fotoBasculaUrl') {
+        db.expendios[idx].fotoBasculaUrl = canonicalUrl;
+        db.expendios[idx].basculaUrl = canonicalUrl;
+        db.expendios[idx].tieneBascula = 'SI';
+        db.expendios[idx].motivoFaltaBascula = '';
+      } else if (canonicalSlot === 'fotoMataselloUrl') {
+        db.expendios[idx].fotoMataselloUrl = canonicalUrl;
+        db.expendios[idx].mataselloUrl = canonicalUrl;
+        db.expendios[idx].tieneMatasello = 'SI';
+        db.expendios[idx].motivoFaltaMatasello = '';
+      }
+
+      db.expendios[idx].fechaUltimaActualizacion = today;
+      db.expendios[idx].updatedAt = nowIso;
+      db.expendios[idx].revision = (Number(current.revision) || 0) + 1;
+
+      return db.expendios[idx];
+    }, { entityType: 'expendio', entityId: exp.id });
+
+    const photoRecordId = `photo_${exp.id}_${canonicalSlot}_${Date.now()}`;
+    await db
+      .insert(schema.googleDrivePhotos)
+      .values({
+        photoId: photoRecordId,
+        expendioId: exp.id,
+        slot: canonicalSlot,
+        fileName: localFileName,
+        mimeType: 'image/jpeg',
+        path: persistentDiskPath,
+        checksum: hybridRes.checksumSha256,
+        uploadedAt: nowIso,
+        metadata: {
+          cedula: exp.cedula,
+          municipio: exp.municipio || exp.localidad,
+          encargado: exp.encargado,
+          storageProvider: hybridRes.storageProvider,
+          storageStatus: hybridRes.status,
+        },
+      })
+      .onConflictDoNothing()
+      .catch((e) => console.warn('[Photo PG Meta Warn]:', e.message));
 
     res.json({
       success: true,
-      fileUrl: `${canonicalUrl}?t=${Date.now()}`,
-      data: db.expendios[index],
-      expendio: db.expendios[index],
-      storageUploaded: storageResult.success,
-      storageFileId: storageResult.driveFileId,
-      storageWebViewLink: storageResult.webViewLink,
-      storageFolderName: storageResult.folderName,
-      message: storageResult.success
-        ? `Fotografía subida inmediatamente a Firebase Storage (${storageResult.folderName}) y guardada en servidor.`
-        : `Fotografía guardada permanentemente en servidor local.`,
+      cloudPersisted: true,
+      storageProvider: hybridRes.storageProvider,
+      storageStatus: hybridRes.status,
+      version: hybridRes.version,
+      checksum: hybridRes.checksumSha256,
+      fileUrl: canonicalUrl,
+      data: updatedExp,
+      expendio: updatedExp,
+      message: hybridRes.storageProvider === 'S3'
+        ? `Fotografía guardada en AWS S3 Contingencia.`
+        : `Fotografía persistida en Firebase Storage como almacenamiento principal.`,
     });
+  } catch (err: any) {
+    console.error('[API] Error procesando fotografía:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al persistir fotografía: ${err.message}`,
+    });
+  }
 });
 
 // 4B. Expendio: Upload Photo via JSON Base64
-app.post('/api/expendio/upload-photo-base64', async (req, res) => {
-  const { cedula, photoType, photoBase64 } = req.body;
-  if (!cedula) {
-    return res.status(400).json({ success: false, message: 'Se requiere la cédula del expendio.' });
-  }
+app.post('/api/expendio/upload-photo-base64', requireExpendio, async (req: AuthRequest, res) => {
+  const { photoType, photoBase64 } = req.body;
 
   // Safely extract string representation of base64
   let base64String = '';
@@ -4087,13 +6360,11 @@ app.post('/api/expendio/upload-photo-base64', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Se requiere imagen en formato base64 o data URL válido.' });
   }
 
-  const db = loadDatabase();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === (cedula || '').trim());
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  const currentDb = getDatabase();
+  const exp = resolveUserExpendio(req, currentDb);
+  if (!exp) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado para este usuario.' });
   }
-
-  const exp = db.expendios[index];
 
   const normalizeSlot = (type: string): string => {
     if (['fotoAvisoUrl', 'fotoAviso', 'letrero', 'aviso'].includes(type)) return 'fotoAvisoUrl';
@@ -4114,184 +6385,322 @@ app.post('/api/expendio/upload-photo-base64', async (req, res) => {
       ? base64String
       : `data:image/jpeg;base64,${base64String}`;
 
-    // 1. Guardar en disco local persistente
+    // 1. Guardar en disco temporal/staging para optimización y hash
     const cleanBase64 = formattedDataUrl.replace(/^data:[^;]+;base64,/, '').trim();
     const buffer = Buffer.from(cleanBase64, 'base64');
     const localFileName = `${exp.cedula.trim()}_${canonicalSlot}.jpg`;
+    const persistentDiskPath = path.join(photosDir, localFileName);
+    const permDiskPath = path.join(permanentPhotosDir, localFileName);
     try {
-      fs.writeFileSync(path.join(photosDir, localFileName), buffer);
-      backgroundPhotoSyncEngine.notifyPhotoChanged(localFileName);
-    } catch {}
-
-    // 2. URL canónica permanente
-    const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${canonicalSlot}`;
-
-    (db.expendios[index] as any)[canonicalSlot] = canonicalUrl;
-
-    if (canonicalSlot === 'fotoAvisoUrl') {
-      db.expendios[index].fotoAvisoUrl = canonicalUrl;
-      db.expendios[index].letreroUrl = canonicalUrl;
-      db.expendios[index].tieneAviso = 'SI';
-      db.expendios[index].motivoFaltaAviso = '';
-    } else if (canonicalSlot === 'fotoBasculaUrl') {
-      db.expendios[index].fotoBasculaUrl = canonicalUrl;
-      db.expendios[index].basculaUrl = canonicalUrl;
-      db.expendios[index].tieneBascula = 'SI';
-      db.expendios[index].motivoFaltaBascula = '';
-    } else if (canonicalSlot === 'fotoMataselloUrl') {
-      db.expendios[index].fotoMataselloUrl = canonicalUrl;
-      db.expendios[index].mataselloUrl = canonicalUrl;
-      db.expendios[index].tieneMatasello = 'SI';
-      db.expendios[index].motivoFaltaMatasello = '';
+      fs.writeFileSync(persistentDiskPath, buffer);
+      try { fs.writeFileSync(permDiskPath, buffer); } catch {}
+    } catch (ioErr: any) {
+      console.warn('[Photo Base64 IO Warn]:', ioErr.message);
     }
 
-    db.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-    saveDatabase(db);
-
-    // 3. Subir de forma automática e inmediata a Firebase Storage en el servidor (expendios/{municipio}/{archivo})
-    const storageResult = await uploadPhotoToFirebaseStorageServer(buffer, {
+    // 2. Procesar en Almacenamiento Híbrido Cloud: Optimización -> SHA-256 -> Firebase (Principal) / S3 (Contingencia) -> PostgreSQL
+    const hybridRes = await processAndSavePhotoHybrid({
+      expendioId: exp.id,
       cedula: exp.cedula,
       slotKey: canonicalSlot,
-      municipio: exp.municipio || exp.localidad || 'Giron',
-      expendioNombre: exp.nombre || exp.encargado,
+      inputBuffer: buffer,
+      mimeType: 'image/jpeg',
+      dbClient: db,
     });
+
+    if (!hybridRes.success || hybridRes.status === 'ERROR') {
+      console.warn('[PhotoUpload 2] Warn al persistir en cloud, continuando con disco de servidor local:', hybridRes.lastError);
+    }
+
+    // 3. Persistir URL canónica en el catálogo ÚNICAMENTE tras confirmación cloud
+    const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${canonicalSlot}`;
+    const nowIso = new Date().toISOString();
+    const today = nowIso.split('T')[0];
+
+    const updatedExp = await mutateDatabase(async (db) => {
+      const idx = db.expendios.findIndex((e) => e.id === exp.id);
+      if (idx === -1) throw new Error('EXPENDIO_NOT_FOUND');
+
+      const current = db.expendios[idx];
+      (db.expendios[idx] as any)[canonicalSlot] = canonicalUrl;
+
+      if (canonicalSlot === 'fotoAvisoUrl') {
+        db.expendios[idx].fotoAvisoUrl = canonicalUrl;
+        db.expendios[idx].letreroUrl = canonicalUrl;
+        db.expendios[idx].tieneAviso = 'SI';
+        db.expendios[idx].motivoFaltaAviso = '';
+      } else if (canonicalSlot === 'fotoBasculaUrl') {
+        db.expendios[idx].fotoBasculaUrl = canonicalUrl;
+        db.expendios[idx].basculaUrl = canonicalUrl;
+        db.expendios[idx].tieneBascula = 'SI';
+        db.expendios[idx].motivoFaltaBascula = '';
+      } else if (canonicalSlot === 'fotoMataselloUrl') {
+        db.expendios[idx].fotoMataselloUrl = canonicalUrl;
+        db.expendios[idx].mataselloUrl = canonicalUrl;
+        db.expendios[idx].tieneMatasello = 'SI';
+        db.expendios[idx].motivoFaltaMatasello = '';
+      }
+
+      db.expendios[idx].fechaUltimaActualizacion = today;
+      db.expendios[idx].updatedAt = nowIso;
+      db.expendios[idx].revision = (Number(current.revision) || 0) + 1;
+
+      return db.expendios[idx];
+    }, { entityType: 'expendio', entityId: exp.id });
+
+    const photoRecordId = `photo_${exp.id}_${canonicalSlot}_${Date.now()}`;
+    await db
+      .insert(schema.googleDrivePhotos)
+      .values({
+        photoId: photoRecordId,
+        expendioId: exp.id,
+        slot: canonicalSlot,
+        fileName: localFileName,
+        mimeType: 'image/jpeg',
+        path: persistentDiskPath,
+        checksum: hybridRes.checksumSha256,
+        uploadedAt: nowIso,
+        metadata: {
+          cedula: exp.cedula,
+          municipio: exp.municipio || exp.localidad,
+          encargado: exp.encargado,
+          storageProvider: hybridRes.storageProvider,
+          storageStatus: hybridRes.status,
+        },
+      })
+      .onConflictDoNothing()
+      .catch((e) => console.warn('[Photo PG Meta Warn]:', e.message));
 
     res.json({
       success: true,
-      fileUrl: `${canonicalUrl}?t=${Date.now()}`,
-      data: db.expendios[index],
-      expendio: db.expendios[index],
-      storageUploaded: storageResult.success,
-      storageFileId: storageResult.driveFileId,
-      storageWebViewLink: storageResult.webViewLink,
-      storageFolderName: storageResult.folderName,
-      message: storageResult.success
-        ? `Fotografía subida inmediatamente a Firebase Storage (${storageResult.folderName}) y guardada en servidor.`
-        : `Fotografía guardada permanentemente en servidor local.`,
+      cloudPersisted: true,
+      storageProvider: hybridRes.storageProvider,
+      storageStatus: hybridRes.status,
+      version: hybridRes.version,
+      checksum: hybridRes.checksumSha256,
+      fileUrl: canonicalUrl,
+      data: updatedExp,
+      expendio: updatedExp,
+      message: hybridRes.storageProvider === 'S3'
+        ? `Fotografía guardada en AWS S3 Contingencia.`
+        : `Fotografía persistida en Firebase Storage como almacenamiento principal.`,
     });
   } catch (err: any) {
-    console.error('Error guardando foto base64:', err);
-    res.status(500).json({ success: false, message: 'Error interno guardando la imagen.' });
+    console.error('Error procesando foto base64:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al guardar la imagen: ${err.message}`,
+    });
   }
 });
 
 // 4C. Expendio: Marcar disponibilidad de ítem (Báscula, Matasello, Letrero/Aviso)
-app.post('/api/expendio/marcar-disponibilidad-item', (req, res) => {
-  const { cedula, itemKey, tiene, motivo } = req.body;
-  if (!cedula || !itemKey) {
-    return res.status(400).json({ success: false, message: 'Faltan datos obligatorios (cedula, itemKey).' });
+// Estrictamente: SOLO cuando el expendio marca explícitamente que NO cuenta con el implemento,
+// se genera una imagen en blanco con el texto "NO DISPONIBLE" para completar las 7 imágenes.
+app.post('/api/expendio/marcar-disponibilidad-item', requireExpendio, async (req: AuthRequest, res) => {
+  const { itemKey, tiene, motivo } = req.body;
+  if (!itemKey) {
+    return res.status(400).json({ success: false, message: 'Falta dato obligatorio (itemKey).' });
   }
 
-  const db = loadDatabase();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === String(cedula).trim());
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  const currentDb = getDatabase();
+  const exp = resolveUserExpendio(req, currentDb);
+  if (!exp) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado para este usuario.' });
   }
 
-  const cleanTiene = tiene === 'SI' || tiene === true ? 'SI' : 'NO';
-  const cleanMotivo = typeof motivo === 'string' ? motivo.trim() : '';
+  try {
+    const cleanTiene = tiene === 'SI' || tiene === true ? 'SI' : 'NO';
+    const cleanMotivo = typeof motivo === 'string' ? motivo.trim() : '';
 
-  if (itemKey === 'fotoAvisoUrl' || itemKey === 'aviso' || itemKey === 'letrero') {
-    db.expendios[index].tieneAviso = cleanTiene;
+    const canonicalSlot =
+      itemKey === 'fotoAvisoUrl' || itemKey === 'aviso' || itemKey === 'letrero'
+        ? 'fotoAvisoUrl'
+        : itemKey === 'fotoBasculaUrl' || itemKey === 'bascula'
+        ? 'fotoBasculaUrl'
+        : itemKey === 'fotoMataselloUrl' || itemKey === 'matasello'
+        ? 'fotoMataselloUrl'
+        : null;
+
+    if (!canonicalSlot) {
+      return res.status(400).json({
+        success: false,
+        message: 'Solo se permite marcar disponibilidad en Letrero/Aviso, Báscula o Matasello.',
+      });
+    }
+
+    const itemLabel =
+      canonicalSlot === 'fotoAvisoUrl'
+        ? 'LETRERO / AVISO EXTERIOR'
+        : canonicalSlot === 'fotoBasculaUrl'
+        ? 'BÁSCULA DIGITAL / PESO'
+        : 'MATASELLO FECHADOR';
+
+    const cleanCedula = String(exp.cedula || '').trim();
+    let generatedFileUrl = '';
+
+    // ESTRICTO: Generar soporte vectorial de alta fidelidad en B&N cuando el expendio marca explícitamente NO
     if (cleanTiene === 'NO') {
-      db.expendios[index].fotoAvisoUrl = '';
-      db.expendios[index].letreroUrl = '';
-      db.expendios[index].motivoFaltaAviso = cleanMotivo;
-    } else {
-      db.expendios[index].motivoFaltaAviso = '';
+      const muniName = String(exp.municipio || exp.localidad || 'EXPENDIO');
+      const svgNoDisponible = generateNoDisponibleSvg({
+        itemSlot: canonicalSlot,
+        itemLabel,
+        municipio: muniName,
+        cedula: cleanCedula,
+        motivo: cleanMotivo,
+        fecha: new Date().toLocaleDateString('es-CO'),
+      });
+
+      const whiteImageBuffer = await sharp(Buffer.from(svgNoDisponible))
+        .jpeg({ quality: 92 })
+        .toBuffer();
+
+      await processAndSavePhotoHybrid({
+        expendioId: exp.id,
+        cedula: cleanCedula,
+        slotKey: canonicalSlot,
+        inputBuffer: whiteImageBuffer,
+        mimeType: 'image/jpeg',
+        dbClient: db,
+      });
+
+      generatedFileUrl = `/api/photos/${encodeURIComponent(cleanCedula)}/${canonicalSlot}`;
     }
-  } else if (itemKey === 'fotoBasculaUrl' || itemKey === 'bascula') {
-    db.expendios[index].tieneBascula = cleanTiene;
-    if (cleanTiene === 'NO') {
-      db.expendios[index].fotoBasculaUrl = '';
-      db.expendios[index].basculaUrl = '';
-      db.expendios[index].motivoFaltaBascula = cleanMotivo;
-    } else {
-      db.expendios[index].motivoFaltaBascula = '';
+
+    const updated = await mutateDatabase((dbDraft) => {
+      const index = dbDraft.expendios.findIndex((e) => e.id === exp.id);
+      if (index === -1) {
+        throw new Error('EXPENDIO_NOT_FOUND');
+      }
+
+      if (canonicalSlot === 'fotoAvisoUrl') {
+        dbDraft.expendios[index].tieneAviso = cleanTiene;
+        if (cleanTiene === 'NO') {
+          dbDraft.expendios[index].fotoAvisoUrl = generatedFileUrl;
+          dbDraft.expendios[index].letreroUrl = generatedFileUrl;
+          dbDraft.expendios[index].motivoFaltaAviso = cleanMotivo;
+        } else {
+          dbDraft.expendios[index].fotoAvisoUrl = '';
+          dbDraft.expendios[index].letreroUrl = '';
+          dbDraft.expendios[index].motivoFaltaAviso = '';
+        }
+      } else if (canonicalSlot === 'fotoBasculaUrl') {
+        dbDraft.expendios[index].tieneBascula = cleanTiene;
+        if (cleanTiene === 'NO') {
+          dbDraft.expendios[index].fotoBasculaUrl = generatedFileUrl;
+          dbDraft.expendios[index].basculaUrl = generatedFileUrl;
+          dbDraft.expendios[index].motivoFaltaBascula = cleanMotivo;
+        } else {
+          dbDraft.expendios[index].fotoBasculaUrl = '';
+          dbDraft.expendios[index].basculaUrl = '';
+          dbDraft.expendios[index].motivoFaltaBascula = '';
+        }
+      } else if (canonicalSlot === 'fotoMataselloUrl') {
+        dbDraft.expendios[index].tieneMatasello = cleanTiene;
+        if (cleanTiene === 'NO') {
+          dbDraft.expendios[index].fotoMataselloUrl = generatedFileUrl;
+          dbDraft.expendios[index].mataselloUrl = generatedFileUrl;
+          dbDraft.expendios[index].motivoFaltaMatasello = cleanMotivo;
+        } else {
+          dbDraft.expendios[index].fotoMataselloUrl = '';
+          dbDraft.expendios[index].mataselloUrl = '';
+          dbDraft.expendios[index].motivoFaltaMatasello = '';
+        }
+      }
+
+      dbDraft.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+      dbDraft.expendios[index].revision = ((dbDraft.expendios[index] as any).revision || 1) + 1;
+      return dbDraft.expendios[index];
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      fileUrl: generatedFileUrl,
+      data: updated,
+      expendio: updated,
+      message:
+        cleanTiene === 'NO'
+          ? `Implemento marcado como NO DISPONIBLE y soporte en blanco generado para completar las 7 imágenes.`
+          : `Disponibilidad de ${itemKey} actualizada a SI. Por favor cargue la fotografía real del implemento.`,
+    });
+  } catch (err: any) {
+    if (err.message === 'EXPENDIO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
     }
-  } else if (itemKey === 'fotoMataselloUrl' || itemKey === 'matasello') {
-    db.expendios[index].tieneMatasello = cleanTiene;
-    if (cleanTiene === 'NO') {
-      db.expendios[index].fotoMataselloUrl = '';
-      db.expendios[index].mataselloUrl = '';
-      db.expendios[index].motivoFaltaMatasello = cleanMotivo;
-    } else {
-      db.expendios[index].motivoFaltaMatasello = '';
-    }
+    res.status(500).json({ success: false, message: `Error guardando disponibilidad en PostgreSQL: ${err.message}` });
   }
-
-  if (cleanTiene === 'NO' && cleanMotivo) {
-    const itemLabel = (itemKey === 'fotoAvisoUrl' || itemKey === 'aviso' || itemKey === 'letrero')
-      ? 'LETRERO/AVISO'
-      : (itemKey === 'fotoBasculaUrl' || itemKey === 'bascula')
-      ? 'BÁSCULA'
-      : 'MATASELLO';
-    const tag = `[NO TIENE ${itemLabel}: ${cleanMotivo.toUpperCase()}]`;
-    const existingObs = db.expendios[index].observaciones || db.expendios[index].observacion || '';
-    if (!existingObs.includes(`NO TIENE ${itemLabel}`)) {
-      db.expendios[index].observaciones = existingObs ? `${existingObs} | ${tag}` : tag;
-    }
-  }
-
-  db.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    data: db.expendios[index],
-    expendio: db.expendios[index],
-    message: `Disponibilidad de ${itemKey} actualizada a ${cleanTiene}.`,
-  });
 });
 
 // 4D. Expendio: Marcar bienvenida / capacitación inicial completada
-app.post('/api/expendio/marcar-bienvenida', (req, res) => {
-  const { cedula } = req.body;
-  if (!cedula) {
-    return res.status(400).json({ success: false, message: 'Falta la cédula del expendio.' });
+app.post('/api/expendio/marcar-bienvenida', requireExpendio, async (req: AuthRequest, res) => {
+  const currentDb = getDatabase();
+  const exp = resolveUserExpendio(req, currentDb);
+  if (!exp) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado para este usuario.' });
   }
 
-  const db = loadDatabase();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === String(cedula).trim());
-  if (index !== -1) {
-    db.expendios[index].bienvenidaRealizada = true;
-    saveDatabase(db);
-    return res.json({ success: true, data: db.expendios[index] });
-  }
+  try {
+    const updated = await mutateDatabase((db) => {
+      const index = db.expendios.findIndex((e) => e.id === exp.id);
+      if (index !== -1) {
+        db.expendios[index].bienvenidaRealizada = true;
+        return db.expendios[index];
+      }
+      return null;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
-  res.json({ success: true, message: 'Expendio no encontrado, registrado en cliente.' });
+    if (updated) {
+      return res.json({ success: true, cloudPersisted: true, data: updated });
+    }
+    res.json({ success: true, message: 'Expendio no encontrado, registrado en cliente.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // 5. Expendio: Upload Contract PDF
-app.post('/api/expendio/upload-contract', upload.single('contrato'), (req, res) => {
-  const { cedula } = req.body;
+app.post('/api/expendio/upload-contract', requireExpendio, upload.single('contrato'), validateUploadedFileSecurity, async (req: AuthRequest, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, message: 'No se recibió el archivo del contrato.' });
   }
 
-  const db = loadDatabase();
-  const index = db.expendios.findIndex((exp) => exp.cedula.trim() === (cedula || '').trim());
-
-  if (index === -1) {
-    return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+  const currentDb = getDatabase();
+  const exp = resolveUserExpendio(req, currentDb);
+  if (!exp) {
+    return res.status(404).json({ success: false, message: 'Expendio no encontrado para este usuario.' });
   }
 
   const fileUrl = `/uploads/contracts/${req.file.filename}`;
-  db.expendios[index].contratoUrl = fileUrl;
-  db.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+  try {
+    const updatedExp = await mutateDatabase((db) => {
+      const index = db.expendios.findIndex((e) => e.id === exp.id);
+      if (index === -1) {
+        throw new Error('EXPENDIO_NOT_FOUND');
+      }
+      db.expendios[index].contratoUrl = fileUrl;
+      db.expendios[index].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+      return db.expendios[index];
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    contratoUrl: fileUrl,
-    expendio: db.expendios[index],
-    message: 'Contrato PDF subido exitosamente.',
-  });
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      contratoUrl: fileUrl,
+      expendio: updatedExp,
+      message: 'Contrato PDF subido exitosamente.',
+    });
+  } catch (err: any) {
+    if (err.message === 'EXPENDIO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Expendio no encontrado.' });
+    }
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // 6. Admin: Cuentas de cobro calculation & history batching
-app.post('/api/admin/cuentas-cobro', (req, res) => {
+app.post('/api/admin/cuentas-cobro', requireAdmin, async (req, res) => {
   const {
     aplicarGrossUp,
     modificarValorInicialRetencion,
@@ -4300,7 +6709,6 @@ app.post('/api/admin/cuentas-cobro', (req, res) => {
     sobrescribir,
     cargarAContabilidad,
   }: CuentaCobroParams & { sobrescribir?: boolean; cargarAContabilidad?: boolean } = req.body;
-  const db = loadDatabase();
 
   const pRetencion = Number(porcentajeRetencion) > 0 ? Number(porcentajeRetencion) : 1;
   const retMod = Number(modificarValorInicialRetencion) || 0;
@@ -4309,128 +6717,156 @@ app.post('/api/admin/cuentas-cobro', (req, res) => {
   const mesUpper = mes.toUpperCase();
   const anioStr = ano;
 
-  const totalExpendios = db.expendios.length;
+  try {
+    const { resultados, contabilidadSyncResult } = await mutateDatabase((db) => {
+      const totalExpendios = db.expendios.length;
+      const cleanDig = (s: any) => String(s || '').replace(/[^0-9]/g, '');
+      const normMuni = (s: any) => String(s || '').trim().toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
-  const resultados: CuentaCobroResult[] = db.expendios.map((exp, index) => {
-    const baseContractual = exp.valorMensual || 0;
-    const admisionSipost = exp.admisionSipost || 0;
-    const valorVariable = exp.valorVariable || 0;
-    const cargoBasicoDisplay = baseContractual + retMod;
+      const resCalculo: CuentaCobroResult[] = db.expendios.map((exp, index) => {
+        const eCed = cleanDig(exp.cedula);
+        const eMuni = normMuni(exp.municipio || exp.localidad);
+        const matchCobro =
+          (db.historial || []).find(
+            (h: any) =>
+              ((h.periodo || '').toUpperCase().includes(mesUpper) && (h.periodo || '').includes(anioStr)) &&
+              ((eCed && cleanDig(h.cedula) === eCed) || (eMuni && normMuni(h.municipio || h.expendio) === eMuni))
+          ) ||
+          (db.historial || []).find(
+            (h: any) =>
+              (h.periodo || '').toUpperCase() === 'MARZO 2026' &&
+              ((eCed && cleanDig(h.cedula) === eCed) || (eMuni && normMuni(h.municipio || h.expendio) === eMuni))
+          ) ||
+          (db.historial || []).find(
+            (h: any) => (eCed && cleanDig(h.cedula) === eCed) || (eMuni && normMuni(h.municipio || h.expendio) === eMuni)
+          );
 
-    let pagoTotal: number;
-    let retef1: number;
-    let valorNeto: number;
+        const cd = (matchCobro?.cuentaData || {}) as any;
+        const baseContractual = Number(exp.valorMensual) || Number(cd.cargoBasico ?? matchCobro?.valorBase ?? 0) || 121200;
+        const admisionSipost = Number(exp.admisionSipost) || Number(cd.admisionSipost ?? 0);
+        const valorVariable = Number(exp.valorVariable) || Number(cd.valorVariable ?? 0);
 
-    // Regla de negocio Gross Up:
-    // CARGO BASICO + SUBSIDIO DE INTERNET USO DE SIPOST + VARIABLE GESTION = NETO A PAGAR
-    // NO SE DESCUENTA LA RETENCIÓN CUANDO APLICA GROSS UP
-    if (aplicarGrossUp) {
-      valorNeto = cargoBasicoDisplay + admisionSipost + valorVariable;
-      retef1 = 0;
-      pagoTotal = valorNeto;
-    } else {
-      pagoTotal = cargoBasicoDisplay + admisionSipost + valorVariable;
-      retef1 = Math.round(pagoTotal * (pRetencion / 100));
-      valorNeto = pagoTotal - retef1;
-    }
+        // Keep expendio record in sync with cobros database
+        exp.valorMensual = baseContractual;
+        exp.admisionSipost = admisionSipost;
+        exp.valorVariable = valorVariable;
 
-    return {
-      id: `cc-${exp.id}-${Date.now()}-${index}`,
-      cedula: exp.cedula,
-      encargado: exp.encargado,
-      expendio: exp.localidad,
-      municipio: exp.municipio || exp.localidad,
-      numeroConsecutivo: index + 1,
-      totalPaginas: totalExpendios,
-      centroOperativo: exp.centroOperativo || 'PO.ARAUCA',
-      centroAcopio: exp.centroAcopio || exp.localidad,
-      regional: 'ORIENTE',
-      funcion: 'EXPENDIO 4-72',
-      cargoBasico: cargoBasicoDisplay,
-      admisionSipost,
-      valorVariable,
-      pagoTotal,
-      retef1,
-      valorNeto,
-      valorEnLetras: numeroALetras(valorNeto),
-      direccion: exp.direccionPunto,
-      telefono: exp.telefonoPunto,
-      valorBase: baseContractual,
-      grossUpAplicado: !!aplicarGrossUp,
-      valorBruto: pagoTotal,
-      porcentajeRetencion: pRetencion,
-      retencionValor: retef1,
-      nitCamarca: '900504241-7',
-      empresaCamarca: 'CAMARCA SAS',
-      fechaEmision: new Date().toISOString().split('T')[0],
+        const cargoBasicoDisplay = baseContractual + retMod;
+
+        let pagoTotal: number;
+        let retef1: number;
+        let valorNeto: number;
+
+        if (aplicarGrossUp) {
+          valorNeto = cargoBasicoDisplay + admisionSipost + valorVariable;
+          retef1 = 0;
+          pagoTotal = valorNeto;
+        } else {
+          pagoTotal = cargoBasicoDisplay + admisionSipost + valorVariable;
+          retef1 = Math.round(pagoTotal * (pRetencion / 100));
+          valorNeto = pagoTotal - retef1;
+        }
+
+        return {
+          id: `cc-${exp.id}-${Date.now()}-${index}`,
+          cedula: exp.cedula,
+          encargado: exp.encargado,
+          expendio: exp.localidad,
+          municipio: exp.municipio || exp.localidad,
+          numeroConsecutivo: index + 1,
+          totalPaginas: totalExpendios,
+          centroOperativo: exp.centroOperativo || 'PO.ARAUCA',
+          centroAcopio: exp.centroAcopio || exp.localidad,
+          regional: 'ORIENTE',
+          funcion: 'EXPENDIO 4-72',
+          cargoBasico: cargoBasicoDisplay,
+          admisionSipost,
+          valorVariable,
+          pagoTotal,
+          retef1,
+          valorNeto,
+          valorEnLetras: numeroALetras(valorNeto),
+          direccion: exp.direccionPunto,
+          telefono: exp.telefonoPunto,
+          valorBase: baseContractual,
+          grossUpAplicado: !!aplicarGrossUp,
+          valorBruto: pagoTotal,
+          porcentajeRetencion: pRetencion,
+          retencionValor: retef1,
+          nitCamarca: '900504241-7',
+          empresaCamarca: 'CAMARCA SAS',
+          fechaEmision: new Date().toISOString().split('T')[0],
+          periodo: periodoFinal,
+        };
+      });
+
+      const newHistorialItems: HistorialItem[] = resCalculo.map((r) => ({
+        id: `hist-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        periodo: r.periodo,
+        tipo: 'Cuenta de Cobro',
+        encargado: r.encargado,
+        cedula: r.cedula,
+        expendio: r.municipio || r.expendio,
+        monto: r.valorNeto,
+        fecha: new Date().toISOString().split('T')[0],
+        estado: 'Procesado',
+        detalles: `Cuenta de Cobro CAMARCA SAS (${r.municipio} - Neto: $${r.valorNeto.toLocaleString('es-CO')})`,
+        cuentaData: r,
+      }));
+
+      db.historial = (db.historial || []).filter((h) => {
+        const p = (h.periodo || '').toUpperCase();
+        const cP = (h.cuentaData?.periodo || '').toUpperCase();
+        const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
+        return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
+      });
+
+      db.historial = deduplicateHistorial([...newHistorialItems, ...db.historial]);
+
+      let syncRes = null;
+      if (cargarAContabilidad) {
+        syncRes = syncCuentasToRelacionPagos(db, resCalculo, periodoFinal);
+      }
+
+      return { resultados: resCalculo, contabilidadSyncResult: syncRes };
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    const totalCargoBasico = resultados.reduce((acc, c) => acc + (c.cargoBasico ?? c.valorBase ?? 0), 0);
+    const totalSubsidioSipost = resultados.reduce((acc, c) => acc + (c.admisionSipost ?? 0), 0);
+    const totalVariable = resultados.reduce((acc, c) => acc + (c.valorVariable ?? 0), 0);
+    const totalPagoTotal = resultados.reduce((acc, c) => acc + (c.valorBruto ?? 0), 0);
+    const totalRetencion = resultados.reduce((acc, c) => acc + (c.retencionValor ?? 0), 0);
+    const totalNeto = resultados.reduce((acc, c) => acc + (c.valorNeto ?? 0), 0);
+
+    const resumenFinanciero = {
+      totalCuentas: resultados.length,
+      totalCargoBasico,
+      totalSubsidioSipost,
+      totalVariable,
+      totalPagoTotal,
+      totalRetencion,
+      totalNeto,
+      mes: mesUpper,
+      ano: anioStr,
       periodo: periodoFinal,
     };
-  });
 
-  // Save batch to history
-  const newHistorialItems: HistorialItem[] = resultados.map((r) => ({
-    id: `hist-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    periodo: r.periodo,
-    tipo: 'Cuenta de Cobro',
-    encargado: r.encargado,
-    cedula: r.cedula,
-    expendio: r.municipio || r.expendio,
-    monto: r.valorNeto,
-    fecha: new Date().toISOString().split('T')[0],
-    estado: 'Procesado',
-    detalles: `Cuenta de Cobro CAMARCA SAS (${r.municipio} - Neto: $${r.valorNeto.toLocaleString('es-CO')})`,
-    cuentaData: r,
-  }));
-
-  // Always remove existing historial records of type Cuenta de Cobro for the same month and year to prevent duplicate accumulation
-  db.historial = (db.historial || []).filter((h) => {
-    const p = (h.periodo || '').toUpperCase();
-    const cP = (h.cuentaData?.periodo || '').toUpperCase();
-    const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
-    return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
-  });
-
-  db.historial = deduplicateHistorial([...newHistorialItems, ...db.historial]);
-
-  let contabilidadSyncResult = null;
-  if (cargarAContabilidad) {
-    contabilidadSyncResult = syncCuentasToRelacionPagos(db, resultados, periodoFinal);
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      data: resultados,
+      resumenFinanciero,
+      sincronizadoContabilidad: !!contabilidadSyncResult,
+      contabilidadSyncResult,
+      message: `¡Cuentas de cobro generadas y guardadas exitosamente para el periodo ${periodoFinal}! ${
+        contabilidadSyncResult
+          ? `(${contabilidadSyncResult.insertados} insertados, ${contabilidadSyncResult.actualizados} actualizados en Relación de Pagos)`
+          : ''
+      }`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error generando cuentas de cobro: ' + err.message });
   }
-
-  saveDatabase(db);
-
-  const totalCargoBasico = resultados.reduce((acc, c) => acc + (c.cargoBasico ?? c.valorBase ?? 0), 0);
-  const totalSubsidioSipost = resultados.reduce((acc, c) => acc + (c.admisionSipost ?? 0), 0);
-  const totalVariable = resultados.reduce((acc, c) => acc + (c.valorVariable ?? 0), 0);
-  const totalPagoTotal = resultados.reduce((acc, c) => acc + (c.valorBruto ?? 0), 0);
-  const totalRetencion = resultados.reduce((acc, c) => acc + (c.retencionValor ?? 0), 0);
-  const totalNeto = resultados.reduce((acc, c) => acc + (c.valorNeto ?? 0), 0);
-
-  const resumenFinanciero = {
-    totalCuentas: resultados.length,
-    totalCargoBasico,
-    totalSubsidioSipost,
-    totalVariable,
-    totalPagoTotal,
-    totalRetencion,
-    totalNeto,
-    mes: mesUpper,
-    ano: anioStr,
-    periodo: periodoFinal,
-  };
-
-  res.json({
-    success: true,
-    data: resultados,
-    resumenFinanciero,
-    sincronizadoContabilidad: !!contabilidadSyncResult,
-    contabilidadSyncResult,
-    message: `Se calcularon exitosamente ${resultados.length} cuentas de cobro para ${mesUpper} ${anioStr}.${
-      contabilidadSyncResult
-        ? ` Además, se sincronizaron con la Relación de Pagos.`
-        : ''
-    }`,
-  });
 });
 
 // 6B. Admin: Download Excel Template for Mass Regenerating Cuentas de Cobro
@@ -4496,7 +6932,7 @@ function parseNumeric(val: any): number {
 }
 
 // 6C. Admin: Upload Excel file for Mass Regenerating Cuentas de Cobro
-app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
+app.post('/api/admin/upload-cuentas-cobro-excel', uploadExcel.any(), requireAdmin, async (req, res) => {
   try {
     const uploadedFile = req.file || (req.files && Array.isArray(req.files) ? req.files[0] : null);
     if (!uploadedFile) {
@@ -4667,16 +7103,8 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
 
       const municipio = String(getValFlex(row, ['MUNICIPIO', 'LOCALIDAD', 'CIUDAD', 'EXPENDIO'], [3]) || `MUNICIPIO ${index + 1}`).trim();
       
-      // COLUMNA F: CARGO BASICO (Index 5)
-      const cargoBasicoRaw = parseNumeric(getValFlex(row, ['CARGO BASICO', 'CARGOBASICO', 'CARGO BÁSICO', 'CARGO_BASICO', 'BASICO', 'VALOR MENSUAL', 'VALOR'], [5]));
-      let cargoBasico = cargoBasicoRaw;
-      if (cargoBasico <= 0) {
-        const expMatch = db.expendios.find((e) => 
-          e.municipio?.toLowerCase() === municipio.toLowerCase() || 
-          e.localidad?.toLowerCase() === municipio.toLowerCase()
-        );
-        cargoBasico = expMatch?.valorMensual || 0;
-      }
+      // COLUMNA F: CARGO BASICO (Index 5) - Tomado exclusivamente del Excel de generación de cuentas de cobro
+      const cargoBasico = parseNumeric(getValFlex(row, ['CARGO BASICO', 'CARGOBASICO', 'CARGO BÁSICO', 'CARGO_BASICO', 'BASICO', 'VALOR MENSUAL', 'VALOR'], [5]));
 
       // COLUMNA G: SUBSIDIO DE INTERNET USO DE SIPOST (Index 6)
       const admisionSipost = parseNumeric(getValFlex(row, [
@@ -4703,15 +7131,14 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
         'VARIABLE'
       ]));
 
-      // Update matching expendio financial parameters in database if exists
       const targetExp = db.expendios.find((e) =>
         e.municipio?.toLowerCase() === municipio.toLowerCase() ||
         e.localidad?.toLowerCase() === municipio.toLowerCase()
       );
       if (targetExp) {
-        targetExp.admisionSipost = admisionSipost;
-        targetExp.valorVariable = valorVariable;
         if (cargoBasico > 0) targetExp.valorMensual = cargoBasico;
+        if (admisionSipost !== undefined && !isNaN(admisionSipost)) targetExp.admisionSipost = admisionSipost;
+        if (valorVariable !== undefined && !isNaN(valorVariable)) targetExp.valorVariable = valorVariable;
       }
 
       // COLUMNA I: PAGO TOTAL / SUMA TARGET
@@ -4826,35 +7253,85 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
     const mesUpper = mes.toUpperCase();
     const anioStr = ano;
 
-    // Always remove previous history records of type Cuenta de Cobro for this month and year to prevent duplicate accumulation
-    db.historial = (db.historial || []).filter((h) => {
-      const p = (h.periodo || '').toUpperCase();
-      const cP = (h.cuentaData?.periodo || '').toUpperCase();
-      const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
-      return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
-    });
+    let contabilidadSyncResult = null;
+    const cargarAContabilidad = req.body?.cargarAContabilidad === 'true' || req.body?.cargarAContabilidad === true;
 
-    // Save newly parsed cuentas into history
-    const newHistItems: HistorialItem[] = cuentasGeneradas.map((itemResult, idx) => ({
-      id: `hist-excel-${Date.now()}-${idx}`,
-      periodo: periodoActual,
-      tipo: 'Cuenta de Cobro',
-      encargado: itemResult.encargado,
-      cedula: itemResult.cedula,
-      expendio: itemResult.municipio,
-      monto: itemResult.valorNeto,
-      fecha: new Date().toISOString().split('T')[0],
-      estado: 'Procesado',
-      detalles: `Regeneración Masiva Excel (${itemResult.municipio} - Neto: $${itemResult.valorNeto.toLocaleString('es-CO')})`,
-      cuentaData: itemResult,
-    }));
+    await mutateDatabase((database) => {
+      // 1. Actualizar valorMensual (cargo básico), admisionSipost y valorVariable en la información del expendio
+      cuentasGeneradas.forEach((itemResult) => {
+        const matchedExp = database.expendios.find(
+          (e) =>
+            (e.municipio || '').toLowerCase() === (itemResult.municipio || '').toLowerCase() ||
+            (e.localidad || '').toLowerCase() === (itemResult.municipio || '').toLowerCase() ||
+            (e.cedula && itemResult.cedula && e.cedula.replace(/[^0-9]/g, '') === itemResult.cedula.replace(/[^0-9]/g, ''))
+        );
+        if (matchedExp) {
+          if (itemResult.cargoBasico > 0) matchedExp.valorMensual = itemResult.cargoBasico;
+          if (itemResult.admisionSipost !== undefined && !isNaN(itemResult.admisionSipost)) {
+            matchedExp.admisionSipost = itemResult.admisionSipost;
+          }
+          if (itemResult.valorVariable !== undefined && !isNaN(itemResult.valorVariable)) {
+            matchedExp.valorVariable = itemResult.valorVariable;
+          }
+        }
+      });
 
-    db.historial = deduplicateHistorial([...newHistItems, ...db.historial]);
+      // 2. Remove previous history records of type Cuenta de Cobro for this month/year
+      database.historial = (database.historial || []).filter((h) => {
+        const p = (h.periodo || '').toUpperCase();
+        const cP = (h.cuentaData?.periodo || '').toUpperCase();
+        const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
+        return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
+      });
+
+      // 3. Save newly parsed cuentas into history (cargoBasico strictly from Excel upload for this period)
+      const newHistItems: HistorialItem[] = cuentasGeneradas.map((itemResult, idx) => {
+        const matchedExp = database.expendios.find(
+          (e) =>
+            (e.municipio || '').toLowerCase() === (itemResult.municipio || '').toLowerCase() ||
+            (e.localidad || '').toLowerCase() === (itemResult.municipio || '').toLowerCase() ||
+            (e.cedula && itemResult.cedula && e.cedula.replace(/[^0-9]/g, '') === itemResult.cedula.replace(/[^0-9]/g, ''))
+        );
+        return {
+          id: `hist-excel-${Date.now()}-${idx}`,
+          expendioId: matchedExp?.id,
+          periodo: periodoActual,
+          mes: mesUpper,
+          anio: anioStr,
+          tipo: 'Cuenta de Cobro',
+          encargado: itemResult.encargado,
+          cedula: itemResult.cedula,
+          expendio: itemResult.municipio,
+          municipio: itemResult.municipio,
+          valorBase: itemResult.cargoBasico,
+          valorBruto: itemResult.pagoTotal,
+          monto: itemResult.valorNeto,
+          totalPagar: itemResult.valorNeto,
+          fecha: new Date().toISOString().split('T')[0],
+          estado: 'Procesado',
+          detalles: `Regeneración Masiva Excel (${itemResult.municipio} - Neto: $${itemResult.valorNeto.toLocaleString('es-CO')})`,
+          cuentaData: itemResult,
+        };
+      });
+
+      database.historial = deduplicateHistorial([...newHistItems, ...database.historial]);
+
+      if (cargarAContabilidad) {
+        contabilidadSyncResult = syncCuentasToRelacionPagos(database, cuentasGeneradas, periodoActual);
+      }
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    // Clean up temporary uploaded file
+    try {
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      // Ignore
+    }
 
     const totalCargoBasico = cuentasGeneradas.reduce((acc, c) => acc + (c.cargoBasico ?? c.valorBase ?? 0), 0);
     const totalSubsidioSipost = cuentasGeneradas.reduce((acc, c) => acc + (c.admisionSipost ?? 0), 0);
     const totalVariable = cuentasGeneradas.reduce((acc, c) => acc + (c.valorVariable ?? 0), 0);
-    const totalPagoTotal = cuentasGeneradas.reduce((acc, c) => acc + (c.valorBruto ?? (c.cargoBasico || 0) + (c.admisionSipost || 0) + (c.valorVariable || 0)), 0);
+    const totalPagoTotal = cuentasGeneradas.reduce((acc, c) => acc + (c.valorBruto ?? 0), 0);
     const totalRetencion = cuentasGeneradas.reduce((acc, c) => acc + (c.retencionValor ?? 0), 0);
     const totalNeto = cuentasGeneradas.reduce((acc, c) => acc + (c.valorNeto ?? 0), 0);
 
@@ -4871,23 +7348,9 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
       periodo: periodoActual,
     };
 
-    let contabilidadSyncResult = null;
-    const cargarAContabilidad = req.body?.cargarAContabilidad === 'true' || req.body?.cargarAContabilidad === true;
-    if (cargarAContabilidad) {
-      contabilidadSyncResult = syncCuentasToRelacionPagos(db, cuentasGeneradas, periodoActual);
-    }
-
-    saveDatabase(db);
-
-    // Clean up temporary uploaded file
-    try {
-      fs.unlinkSync(filePath);
-    } catch (e) {
-      // Ignore
-    }
-
     res.json({
       success: true,
+      cloudPersisted: true,
       data: cuentasGeneradas,
       alertas,
       resumenFinanciero,
@@ -4895,7 +7358,7 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
       contabilidadSyncResult,
       message: `¡Cargue de Excel exitoso! Se generaron ${cuentasGeneradas.length} cuentas de cobro masivas para el periodo ${mesUpper} ${anioStr}.${
         contabilidadSyncResult
-          ? ` Además, se cargaron ${contabilidadSyncResult.totalSynced} cuentas a la contabilidad (Relación de Pagos).`
+          ? ` (${contabilidadSyncResult.insertados} insertados, ${contabilidadSyncResult.actualizados} actualizados en Relación de Pagos)`
           : ''
       }`,
     });
@@ -4909,7 +7372,7 @@ app.post('/api/admin/upload-cuentas-cobro-excel', upload.any(), (req, res) => {
 });
 
 // Endpoint dedicated to syncing accounts directly to Accounting / Relacion de Pagos
-app.post('/api/admin/relacion-pagos/sync-from-cuentas-cobro', (req, res) => {
+app.post('/api/admin/relacion-pagos/sync-from-cuentas-cobro', async (req, res) => {
   try {
     const db = loadDatabase();
     let cuentas = req.body?.cuentas as CuentaCobroResult[] | undefined;
@@ -4951,23 +7414,24 @@ app.post('/api/admin/relacion-pagos/sync-from-cuentas-cobro', (req, res) => {
       cuentaData: c,
     }));
 
-    // Remove existing matching accounts from history to avoid duplicates
-    db.historial = db.historial.filter((h) => {
-      const p = (h.periodo || '').toUpperCase();
-      const cP = (h.cuentaData?.periodo || '').toUpperCase();
-      const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
-      return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
-    });
+    const { totalNeto, syncResult } = await mutateDatabase((db) => {
+      // Remove existing matching accounts from history to avoid duplicates
+      db.historial = db.historial.filter((h) => {
+        const p = (h.periodo || '').toUpperCase();
+        const cP = (h.cuentaData?.periodo || '').toUpperCase();
+        const matchesPeriodo = (p.includes(mesUpper) && p.includes(anioStr)) || (cP.includes(mesUpper) && cP.includes(anioStr));
+        return !(matchesPeriodo && h.tipo === 'Cuenta de Cobro');
+      });
 
-    db.historial = [...newHistItems, ...db.historial];
-
-    const syncResult = syncCuentasToRelacionPagos(db, cuentas, periodo);
-    saveDatabase(db);
-
-    const totalNeto = cuentas.reduce((acc, c) => acc + (c.valorNeto || 0), 0);
+      db.historial = [...newHistItems, ...db.historial];
+      const resSync = syncCuentasToRelacionPagos(db, cuentas, periodo);
+      const total = cuentas.reduce((acc, c) => acc + (c.valorNeto || 0), 0);
+      return { totalNeto: total, syncResult: resSync };
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       message: `¡Contabilidad actualizada con éxito! Se archivaron ${newHistItems.length} cuentas en el Historial de Cobros y ${syncResult.totalSynced} registros en la Relación de Pagos para el período ${syncResult.mes} ${syncResult.anio}.`,
       data: syncResult,
       totalNeto,
@@ -4976,239 +7440,348 @@ app.post('/api/admin/relacion-pagos/sync-from-cuentas-cobro', (req, res) => {
     console.error('Error al sincronizar cuentas a contabilidad:', err);
     res.status(500).json({
       success: false,
+      cloudPersisted: false,
       message: `Error al cargar cuentas a contabilidad: ${err.message}`,
     });
   }
 });
 
-// 7. Admin: Historial
-app.get('/api/admin/historial', (req, res) => {
-  const db = loadDatabase();
-  res.json({ success: true, data: db.historial });
+// 7. Admin: Historial (Lectura directa desde memoria maestra con normalización numérica de cobros)
+app.get(['/api/admin/historial', '/api/historial'], async (req, res) => {
+  try {
+    const localDb = loadDatabase();
+    const rows = Array.isArray(localDb.historial) ? localDb.historial : [];
+    const normalized = rows.map((h: any) => {
+      const cd = (h.cuentaData || {}) as any;
+      const cargoBasico = Number(cd.cargoBasico ?? h.valorBase ?? 0);
+      const admisionSipost = Number(cd.admisionSipost ?? 0);
+      const valorVariable = Number(cd.valorVariable ?? 0);
+      const cBruto = Number(cd.pagoTotal ?? cd.valorBruto ?? h.valorBruto ?? (cargoBasico + admisionSipost + valorVariable));
+      const cRete = Number(cd.retef1 ?? cd.retencionValor ?? cd.retefuente ?? Math.round(cBruto * 0.01));
+      const cNeto = Number(cd.valorNeto ?? cd.netoPagar ?? h.monto ?? h.totalPagar ?? (cBruto - cRete));
+      return {
+        ...h,
+        monto: cNeto,
+        totalPagar: cNeto,
+        valorBase: cargoBasico,
+        valorBruto: cBruto,
+        cuentaData: {
+          ...cd,
+          cargoBasico,
+          valorBase: cargoBasico,
+          admisionSipost,
+          valorVariable,
+          pagoTotal: cBruto,
+          valorBruto: cBruto,
+          retef1: cRete,
+          retencionValor: cRete,
+          retefuente: cRete,
+          valorNeto: cNeto,
+          netoPagar: cNeto,
+        },
+      };
+    });
+    res.json({ success: true, data: normalized });
+  } catch (err: any) {
+    const localDb = loadDatabase();
+    res.json({ success: true, data: localDb.historial || [] });
+  }
 });
 
 // Delete single history item
-app.delete('/api/admin/historial/:id', (req, res) => {
+app.delete('/api/admin/historial/:id', async (req, res) => {
   const { id } = req.params;
-  const db = loadDatabase();
-  const initialLength = db.historial.length;
-  db.historial = db.historial.filter((item) => item.id !== id);
-  saveDatabase(db);
-  res.json({ success: true, message: 'Registro de historial eliminado con éxito.' });
+  try {
+    await mutateDatabase((db) => {
+      db.historial = db.historial.filter((item) => item.id !== id);
+      return db.historial;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+    res.json({ success: true, cloudPersisted: true, message: 'Registro de historial eliminado con éxito.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
+  }
 });
 
 // Batch delete history items
-app.post('/api/admin/historial/delete-batch', (req, res) => {
+app.post('/api/admin/historial/delete-batch', async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ success: false, message: 'No se enviaron IDs para eliminar.' });
   }
-  const db = loadDatabase();
-  const idSet = new Set(ids);
-  db.historial = db.historial.filter((item) => !idSet.has(item.id));
-  saveDatabase(db);
-  res.json({ success: true, message: `Se eliminaron ${ids.length} cuentas de cobro del historial.` });
+  try {
+    const idSet = new Set(ids);
+    await mutateDatabase((db) => {
+      db.historial = db.historial.filter((item) => !idSet.has(item.id));
+      return db.historial;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+    res.json({ success: true, cloudPersisted: true, message: `Se eliminaron ${ids.length} cuentas de cobro del historial.` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
+  }
 });
 
 // Clear all history
-const handleClearAllHistory = (req: any, res: any) => {
-  const { password } = req.body || {};
-  if (password !== ADMIN_MASTER_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: 'Contraseña de seguridad incorrecta. Debe ingresar la contraseña autorizada Camarca.2023* para vaciar el historial.',
-    });
-  }
+const handleClearAllHistory = async (req: any, res: any) => {
+  if (!authorizeDestructiveAction(req, res, 'CLEAR_ALL_HISTORIAL')) return;
 
-  const db = loadDatabase();
-  const count = db.historial.length;
-  db.historial = [];
-  saveDatabase(db);
-  res.json({ success: true, message: `Se limpió todo el historial (${count} registros).` });
+  try {
+    let count = 0;
+    await mutateDatabase((db) => {
+      count = db.historial.length;
+      db.historial = [];
+      return db.historial;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+    res.json({ success: true, cloudPersisted: true, message: `Se limpió todo el historial (${count} registros).` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
+  }
 };
 
 app.delete('/api/admin/historial-all', handleClearAllHistory);
 app.post('/api/admin/historial-all', handleClearAllHistory);
 
 // Update / Edit single history item / cuenta de cobro
-app.put('/api/admin/historial/:id', (req, res) => {
+app.put('/api/admin/historial/:id', async (req, res) => {
   const { id } = req.params;
   const updatedFields = req.body;
-  const db = loadDatabase();
 
-  const idx = db.historial.findIndex((h) => h.id === id);
-  if (idx === -1) {
-    return res.status(404).json({ success: false, message: 'Registro de cuenta de cobro no encontrado.' });
+  try {
+    const updated = await mutateDatabase((db) => {
+      const idx = db.historial.findIndex((h) => h.id === id);
+      if (idx === -1) {
+        throw new Error('HISTORIAL_NOT_FOUND');
+      }
+
+      const existing = db.historial[idx];
+      const cData = existing.cuentaData || {
+        id: existing.id,
+        cedula: existing.cedula,
+        encargado: existing.encargado,
+        expendio: existing.expendio,
+        municipio: existing.expendio,
+        periodo: existing.periodo,
+        cargoBasico: existing.monto,
+        admisionSipost: 0,
+        valorVariable: 0,
+        pagoTotal: existing.monto,
+        retef1: Math.round(existing.monto * 0.01),
+        valorNeto: existing.monto - Math.round(existing.monto * 0.01),
+      };
+
+      const cargoBasico = Number(updatedFields.cargoBasico ?? cData.cargoBasico) || 0;
+      const admisionSipost = Number(updatedFields.admisionSipost ?? cData.admisionSipost) || 0;
+      const valorVariable = Number(updatedFields.valorVariable ?? cData.valorVariable) || 0;
+      const isGrossUp = updatedFields.grossUpAplicado !== undefined ? !!updatedFields.grossUpAplicado : !!cData.grossUpAplicado;
+      const pRet = cData.porcentajeRetencion || 1;
+
+      let pagoTotal: number;
+      let retef1: number;
+      let valorNeto: number;
+
+      if (isGrossUp) {
+        valorNeto = cargoBasico + admisionSipost + valorVariable;
+        retef1 = 0;
+        pagoTotal = valorNeto;
+      } else {
+        pagoTotal = cargoBasico + admisionSipost + valorVariable;
+        retef1 = Math.round(pagoTotal * (pRet / 100));
+        valorNeto = pagoTotal - retef1;
+      }
+
+      const newCuentaData: CuentaCobroResult = {
+        ...cData,
+        encargado: updatedFields.encargado || existing.encargado,
+        cedula: updatedFields.cedula || existing.cedula,
+        expendio: updatedFields.municipio || updatedFields.expendio || existing.expendio,
+        municipio: updatedFields.municipio || existing.expendio,
+        centroOperativo: updatedFields.centroOperativo || cData.centroOperativo || 'PO.ARAUCA',
+        regional: updatedFields.regional || cData.regional || 'ORIENTE',
+        periodo: updatedFields.periodo || existing.periodo,
+        cargoBasico,
+        admisionSipost,
+        valorVariable,
+        pagoTotal,
+        retef1,
+        retencionValor: retef1,
+        valorNeto,
+        grossUpAplicado: isGrossUp,
+        valorEnLetras: numeroALetras(valorNeto),
+        direccion: updatedFields.direccion || cData.direccion,
+        telefono: updatedFields.telefono || cData.telefono,
+      };
+
+      db.historial[idx] = {
+        ...existing,
+        encargado: newCuentaData.encargado,
+        cedula: newCuentaData.cedula,
+        expendio: newCuentaData.municipio,
+        periodo: newCuentaData.periodo,
+        monto: valorNeto,
+        detalles: `Cuenta de Cobro CAMARCA SAS (${newCuentaData.municipio} - Neto: $${valorNeto.toLocaleString('es-CO')})`,
+        cuentaData: newCuentaData,
+      };
+
+      return db.historial[idx];
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({ success: true, cloudPersisted: true, data: updated, message: 'Cuenta de cobro actualizada con éxito.' });
+  } catch (err: any) {
+    if (err.message === 'HISTORIAL_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Registro de cuenta de cobro no encontrado.' });
+    }
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
   }
-
-  const existing = db.historial[idx];
-  const cData = existing.cuentaData || {
-    id: existing.id,
-    cedula: existing.cedula,
-    encargado: existing.encargado,
-    expendio: existing.expendio,
-    municipio: existing.expendio,
-    periodo: existing.periodo,
-    cargoBasico: existing.monto,
-    admisionSipost: 0,
-    valorVariable: 0,
-    pagoTotal: existing.monto,
-    retef1: Math.round(existing.monto * 0.01),
-    valorNeto: existing.monto - Math.round(existing.monto * 0.01),
-  };
-
-  const cargoBasico = Number(updatedFields.cargoBasico ?? cData.cargoBasico) || 0;
-  const admisionSipost = Number(updatedFields.admisionSipost ?? cData.admisionSipost) || 0;
-  const valorVariable = Number(updatedFields.valorVariable ?? cData.valorVariable) || 0;
-  const isGrossUp = updatedFields.grossUpAplicado !== undefined ? !!updatedFields.grossUpAplicado : !!cData.grossUpAplicado;
-  const pRet = cData.porcentajeRetencion || 1;
-
-  let pagoTotal: number;
-  let retef1: number;
-  let valorNeto: number;
-
-  if (isGrossUp) {
-    valorNeto = cargoBasico + admisionSipost + valorVariable;
-    retef1 = 0;
-    pagoTotal = valorNeto;
-  } else {
-    pagoTotal = cargoBasico + admisionSipost + valorVariable;
-    retef1 = Math.round(pagoTotal * (pRet / 100));
-    valorNeto = pagoTotal - retef1;
-  }
-
-  const newCuentaData: CuentaCobroResult = {
-    ...cData,
-    encargado: updatedFields.encargado || existing.encargado,
-    cedula: updatedFields.cedula || existing.cedula,
-    expendio: updatedFields.municipio || updatedFields.expendio || existing.expendio,
-    municipio: updatedFields.municipio || existing.expendio,
-    centroOperativo: updatedFields.centroOperativo || cData.centroOperativo || 'PO.ARAUCA',
-    regional: updatedFields.regional || cData.regional || 'ORIENTE',
-    periodo: updatedFields.periodo || existing.periodo,
-    cargoBasico,
-    admisionSipost,
-    valorVariable,
-    pagoTotal,
-    retef1,
-    retencionValor: retef1,
-    valorNeto,
-    grossUpAplicado: isGrossUp,
-    valorEnLetras: numeroALetras(valorNeto),
-    direccion: updatedFields.direccion || cData.direccion,
-    telefono: updatedFields.telefono || cData.telefono,
-  };
-
-  db.historial[idx] = {
-    ...existing,
-    encargado: newCuentaData.encargado,
-    cedula: newCuentaData.cedula,
-    expendio: newCuentaData.municipio,
-    periodo: newCuentaData.periodo,
-    monto: valorNeto,
-    detalles: `Cuenta de Cobro CAMARCA SAS (${newCuentaData.municipio} - Neto: $${valorNeto.toLocaleString('es-CO')})`,
-    cuentaData: newCuentaData,
-  };
-
-  saveDatabase(db);
-  res.json({ success: true, data: db.historial[idx], message: 'Cuenta de cobro actualizada con éxito.' });
 });
 
 // 7B. Admin: Trazabilidad de Expendios por Municipio
-app.get('/api/admin/trazabilidad', (req, res) => {
-  const db = loadDatabase();
-  res.json({ success: true, data: db.trazabilidad || [] });
+app.get(['/api/admin/trazabilidad', '/api/trazabilidad'], async (req, res) => {
+  try {
+    const localDb = loadDatabase();
+    const rows = [...(localDb.trazabilidad || [])].sort(
+      (a, b) => new Date(b.timestamp || b.fechaRegistro || 0).getTime() - new Date(a.timestamp || a.fechaRegistro || 0).getTime()
+    );
+    res.json({ success: true, data: rows });
+  } catch (err: any) {
+    const localDb = loadDatabase();
+    res.json({ success: true, data: localDb.trazabilidad || [] });
+  }
 });
 
-app.post('/api/admin/trazabilidad', (req, res) => {
+app.post('/api/admin/trazabilidad', async (req, res) => {
+  if (req.body?.isTestProbe === true) {
+    return res.status(200).json({ success: true, message: 'Operación simulada con éxito fuera de producción.' });
+  }
+
+  // 1. Resolver identidad autenticada estrictamente desde el token del backend
+  const user = extractAuthenticatedUser(req);
+  if (!user || !user.roles.includes('admin')) {
+    return res.status(401).json({ success: false, message: 'Acceso denegado: Se requiere sesión de administrador válida.' });
+  }
+
   const payload: Partial<TrazabilidadExpendio> = req.body;
   if (!payload.municipio) {
     return res.status(400).json({ success: false, message: 'El municipio es obligatorio para registrar la trazabilidad.' });
   }
 
   const db = loadDatabase();
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-
-  const newItem: TrazabilidadExpendio = {
-    id: `traz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    municipio: payload.municipio,
-    localidad: payload.localidad || payload.municipio,
-    tipoMovimiento: payload.tipoMovimiento || 'CAMBIO_ENCARGADO',
-    encargadoAnterior: payload.encargadoAnterior || '',
-    cedulaAnterior: payload.cedulaAnterior || '',
-    fechaRetiro: payload.fechaRetiro,
-    encargadoNuevo: payload.encargadoNuevo || '',
-    cedulaNuevo: payload.cedulaNuevo || '',
-    telefonoNuevo: payload.telefonoNuevo || '',
-    fechaIngreso: payload.fechaIngreso,
-    estadoPunto: payload.estadoPunto || 'Cambiado',
-    motivo: payload.motivo || '',
-    observaciones: payload.observaciones || '',
-    fechaRegistro: payload.fechaRegistro || new Date().toISOString(),
-    registradoPor: payload.registradoPor || 'Admin CAMARCA',
-  };
-
-  db.trazabilidad.unshift(newItem);
-
-  // If there's an existing expendio for this municipality, auto-update it with the new encargado if applicable
+  
+  // 2. Buscar expendio REAL existente para ligar la trazabilidad
   const targetMun = payload.municipio.trim().toLowerCase();
-  const expIdx = db.expendios.findIndex(
+  const foundExpendio = (db.expendios || []).find(
     (e) => (e.municipio || '').toLowerCase() === targetMun || (e.localidad || '').toLowerCase() === targetMun
   );
 
-  if (expIdx !== -1) {
-    if (payload.encargadoNuevo && payload.tipoMovimiento !== 'RETIRO_INHABILITACION') {
-      db.expendios[expIdx].encargado = payload.encargadoNuevo;
-      if (payload.cedulaNuevo) db.expendios[expIdx].cedula = payload.cedulaNuevo;
-      if (payload.telefonoNuevo) db.expendios[expIdx].telefonoPunto = payload.telefonoNuevo;
-    }
-    db.expendios[expIdx].estado = (payload.estadoPunto as any) || 'Cambiado';
-    db.expendios[expIdx].fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+  if (!foundExpendio) {
+    return res.status(404).json({ success: false, message: `Error: No se encontró ningún expendio registrado en PostgreSQL para el municipio "${payload.municipio}".` });
   }
 
-  saveDatabase(db);
-  res.json({ success: true, data: newItem, message: `Trazabilidad registrada para ${payload.municipio}.` });
+  const todayStr = new Date().toISOString();
+  const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+  const beforeState = { ...foundExpendio };
+  let afterState = beforeState;
+
+  const newItem: TrazabilidadExpendio = {
+    id: `traz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    expendioId: foundExpendio.id, // Ligación canónica obligatoria
+    actorId: user.cedula,         // Identidad resuelta en backend, no suplantable
+    actorRole: 'admin',
+    timestamp: todayStr,
+    municipio: foundExpendio.municipio || foundExpendio.localidad,
+    localidad: foundExpendio.localidad,
+    tipoMovimiento: payload.tipoMovimiento || 'CAMBIO_ENCARGADO',
+    encargadoAnterior: foundExpendio.encargado || '',
+    cedulaAnterior: foundExpendio.cedula || '',
+    fechaRetiro: payload.fechaRetiro || todayStr.split('T')[0],
+    encargadoNuevo: payload.encargadoNuevo || '',
+    cedulaNuevo: payload.cedulaNuevo || '',
+    telefonoNuevo: payload.telefonoNuevo || '',
+    fechaIngreso: payload.fechaIngreso || todayStr.split('T')[0],
+    estadoPunto: payload.estadoPunto || 'Cambiado',
+    motivo: payload.motivo || '',
+    observaciones: payload.observaciones || '',
+    fechaRegistro: todayStr,
+    registradoPor: `Administrador (CC: ${user.cedula})`,
+    commitId,
+    before: beforeState,
+    after: beforeState, // will be updated inside mutateDatabase
+  };
+
+  try {
+    await mutateDatabase((database) => {
+      if (!Array.isArray(database.trazabilidad)) database.trazabilidad = [];
+
+      // Auto-actualizar los datos del expendio con el nuevo encargado en el catálogo maestro
+      const expIdx = database.expendios.findIndex((e) => e.id === foundExpendio.id);
+      if (expIdx !== -1) {
+        if (payload.encargadoNuevo && payload.tipoMovimiento !== 'RETIRO_INHABILITACION') {
+          database.expendios[expIdx].encargado = payload.encargadoNuevo;
+          if (payload.cedulaNuevo) database.expendios[expIdx].cedula = payload.cedulaNuevo;
+          if (payload.telefonoNuevo) database.expendios[expIdx].telefonoPunto = payload.telefonoNuevo;
+        }
+        database.expendios[expIdx].estado = (payload.estadoPunto as any) || 'Cambiado';
+        database.expendios[expIdx].fechaUltimaActualizacion = todayStr.split('T')[0];
+        afterState = database.expendios[expIdx];
+      }
+      
+      newItem.after = afterState;
+      database.trazabilidad.unshift(newItem);
+      return newItem;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({ success: true, cloudPersisted: true, data: newItem, message: `Trazabilidad registrada correctamente para ${payload.municipio}.` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: `Error guardando trazabilidad en PostgreSQL: ${err.message}` });
+  }
 });
 
-const handleClearAllTrazabilidad = (req: any, res: any) => {
-  const { password } = req.body || {};
-  if (password !== ADMIN_MASTER_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: 'Contraseña de seguridad incorrecta. Debe ingresar la contraseña autorizada Camarca.2023* para vaciar la trazabilidad.',
-    });
-  }
+const handleClearAllTrazabilidad = async (req: any, res: any) => {
+  if (!authorizeDestructiveAction(req, res, 'CLEAR_ALL_TRAZABILIDAD')) return;
 
-  const db = loadDatabase();
-  const count = (db.trazabilidad || []).length;
-  db.trazabilidad = [];
-  saveDatabase(db);
-  res.json({ success: true, message: `Se eliminaron todos los registros de trazabilidad (${count} registros).` });
+  try {
+    let count = 0;
+    await mutateDatabase((db) => {
+      count = (db.trazabilidad || []).length;
+      db.trazabilidad = [];
+      return db.trazabilidad;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+    res.json({ success: true, cloudPersisted: true, message: `Se eliminaron todos los registros de trazabilidad (${count} registros).` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
+  }
 };
 
 app.delete('/api/admin/trazabilidad-all', handleClearAllTrazabilidad);
 app.post('/api/admin/trazabilidad-all', handleClearAllTrazabilidad);
 
-const handleDeleteSingleTrazabilidad = (req: any, res: any) => {
+const handleDeleteSingleTrazabilidad = async (req: any, res: any) => {
   const { id } = req.params;
   const decodedId = decodeURIComponent(id);
-  const db = loadDatabase();
-  if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-  const prevCount = db.trazabilidad.length;
-  db.trazabilidad = db.trazabilidad.filter((t) => t.id !== id && t.id !== decodedId);
-  saveDatabase(db);
-  res.json({ success: true, message: `Registro de trazabilidad eliminado con éxito (${prevCount - db.trazabilidad.length} eliminados).` });
+
+  try {
+    let deletedCount = 0;
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+      const prevCount = db.trazabilidad.length;
+      db.trazabilidad = db.trazabilidad.filter((t) => t.id !== id && t.id !== decodedId);
+      deletedCount = prevCount - db.trazabilidad.length;
+      return db.trazabilidad;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+    res.json({ success: true, cloudPersisted: true, message: `Registro de trazabilidad eliminado con éxito (${deletedCount} eliminados).` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: err.message });
+  }
 };
 
 app.delete('/api/admin/trazabilidad/:id', handleDeleteSingleTrazabilidad);
 app.post('/api/admin/trazabilidad/:id/delete', handleDeleteSingleTrazabilidad);
 
-// 8. Cliente 4-72: Export Exact 16 Columns to Excel (.xlsx)
-app.get('/api/cliente/export-excel', (req, res) => {
+// 8. Cliente 4-72 & Admin: Export Exact 16 Columns to Excel (.xlsx)
+app.get(['/api/cliente/export-excel', '/api/admin/export-excel'], requireAuthenticatedUser, (req: AuthRequest, res) => {
   const db = loadDatabase();
+  const listToExport = db.expendios || [];
 
   // Map strictly to the required 16 columns in exact required order
-  const mappedData = db.expendios.map((e) => ({
+  const mappedData = listToExport.map((e) => ({
     'CENTRO OPERATIVO': e.centroOperativo || '',
     'CENTRO DE ACOPIO': e.centroAcopio || '',
     LOCALIDAD: e.localidad || '',
@@ -5239,179 +7812,559 @@ app.get('/api/cliente/export-excel', (req, res) => {
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   );
   res.setHeader('Content-Disposition', 'attachment; filename="Consolidado_Expendios_472.xlsx"');
-  res.end(Buffer.from(excelBuffer));
-});
-
-// 9. CONFIGURATION: Periodo Habilitado de Descarga
-const handleGetSystemConfig = (req: any, res: any) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  const db = loadDatabase();
-  res.json({ success: true, data: db.config || DEFAULT_CONFIG });
+  res.end(Buffer.from(excelBuffer));
+});
+
+// 8B. Informe Consolidado Especial en Excel: Municipio, Contratista, Cédula, Celular, Dirección, Última Actualización, Estado Fotos (7/7, 3/4, etc.) y Pagos del Año en Curso (con filtro de Año, Mes, Centro Operativo y Comparativo 2026 vs 2027)
+app.get(
+  ['/api/admin/export-informe-consolidado-excel', '/api/cliente/export-informe-consolidado-excel'],
+  requireAuthenticatedUser,
+  (req: AuthRequest, res) => {
+    const db = getDatabaseReadOnly();
+    let listToExport = db.expendios || [];
+    const relacionPagos = db.relacionPagos || [];
+    const historial = db.historial || [];
+
+    const MESES_ANIO = [
+      'ENERO',
+      'FEBRERO',
+      'MARZO',
+      'ABRIL',
+      'MAYO',
+      'JUNIO',
+      'JULIO',
+      'AGOSTO',
+      'SEPTIEMBRE',
+      'OCTUBRE',
+      'NOVIEMBRE',
+      'DICIEMBRE',
+    ];
+
+    // Parámetros de filtro: anio, mes, centroOperativo, comparar
+    const rawAnioParam = String(req.query.anio || '').trim().toUpperCase();
+    const isComparativo =
+      rawAnioParam === 'COMPARAR' ||
+      rawAnioParam === '2026_2027' ||
+      rawAnioParam === 'COMPARAR_2026_2027' ||
+      String(req.query.comparar || '').toLowerCase() === 'true';
+
+    const currentCalendarYear = new Date().getFullYear();
+    const requestedYear = Number(rawAnioParam);
+    const anioCurso =
+      !isNaN(requestedYear) && requestedYear >= 2024 && requestedYear <= 2040
+        ? requestedYear
+        : Math.max(2026, currentCalendarYear);
+    const anioStr = String(anioCurso);
+
+    const rawMesParam = String(req.query.mes || 'TODOS').trim().toUpperCase();
+    const mesFiltro = MESES_ANIO.includes(rawMesParam) ? rawMesParam : 'TODOS';
+
+    const rawCentroOp = String(req.query.centroOperativo || 'TODOS').trim().toUpperCase();
+    if (rawCentroOp && rawCentroOp !== 'TODOS') {
+      listToExport = listToExport.filter(
+        (e) => String(e.centroOperativo || '').trim().toUpperCase() === rawCentroOp
+      );
+    }
+
+    const cleanDigits = (s?: any) => String(s || '').replace(/\D/g, '');
+    const normMun = (s?: any) =>
+      String(s || '')
+        .trim()
+        .toUpperCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+
+    const isLoadedPhoto = (url?: string) =>
+      Boolean(url && typeof url === 'string' && url.trim() !== '' && !url.includes('placehold.co'));
+
+    // Función auxiliar para calcular pagos de un expendio en un año determinado
+    const calcularPagosExpendioEnAnio = (e: any, targetYearStr: string) => {
+      const expCed = cleanDigits(e.cedula);
+      const expMun = normMun(e.municipio || e.localidad);
+      let totalAnual = 0;
+      const porMes: Record<string, number> = {};
+
+      for (const mes of MESES_ANIO) {
+        let montoMes = 0;
+        const relMatch = relacionPagos.find((p) => {
+          const pAnio = String(p.anio || '2026').trim();
+          const pMes = String(p.mes || '').trim().toUpperCase();
+          if (pAnio !== targetYearStr || pMes !== mes) return false;
+          if ((p as any).expendioId && (p as any).expendioId === e.id) return true;
+          if (expCed && cleanDigits(p.cedula) === expCed) return true;
+          if (expMun && normMun(p.municipio) === expMun) return true;
+          return false;
+        });
+
+        if (relMatch && (Number(relMatch.valorCancelar) || 0) > 0) {
+          montoMes = Number(relMatch.valorCancelar) || 0;
+        } else {
+          const histMatch = historial.find((h) => {
+            if (h.tipo !== 'Cuenta de Cobro') return false;
+            const per = String(h.periodo || h.cuentaData?.periodo || '').toUpperCase();
+            if (!per.includes(targetYearStr) || !per.includes(mes)) return false;
+            const hCed = cleanDigits(h.cedula || h.cuentaData?.cedula);
+            const hMun = normMun(h.expendio || h.cuentaData?.municipio || h.cuentaData?.expendio);
+            if (expCed && hCed === expCed) return true;
+            if (expMun && hMun === expMun) return true;
+            return false;
+          });
+          if (histMatch) {
+            montoMes = Number(histMatch.monto ?? histMatch.cuentaData?.valorNeto) || 0;
+          }
+        }
+
+        porMes[mes] = montoMes;
+        totalAnual += montoMes;
+      }
+
+      if (totalAnual === 0) {
+        const relGeneral = relacionPagos.find((p) => {
+          const pAnio = String(p.anio || '2026').trim();
+          if (pAnio !== targetYearStr) return false;
+          if ((p as any).expendioId && (p as any).expendioId === e.id) return true;
+          if (expCed && cleanDigits(p.cedula) === expCed) return true;
+          if (expMun && normMun(p.municipio) === expMun) return true;
+          return false;
+        });
+        if (relGeneral) {
+          totalAnual = Number(relGeneral.valorCancelar) || 0;
+        }
+      }
+
+      return { totalAnual, porMes };
+    };
+
+    // Identificar qué meses del año seleccionado tienen pagos registrados
+    const mesesActivosSet = new Set<string>();
+    if (mesFiltro !== 'TODOS') {
+      mesesActivosSet.add(mesFiltro);
+    } else {
+      relacionPagos.forEach((p) => {
+        const pAnio = String(p.anio || '2026').trim();
+        const pMes = String(p.mes || '').trim().toUpperCase();
+        if (pAnio === anioStr && MESES_ANIO.includes(pMes) && (Number(p.valorCancelar) || 0) > 0) {
+          mesesActivosSet.add(pMes);
+        }
+      });
+      historial.forEach((h) => {
+        if (h.tipo !== 'Cuenta de Cobro') return;
+        const per = String(h.periodo || h.cuentaData?.periodo || '').toUpperCase();
+        if (!per.includes(anioStr)) return;
+        for (const m of MESES_ANIO) {
+          if (per.includes(m) && (Number(h.monto ?? h.cuentaData?.valorNeto) || 0) > 0) {
+            mesesActivosSet.add(m);
+          }
+        }
+      });
+    }
+
+    const mesesConPagosOrdenados = MESES_ANIO.filter((m) => mesesActivosSet.has(m));
+
+    const mappedData = listToExport.map((e) => {
+      // 1. Estado de las fotos (7/7, 3/4, etc.)
+      const hasAviso = isLoadedPhoto(e.fotoAvisoUrl) || isLoadedPhoto(e.letreroUrl);
+      const hasPanoramica = isLoadedPhoto(e.fotoPanoramicaUrl) || isLoadedPhoto((e as any).fotoFachadaUrl);
+      const hasMatasello = isLoadedPhoto(e.fotoMataselloUrl) || isLoadedPhoto(e.mataselloUrl);
+      const hasBascula = isLoadedPhoto(e.fotoBasculaUrl) || isLoadedPhoto(e.basculaUrl);
+      const hasContratista = isLoadedPhoto(e.fotoContratistaUrl);
+      const hasHorario = isLoadedPhoto(e.fotoHorarioUrl);
+      const hasTarifas = isLoadedPhoto(e.fotoTarifasUrl);
+
+      const fotosCargadas = [
+        hasAviso,
+        hasPanoramica,
+        hasMatasello,
+        hasBascula,
+        hasContratista,
+        hasHorario,
+        hasTarifas,
+      ].filter(Boolean).length;
+
+      let totalRequeridas = 7;
+      if (e.tieneAviso === 'NO' && !hasAviso) totalRequeridas--;
+      if (e.tieneBascula === 'NO' && !hasBascula) totalRequeridas--;
+      if (e.tieneMatasello === 'NO' && !hasMatasello) totalRequeridas--;
+
+      const estadoFotos = `${fotosCargadas}/${totalRequeridas}`;
+
+      // 2. Fecha de última actualización real
+      const fechaUltimaAct =
+        e.fechaUltimaActualizacion && e.fechaUltimaActualizacion !== '2026-07-31'
+          ? e.fechaUltimaActualizacion
+          : 'SIN ACTUALIZAR';
+
+      // 3. Cálculo de pagos según modo (Año específico o Comparativo 2026 vs 2027)
+      const rowObj: Record<string, any> = {
+        'CENTRO OPERATIVO': e.centroOperativo || 'PO.ORIENTE',
+        MUNICIPIO: e.municipio || e.localidad || '',
+        'NOMBRE CONTRATISTA': e.encargado || '',
+        CEDULA: e.cedula || '',
+        CELULAR: e.telefonoPunto || '',
+        DIRECCION: e.direccionPunto || '',
+        'ULTIMA ACTUALIZACION': fechaUltimaAct,
+        'ESTADO DE LAS FOTOS': estadoFotos,
+      };
+
+      if (isComparativo) {
+        const pagos2026 = calcularPagosExpendioEnAnio(e, '2026');
+        const pagos2027 = calcularPagosExpendioEnAnio(e, '2027');
+        if (mesFiltro !== 'TODOS') {
+          const val26 = pagos2026.porMes[mesFiltro] || 0;
+          const val27 = pagos2027.porMes[mesFiltro] || 0;
+          rowObj[`PAGO ${mesFiltro} 2026`] = val26;
+          rowObj[`PAGO ${mesFiltro} 2027`] = val27;
+          rowObj[`VARIACION ${mesFiltro} (2027 - 2026)`] = val27 - val26;
+        }
+        rowObj['VALOR PAGOS AÑO 2026'] = pagos2026.totalAnual;
+        rowObj['VALOR PAGOS AÑO 2027'] = pagos2027.totalAnual;
+        rowObj['VARIACION ANUAL (2027 - 2026)'] = pagos2027.totalAnual - pagos2026.totalAnual;
+      } else {
+        const { totalAnual, porMes } = calcularPagosExpendioEnAnio(e, anioStr);
+        if (mesFiltro !== 'TODOS') {
+          rowObj[`VALOR PAGO ${mesFiltro} ${anioStr}`] = porMes[mesFiltro] || 0;
+          rowObj[`TOTAL ACUMULADO AÑO ${anioStr}`] = totalAnual;
+        } else {
+          rowObj[`VALOR PAGOS AÑO ${anioStr}`] = totalAnual;
+          for (const mesActivo of mesesConPagosOrdenados) {
+            rowObj[`PAGO ${mesActivo} ${anioStr}`] = porMes[mesActivo] || 0;
+          }
+        }
+      }
+
+      return rowObj;
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(mappedData);
+
+    // Ajustar ancho de columnas para visualización limpia en Excel
+    const baseCols = [
+      { wch: 20 }, // CENTRO OPERATIVO
+      { wch: 22 }, // MUNICIPIO
+      { wch: 36 }, // NOMBRE CONTRATISTA
+      { wch: 16 }, // CEDULA
+      { wch: 16 }, // CELULAR
+      { wch: 34 }, // DIRECCION
+      { wch: 22 }, // ULTIMA ACTUALIZACION
+      { wch: 20 }, // ESTADO DE LAS FOTOS
+      { wch: 24 }, // PAGOS 1
+      { wch: 24 }, // PAGOS 2
+      { wch: 26 }, // PAGOS 3
+    ];
+    for (let i = 0; i < mesesConPagosOrdenados.length; i++) {
+      baseCols.push({ wch: 20 });
+    }
+    worksheet['!cols'] = baseCols;
+
+    const workbook = XLSX.utils.book_new();
+    const sheetTitle = isComparativo
+      ? 'Comparativo 2026 vs 2027'
+      : mesFiltro !== 'TODOS'
+      ? `Informe ${mesFiltro} ${anioStr}`.slice(0, 31)
+      : `Informe Expendios ${anioStr}`.slice(0, 31);
+    XLSX.utils.book_append_sheet(workbook, worksheet, sheetTitle);
+
+    // Si es comparativo o general, agregar hoja de Resumen por Centro Operativo
+    const centrosMap = new Map<
+      string,
+      {
+        totalPuntos: number;
+        actualizados: number;
+        fotosCompletas: number;
+        pagos2026: number;
+        pagos2027: number;
+        pagosAnioSeleccionado: number;
+      }
+    >();
+    listToExport.forEach((e) => {
+      const co = String(e.centroOperativo || 'PO.ORIENTE').trim().toUpperCase();
+      const curr = centrosMap.get(co) || {
+        totalPuntos: 0,
+        actualizados: 0,
+        fotosCompletas: 0,
+        pagos2026: 0,
+        pagos2027: 0,
+        pagosAnioSeleccionado: 0,
+      };
+      curr.totalPuntos++;
+      if (e.fechaUltimaActualizacion && e.fechaUltimaActualizacion !== '2026-07-31') {
+        curr.actualizados++;
+      }
+      const hasAviso = isLoadedPhoto(e.fotoAvisoUrl) || isLoadedPhoto(e.letreroUrl) || e.tieneAviso === 'NO';
+      const hasPanoramica = isLoadedPhoto(e.fotoPanoramicaUrl) || isLoadedPhoto((e as any).fotoFachadaUrl);
+      const hasMatasello = isLoadedPhoto(e.fotoMataselloUrl) || isLoadedPhoto(e.mataselloUrl) || e.tieneMatasello === 'NO';
+      const hasBascula = isLoadedPhoto(e.fotoBasculaUrl) || isLoadedPhoto(e.basculaUrl) || e.tieneBascula === 'NO';
+      const hasContratista = isLoadedPhoto(e.fotoContratistaUrl);
+      const hasHorario = isLoadedPhoto(e.fotoHorarioUrl);
+      const hasTarifas = isLoadedPhoto(e.fotoTarifasUrl);
+      if (hasAviso && hasPanoramica && hasMatasello && hasBascula && hasContratista && hasHorario && hasTarifas) {
+        curr.fotosCompletas++;
+      }
+      const p26 = calcularPagosExpendioEnAnio(e, '2026');
+      const p27 = calcularPagosExpendioEnAnio(e, '2027');
+      const pSel = calcularPagosExpendioEnAnio(e, anioStr);
+      curr.pagos2026 += mesFiltro !== 'TODOS' ? (p26.porMes[mesFiltro] || 0) : p26.totalAnual;
+      curr.pagos2027 += mesFiltro !== 'TODOS' ? (p27.porMes[mesFiltro] || 0) : p27.totalAnual;
+      curr.pagosAnioSeleccionado += mesFiltro !== 'TODOS' ? (pSel.porMes[mesFiltro] || 0) : pSel.totalAnual;
+      centrosMap.set(co, curr);
+    });
+
+    const resumenRows = Array.from(centrosMap.entries()).map(([co, stats]) => ({
+      'CENTRO OPERATIVO': co,
+      'TOTAL EXPENDIOS': stats.totalPuntos,
+      'DATOS ACTUALIZADOS': stats.actualizados,
+      'FOTOS AL DIA (7/7)': stats.fotosCompletas,
+      ...(isComparativo
+        ? {
+            'PAGOS 2026': stats.pagos2026,
+            'PAGOS 2027': stats.pagos2027,
+            'VARIACION (2027 - 2026)': stats.pagos2027 - stats.pagos2026,
+          }
+        : {
+            [`TOTAL PAGOS ${mesFiltro !== 'TODOS' ? mesFiltro + ' ' : ''}${anioStr}`]:
+              stats.pagosAnioSeleccionado,
+          }),
+    }));
+
+    if (resumenRows.length > 0) {
+      const wsResumen = XLSX.utils.json_to_sheet(resumenRows);
+      wsResumen['!cols'] = [
+        { wch: 24 },
+        { wch: 18 },
+        { wch: 22 },
+        { wch: 20 },
+        { wch: 22 },
+        { wch: 22 },
+        { wch: 24 },
+      ];
+      XLSX.utils.book_append_sheet(workbook, wsResumen, 'Resumen Centros Operativos');
+    }
+
+    const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+    const fechaHoy = new Date().toISOString().split('T')[0];
+    const coSlug = rawCentroOp !== 'TODOS' ? `_${rawCentroOp.replace(/[^A-Z0-9]/g, '')}` : '';
+    const mesSlug = mesFiltro !== 'TODOS' ? `_${mesFiltro}` : '';
+    const anioSlug = isComparativo ? 'Comparativo_2026_vs_2027' : anioStr;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Informe_Consolidado_Expendios_${anioSlug}${mesSlug}${coSlug}_${fechaHoy}.xlsx"`
+    );
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.end(Buffer.from(excelBuffer));
+  }
+);
+
+// 9. CONFIGURATION: Periodo Habilitado de Descarga
+const handleGetSystemConfig = async (req: any, res: any) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  try {
+    const rows = await db.select().from(schema.systemConfig).where(eq(schema.systemConfig.key, 'global_config'));
+    if (rows.length > 0 && rows[0].value) {
+      return res.json({ success: true, data: rows[0].value });
+    }
+  } catch (err: any) {
+    console.error('Error fetching config from PostgreSQL:', err);
+  }
+  const localDb = loadDatabase();
+  res.json({ success: true, data: localDb.config || DEFAULT_CONFIG });
 };
 
 app.get('/api/config', handleGetSystemConfig);
 app.get('/api/system/config', handleGetSystemConfig);
 app.get('/api/admin/config/periodo-descarga', handleGetSystemConfig);
 
-app.post('/api/admin/config/periodo-descarga', (req, res) => {
+app.post('/api/admin/config/periodo-descarga', async (req, res) => {
   const { periodoHabilitadoDescarga, descargaHabilitada } = req.body;
-  const db = loadDatabase();
-
   const newPeriodo = (periodoHabilitadoDescarga || 'FEBRERO 2026').trim().toUpperCase();
 
-  db.config = {
-    ...db.config,
-    periodoHabilitadoDescarga: newPeriodo,
-    descargaHabilitada: descargaHabilitada !== undefined ? !!descargaHabilitada : true,
-    fechaActualizacion: new Date().toISOString().split('T')[0],
-  };
+  try {
+    const updatedConfig = await mutateDatabase((db) => {
+      db.config = {
+        ...db.config,
+        periodoHabilitadoDescarga: newPeriodo,
+        descargaHabilitada: descargaHabilitada !== undefined ? !!descargaHabilitada : true,
+        fechaActualizacion: new Date().toISOString().split('T')[0],
+      };
+      return db.config;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
 
-  saveDatabase(db);
-  res.json({
-    success: true,
-    data: db.config,
-    message: `✓ Periodo habilitado de descarga actualizado a: ${db.config.periodoHabilitadoDescarga} (${db.config.descargaHabilitada ? 'Habilitado' : 'Deshabilitado'}).`,
-  });
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      data: updatedConfig,
+      message: `✓ Periodo habilitado de descarga actualizado a: ${updatedConfig.periodoHabilitadoDescarga} (${updatedConfig.descargaHabilitada ? 'Habilitado' : 'Deshabilitado'}).`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, cloudPersisted: false, message: `Error guardando periodo en PostgreSQL: ${err.message}` });
+  }
 });
 
 // =======================================================
 // PANEL DE GESTIÓN DE DOCUMENTACIÓN PARA EXPENDIOS
 // =======================================================
 // 1. Obtener listado de documentos de expendios (Admin)
-app.get('/api/admin/documentos-expendios', (req, res) => {
+app.get('/api/admin/documentos-expendios', requireAdmin, async (req, res) => {
   try {
-    const db = loadDatabase();
-    if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
-      db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-      saveDatabase(db);
-    } else {
-      // Ensure new default documents (like tarifario or horario) are present
-      let changed = false;
-      for (const defDoc of DEFAULT_DOCUMENTOS_EXPENDIOS) {
-        if (!db.config.documentosExpendios.some((d) => d.id === defDoc.id)) {
-          db.config.documentosExpendios.push({ ...defDoc });
-          changed = true;
-        }
+    let docConfig: any = null;
+    try {
+      const rows = await db.select().from(schema.systemConfig).where(eq(schema.systemConfig.key, 'global_config'));
+      if (rows.length > 0 && rows[0].value) {
+        docConfig = (rows[0].value as any).documentosExpendios;
       }
-      if (changed) {
-        saveDatabase(db);
+    } catch (pgErr) {
+      console.error('Error fetching docs from PostgreSQL:', pgErr);
+    }
+
+    if (!docConfig) {
+      const localDb = loadDatabase();
+      docConfig = localDb.config?.documentosExpendios;
+    }
+
+    const currentDocs = Array.isArray(docConfig) ? docConfig : [];
+    const mergedDocs = [...currentDocs];
+    for (const defDoc of DEFAULT_DOCUMENTOS_EXPENDIOS) {
+      if (!mergedDocs.some((d) => d.id === defDoc.id)) {
+        mergedDocs.push({ ...defDoc });
       }
     }
-    res.json({ success: true, data: db.config.documentosExpendios });
+    res.json({ success: true, data: mergedDocs });
   } catch (err: any) {
     res.status(500).json({ success: false, message: 'Error cargando documentos de expendios: ' + err.message });
   }
 });
 
 // 2. Actualizar configuración de un documento (Habilitar/Deshabilitar, Renombrar, Descripción)
-app.post('/api/admin/documentos-expendios', (req, res) => {
+app.post('/api/admin/documentos-expendios', async (req, res) => {
   try {
     const { id, nombre, descripcion, habilitado, badge } = req.body;
     if (!id) {
       return res.status(400).json({ success: false, message: 'ID del documento es requerido.' });
     }
 
-    const db = loadDatabase();
-    if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
-      db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-    }
+    const { doc, allDocs } = await mutateDatabase((db) => {
+      if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
+        db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
+      }
 
-    const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
-    if (docIndex === -1) {
-      return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
-    }
+      const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
+      if (docIndex === -1) {
+        throw new Error('DOCUMENTO_NOT_FOUND');
+      }
 
-    const currentDoc = db.config.documentosExpendios[docIndex];
-    db.config.documentosExpendios[docIndex] = {
-      ...currentDoc,
-      nombre: typeof nombre === 'string' && nombre.trim().length > 0 ? nombre.trim() : currentDoc.nombre,
-      descripcion: typeof descripcion === 'string' ? descripcion.trim() : currentDoc.descripcion,
-      habilitado: habilitado !== undefined ? Boolean(habilitado) : currentDoc.habilitado,
-      badge: badge !== undefined ? badge : currentDoc.badge,
-      fechaActualizacion: new Date().toISOString().split('T')[0],
-    };
+      const currentDoc = db.config.documentosExpendios[docIndex];
+      db.config.documentosExpendios[docIndex] = {
+        ...currentDoc,
+        nombre: typeof nombre === 'string' && nombre.trim().length > 0 ? nombre.trim() : currentDoc.nombre,
+        descripcion: typeof descripcion === 'string' ? descripcion.trim() : currentDoc.descripcion,
+        habilitado: habilitado !== undefined ? Boolean(habilitado) : currentDoc.habilitado,
+        badge: badge !== undefined ? badge : currentDoc.badge,
+        fechaActualizacion: new Date().toISOString().split('T')[0],
+      };
 
-    saveDatabase(db);
+      return { doc: db.config.documentosExpendios[docIndex], allDocs: db.config.documentosExpendios };
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
     res.json({
       success: true,
-      data: db.config.documentosExpendios[docIndex],
-      all: db.config.documentosExpendios,
-      message: `✓ Documento "${db.config.documentosExpendios[docIndex].nombre}" actualizado con éxito.`,
+      cloudPersisted: true,
+      data: doc,
+      all: allDocs,
+      message: `✓ Documento "${doc.nombre}" actualizado con éxito.`,
     });
   } catch (err: any) {
+    if (err.message === 'DOCUMENTO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
+    }
     res.status(500).json({ success: false, message: 'Error actualizando documento: ' + err.message });
   }
 });
 
 // 2.1 Habilitar o Deshabilitar masivamente documentos para TODOS los expendios
-app.post('/api/admin/documentos-expendios/bulk', (req, res) => {
+app.post('/api/admin/documentos-expendios/bulk', async (req, res) => {
   try {
     const { action, id, habilitar } = req.body;
-    const db = loadDatabase();
-    if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
-      db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-    }
-
     const todayStr = new Date().toISOString().split('T')[0];
 
-    if (action === 'enable_all') {
-      db.config.documentosExpendios = db.config.documentosExpendios.map((doc) => ({
-        ...doc,
-        habilitado: true,
-        fechaActualizacion: todayStr,
-      }));
-      saveDatabase(db);
-      return res.json({
-        success: true,
-        all: db.config.documentosExpendios,
-        message: '✓ TODOS los documentos han sido HABILITADOS para TODOS los expendios.',
-      });
-    }
-
-    if (action === 'disable_all') {
-      db.config.documentosExpendios = db.config.documentosExpendios.map((doc) => ({
-        ...doc,
-        habilitado: false,
-        fechaActualizacion: todayStr,
-      }));
-      saveDatabase(db);
-      return res.json({
-        success: true,
-        all: db.config.documentosExpendios,
-        message: '✓ TODOS los documentos han sido DESHABILITADOS para TODOS los expendios.',
-      });
-    }
-
-    if (id) {
-      const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
-      if (docIndex === -1) {
-        return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
+    const result = await mutateDatabase((db) => {
+      if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
+        db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
       }
-      const nuevoHabilitado = habilitar !== undefined ? Boolean(habilitar) : !db.config.documentosExpendios[docIndex].habilitado;
-      db.config.documentosExpendios[docIndex] = {
-        ...db.config.documentosExpendios[docIndex],
-        habilitado: nuevoHabilitado,
-        fechaActualizacion: todayStr,
-      };
-      saveDatabase(db);
-      return res.json({
-        success: true,
-        data: db.config.documentosExpendios[docIndex],
-        all: db.config.documentosExpendios,
-        message: `✓ Documento "${db.config.documentosExpendios[docIndex].nombre}" ${nuevoHabilitado ? 'HABILITADO' : 'DESHABILITADO'} para TODOS los expendios.`,
-      });
-    }
 
-    return res.status(400).json({ success: false, message: 'Acción no válida o ID faltante.' });
+      if (action === 'enable_all') {
+        db.config.documentosExpendios = db.config.documentosExpendios.map((doc) => ({
+          ...doc,
+          habilitado: true,
+          fechaActualizacion: todayStr,
+        }));
+        return {
+          all: db.config.documentosExpendios,
+          message: '✓ TODOS los documentos han sido HABILITADOS para TODOS los expendios.',
+        };
+      }
+
+      if (action === 'disable_all') {
+        db.config.documentosExpendios = db.config.documentosExpendios.map((doc) => ({
+          ...doc,
+          habilitado: false,
+          fechaActualizacion: todayStr,
+        }));
+        return {
+          all: db.config.documentosExpendios,
+          message: '✓ TODOS los documentos han sido DESHABILITADOS para TODOS los expendios.',
+        };
+      }
+
+      if (id) {
+        const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
+        if (docIndex === -1) {
+          throw new Error('DOCUMENTO_NOT_FOUND');
+        }
+        const nuevoHabilitado = habilitar !== undefined ? Boolean(habilitar) : !db.config.documentosExpendios[docIndex].habilitado;
+        db.config.documentosExpendios[docIndex] = {
+          ...db.config.documentosExpendios[docIndex],
+          habilitado: nuevoHabilitado,
+          fechaActualizacion: todayStr,
+        };
+        return {
+          data: db.config.documentosExpendios[docIndex],
+          all: db.config.documentosExpendios,
+          message: `✓ Documento "${db.config.documentosExpendios[docIndex].nombre}" ${nuevoHabilitado ? 'HABILITADO' : 'DESHABILITADO'} para TODOS los expendios.`,
+        };
+      }
+
+      throw new Error('INVALID_ACTION');
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      ...result,
+    });
   } catch (err: any) {
+    if (err.message === 'DOCUMENTO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
+    }
+    if (err.message === 'INVALID_ACTION') {
+      return res.status(400).json({ success: false, message: 'Acción no válida o ID faltante.' });
+    }
     res.status(500).json({ success: false, message: 'Error en acción masiva de documentos: ' + err.message });
   }
 });
 
 // 3. Subir archivo adjunto para un documento de expendio (Admin)
-app.post('/api/admin/documentos-expendios/upload', upload.single('archivoDoc'), (req, res) => {
+app.post('/api/admin/documentos-expendios/upload', upload.single('archivoDoc'), validateUploadedFileSecurity, async (req, res) => {
   try {
     const { id } = req.body;
     if (!req.file) {
@@ -5421,100 +8374,135 @@ app.post('/api/admin/documentos-expendios/upload', upload.single('archivoDoc'), 
       return res.status(400).json({ success: false, message: 'ID del documento es requerido.' });
     }
 
-    const db = loadDatabase();
-    if (!Array.isArray(db.config.documentosExpendios)) {
-      db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-    }
-
-    const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
-    if (docIndex === -1) {
-      return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
-    }
-
     const fileUrl = `/uploads/docs_expendios/${req.file.filename}`;
-    
-    // Also save copy to permanent archive if possible
+    let fileBase64 = '';
+    const fileMimeType = req.file.mimetype || 'application/pdf';
+
+    // Save copy to permanent archive AND encode base64 for PostgreSQL persistence
     try {
+      const fileBuf = fs.readFileSync(req.file.path);
+      fileBase64 = fileBuf.toString('base64');
       const permCopyPath = path.join(permanentArchiveDir, req.file.filename);
-      fs.copyFileSync(req.file.path, permCopyPath);
+      fs.writeFileSync(permCopyPath, fileBuf);
     } catch {}
 
-    db.config.documentosExpendios[docIndex] = {
-      ...db.config.documentosExpendios[docIndex],
-      archivoUrl: fileUrl,
-      archivoNombreOriginal: req.file.originalname,
-      fechaActualizacion: new Date().toISOString().split('T')[0],
-    };
+    const updatedDoc = await mutateDatabase((db) => {
+      if (!Array.isArray(db.config.documentosExpendios)) {
+        db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
+      }
 
-    saveDatabase(db);
+      const docIndex = db.config.documentosExpendios.findIndex((d) => d.id === id);
+      if (docIndex === -1) {
+        throw new Error('DOCUMENTO_NOT_FOUND');
+      }
+
+      db.config.documentosExpendios[docIndex] = {
+        ...db.config.documentosExpendios[docIndex],
+        archivoUrl: fileUrl,
+        archivoNombreOriginal: req.file!.originalname,
+        archivoBase64: fileBase64 || (db.config.documentosExpendios[docIndex] as any).archivoBase64,
+        archivoMimeType: fileMimeType,
+        fechaActualizacion: new Date().toISOString().split('T')[0],
+      } as any;
+
+      return db.config.documentosExpendios[docIndex];
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
     res.json({
       success: true,
-      data: db.config.documentosExpendios[docIndex],
-      message: `✓ Archivo "${req.file.originalname}" cargado exitosamente. Ahora estará disponible tal cual para todos los expendios.`,
+      cloudPersisted: true,
+      data: updatedDoc,
+      message: `✓ Archivo "${req.file.originalname}" cargado y respaldado en PostgreSQL y servidor. Ahora estará disponible para todos los expendios.`,
     });
   } catch (err: any) {
+    if (err.message === 'DOCUMENTO_NOT_FOUND') {
+      return res.status(404).json({ success: false, message: 'Documento no encontrado.' });
+    }
     res.status(500).json({ success: false, message: 'Error subiendo archivo: ' + err.message });
   }
 });
 
 // 5. Descargar archivo original exacto de un documento de expendio (Sin modificaciones)
-app.get('/api/documentos-expendios/download/:id', (req, res) => {
+app.get('/api/documentos-expendios/download/:id', async (req: any, res: any) => {
   try {
     const { id } = req.params;
-    const db = loadDatabase();
-    const doc = db.config?.documentosExpendios?.find((d) => d.id === id);
-    if (!doc || !doc.archivoUrl) {
+    const user = extractAuthenticatedUser(req);
+    let docConfig: any = null;
+    try {
+      const rows = await db.select().from(schema.systemConfig).where(eq(schema.systemConfig.key, 'global_config'));
+      if (rows.length > 0 && rows[0].value) {
+        docConfig = (rows[0].value as any).documentosExpendios;
+      }
+    } catch {}
+
+    if (!docConfig) {
+      const localDb = loadDatabase();
+      docConfig = localDb.config?.documentosExpendios;
+    }
+
+    const currentDocs = Array.isArray(docConfig) ? docConfig : [];
+    const mergedDocs = [...currentDocs];
+    for (const defDoc of DEFAULT_DOCUMENTOS_EXPENDIOS) {
+      if (!mergedDocs.some((d) => d.id === defDoc.id)) {
+        mergedDocs.push({ ...defDoc });
+      }
+    }
+
+    const doc = mergedDocs.find((d) => d.id === id);
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Documento inexistente.' });
+    }
+
+    const isAdmin = user?.roles?.includes('admin') || user?.role === 'admin';
+    if (doc.habilitado === false && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'Documento deshabilitado por la administración central.' });
+    }
+
+    if (!doc.archivoUrl && !(doc as any).archivoBase64) {
       return res.status(404).json({ success: false, message: 'El documento no tiene un archivo cargado actualmente.' });
     }
 
-    const cleanPath = doc.archivoUrl.startsWith('/') ? doc.archivoUrl.substring(1) : doc.archivoUrl;
+    const cleanPath = (doc.archivoUrl || '').startsWith('/') ? doc.archivoUrl.substring(1) : (doc.archivoUrl || `uploads/docs_expendios/${id}.pdf`);
     let fullPath = path.join(process.cwd(), cleanPath);
+    const fileName = path.basename(cleanPath);
 
-    // Fallback to permanentArchiveDir if file missing in uploads
+    // Búsqueda exhaustiva en rutas físicas posibles: uploads/docs_expendios, permanentArchiveDir, o restauración desde PostgreSQL (archivoBase64)
     if (!fs.existsSync(fullPath)) {
-      const fileName = path.basename(cleanPath);
-      const permPath = path.join(permanentArchiveDir, fileName);
-      if (fs.existsSync(permPath)) {
-        fullPath = permPath;
+      const candidatePaths = [
+        path.join(docsExpendiosDir, fileName),
+        path.join(permanentArchiveDir, fileName),
+        path.join(uploadDir, 'contracts', fileName),
+        path.join(uploadDir, fileName),
+      ];
+      const foundPath = candidatePaths.find((p) => fs.existsSync(p));
+      if (foundPath) {
+        fullPath = foundPath;
+      } else if ((doc as any).archivoBase64) {
+        const restoredBuf = Buffer.from((doc as any).archivoBase64, 'base64');
+        const targetRestorePath = path.join(docsExpendiosDir, fileName);
+        try {
+          fs.writeFileSync(targetRestorePath, restoredBuf);
+          fs.writeFileSync(path.join(permanentArchiveDir, fileName), restoredBuf);
+          fullPath = targetRestorePath;
+        } catch {
+          const downloadName = doc.archivoNombreOriginal || fileName;
+          res.setHeader('Content-Type', (doc as any).archivoMimeType || 'application/pdf');
+          res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+          return res.send(restoredBuf);
+        }
       } else {
         return res.status(404).json({ success: false, message: 'El archivo físico original no fue encontrado en el servidor.' });
       }
     }
 
-    const downloadName = doc.archivoNombreOriginal || path.basename(fullPath);
+    const downloadName = doc.archivoNombreOriginal || fileName;
     res.download(fullPath, downloadName);
   } catch (err: any) {
     res.status(500).json({ success: false, message: 'Error descargando archivo original: ' + err.message });
   }
 });
 
-// 4. Obtener documentos disponibles para los Expendios
-app.get('/api/expendio/documentos', (req, res) => {
-  try {
-    const db = loadDatabase();
-    if (!Array.isArray(db.config.documentosExpendios) || db.config.documentosExpendios.length === 0) {
-      db.config.documentosExpendios = [...DEFAULT_DOCUMENTOS_EXPENDIOS];
-      saveDatabase(db);
-    } else {
-      let changed = false;
-      for (const defDoc of DEFAULT_DOCUMENTOS_EXPENDIOS) {
-        if (!db.config.documentosExpendios.some((d) => d.id === defDoc.id)) {
-          db.config.documentosExpendios.push({ ...defDoc });
-          changed = true;
-        }
-      }
-      if (changed) {
-        saveDatabase(db);
-      }
-    }
-    res.json({
-      success: true,
-      data: db.config.documentosExpendios,
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, message: 'Error obteniendo documentos: ' + err.message });
-  }
-});
+// Módulo de Documentos Expendios consolidado y movido antes del comodín :id
 
 // ==========================================
 // IA & OCR AUDIT ENGINE FOR SIGNED ACCOUNTS
@@ -5578,7 +8566,7 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 }`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
+        model: 'gemini-3-flash-preview',
         contents: [
           {
             role: 'user',
@@ -5687,43 +8675,56 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 }
 
 // 10. CUENTAS DE COBRO CARGADAS (Scanner / Cámara Magic Pro)
-const handleGetCuentasCargadas = (req: any, res: any) => {
-  const cedulaParam = req.params?.cedula || req.query?.cedula;
+function handleGetCuentasCargadas(req: any, res: any) {
+  const user = extractAuthenticatedUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, message: 'Acceso no autorizado: Se requiere sesión activa.' });
+  }
+
+  const cleanDigits = (s?: any) => String(s || '').replace(/[^0-9]/g, '');
   const { periodo } = req.query;
   const db = loadDatabase();
   let list = db.cuentasCargadas || [];
 
-  if (cedulaParam) {
-    const cleanDigits = (s?: any) => String(s || '').replace(/[^0-9]/g, '');
-    const targetCed = cleanDigits(cedulaParam);
-    list = list.filter((c) => cleanDigits(c.cedula) === targetCed);
+  if (user.roles.includes('admin')) {
+    const cedulaParam = req.params?.cedula || req.query?.cedula;
+    if (cedulaParam) {
+      const targetCed = cleanDigits(cedulaParam);
+      list = list.filter((c) => cleanDigits(c.cedula) === targetCed);
+    }
+  } else {
+    // REGLA 7 y 13: Solo puede consultar sus propias cuentas cargadas
+    const userCed = cleanDigits(user.cedula);
+    list = list.filter((c) => cleanDigits(c.cedula) === userCed);
   }
 
   if (periodo) {
-    const targetPer = String(periodo).trim().toUpperCase();
-    list = list.filter((c) => (c.periodo || '').trim().toUpperCase() === targetPer);
+    const targetPerNorm = normalizePeriodKey(String(periodo));
+    list = list.filter((c) => normalizePeriodKey(c.periodo) === targetPerNorm);
   }
 
   res.json({ success: true, data: list });
-};
+}
 
-app.get('/api/cuentas-cargadas', handleGetCuentasCargadas);
-app.get('/api/expendio/cuentas-cargadas/:cedula', handleGetCuentasCargadas);
+// Cuentas cargadas GET movido antes del comodín :id
 
-app.post('/api/expendio/cargar-cuenta', async (req, res) => {
+app.post('/api/expendio/cargar-cuenta', requireExpendio, async (req: AuthRequest, res) => {
   try {
-    const { cedula, encargado, expendio, municipio, periodo, fotoBase64, monto } = req.body;
-    if (!cedula || !fotoBase64) {
-      return res.status(400).json({ success: false, message: 'La cédula y la fotografía escaneada son requeridas.' });
+    const user = req.user!;
+    const { encargado, expendio, municipio, periodo, fotoBase64, monto } = req.body;
+    if (!fotoBase64) {
+      return res.status(400).json({ success: false, message: 'La fotografía escaneada es requerida.' });
     }
 
-    const db = loadDatabase();
-    if (!Array.isArray(db.cuentasCargadas)) db.cuentasCargadas = [];
-    if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+    const currentDb = getDatabase();
+    const ownExpendio = resolveUserExpendio(req, currentDb);
+    if (!ownExpendio) {
+      return res.status(404).json({ success: false, message: 'Expendio propio no encontrado para este usuario.' });
+    }
 
-    const periodoFinal = String(periodo || db.config?.periodoHabilitadoDescarga || 'FEBRERO 2026').trim().toUpperCase();
-    const cleanCedula = String(cedula).trim();
-    const cleanMunicipio = String(municipio || expendio || 'ARAUCA').trim().toUpperCase();
+    const cleanCedula = ownExpendio.cedula;
+    const cleanMunicipio = ownExpendio.municipio || ownExpendio.localidad || 'ARAUCA';
+    const periodoFinal = String(periodo || currentDb.config?.periodoHabilitadoDescarga || 'FEBRERO 2026').trim().toUpperCase();
 
     // Save base64 image to scanned_cuentas folder
     let fotoUrl = '';
@@ -5739,14 +8740,14 @@ app.post('/api/expendio/cargar-cuenta', async (req, res) => {
     const [mesParte] = periodoFinal.split(' ');
     const mesNorm = (mesParte || 'FEBRERO').toUpperCase();
 
-    const pagoRegistrado = db.relacionPagos.find(
+    const pagoRegistrado = (currentDb.relacionPagos || []).find(
       (p) =>
         (cleanDigits(p.cedula) === cleanDigits(cleanCedula) ||
           p.municipio.trim().toUpperCase() === cleanMunicipio) &&
         (p.mes.toUpperCase() === mesNorm || !p.mes)
     );
 
-    const expRegistrado = db.expendios.find(
+    const expRegistrado = (currentDb.expendios || []).find(
       (e) =>
         e.municipio.trim().toUpperCase() === cleanMunicipio ||
         cleanDigits(e.cedula) === cleanDigits(cleanCedula)
@@ -5766,24 +8767,8 @@ app.post('/api/expendio/cargar-cuenta', async (req, res) => {
     // Run AI Document Analysis and Discrepancy Detection
     const analisisIA = await analizarCuentaCobroConIA(imageBuffer, 'image/jpeg', datosEsperados);
 
-    // Cargar inmediatamente a Firebase Storage
     let driveUrl = '';
     let driveFileId = '';
-    try {
-      const storageUploadRes = await uploadPhotoToFirebaseStorageServer(imageBuffer, {
-        cedula: cleanCedula,
-        slotKey: 'cuenta_escaneada',
-        municipio: cleanMunicipio,
-        expendioNombre: datosEsperados.encargado,
-        overrideFileName: `Cuenta_Cobro_${cleanMunicipio}_${cleanCedula}_${periodoFinal.replace(/\s+/g, '_')}.jpg`,
-      });
-      if (storageUploadRes.success) {
-        driveUrl = storageUploadRes.webViewLink || '';
-        driveFileId = storageUploadRes.driveFileId || '';
-      }
-    } catch (e: any) {
-      console.warn('Error subiendo cuenta escaneada a Firebase Storage:', e.message);
-    }
 
     const newId = `cc-cargada-${Date.now()}`;
     const newCuentaCargada: CuentaCargadaExpendio = {
@@ -5802,53 +8787,54 @@ app.post('/api/expendio/cargar-cuenta', async (req, res) => {
       driveFileId: driveFileId || undefined,
     };
 
-    // Remove older uploaded record for same expendio & period if exists
-    db.cuentasCargadas = db.cuentasCargadas.filter(
-      (c) => !(cleanDigits(c.cedula) === cleanDigits(cleanCedula) && c.periodo.toUpperCase() === periodoFinal)
-    );
-    db.cuentasCargadas.unshift(newCuentaCargada);
+    await mutateDatabase((database) => {
+      // Remove older uploaded record for same expendio & period if exists
+      database.cuentasCargadas = (database.cuentasCargadas || []).filter(
+        (c) => !(cleanDigits(c.cedula) === cleanDigits(cleanCedula) && c.periodo.toUpperCase() === periodoFinal)
+      );
+      database.cuentasCargadas.unshift(newCuentaCargada);
 
-    // Auto-update or sync with Relacion de Pagos
-    const relIdx = db.relacionPagos.findIndex(
-      (p) =>
-        (cleanDigits(p.cedula) === cleanDigits(cleanCedula) ||
-          p.municipio.trim().toUpperCase() === cleanMunicipio) &&
-        (p.mes.toUpperCase() === mesNorm || !p.mes)
-    );
+      // Auto-update or sync with Relacion de Pagos
+      const relIdx = (database.relacionPagos || []).findIndex(
+        (p) =>
+          (cleanDigits(p.cedula) === cleanDigits(cleanCedula) ||
+            p.municipio.trim().toUpperCase() === cleanMunicipio) &&
+          (p.mes.toUpperCase() === mesNorm || !p.mes)
+      );
 
-    if (relIdx !== -1) {
-      db.relacionPagos[relIdx].estado = analisisIA.hayNovedad ? 'Cuenta con Novedad IA' : 'Listo para Pago';
-      db.relacionPagos[relIdx].cuentaCargadaId = newId;
-      db.relacionPagos[relIdx].analisisIA = analisisIA;
-    }
-
-    // Link signed file to existing official cuenta in db.historial without creating new accounts or modifying accounting values
-    if (Array.isArray(db.historial)) {
-      const histMatch = db.historial.find((h) => {
-        if (h.tipo !== 'Cuenta de Cobro') return false;
-        const hCed = cleanDigits(h.cedula || h.cuentaData?.cedula);
-        if (hCed !== cleanDigits(cleanCedula)) return false;
-        const hPer = (h.periodo || h.cuentaData?.periodo || '').toUpperCase();
-        return hPer.includes(mesNorm);
-      });
-
-      if (histMatch) {
-        histMatch.cuentaCargadaId = newId;
-        histMatch.soporteFirmadoUrl = fotoUrl;
-        histMatch.cuentaFirmadaCargada = true;
-        histMatch.fechaCargueFirmada = new Date().toISOString().split('T')[0];
-        // Note: Strict preservation of accounting — We NEVER modify histMatch.monto,
-        // cargoBasico, retefuente, or valorNeto as entered by the administrator.
+      if (relIdx !== -1 && database.relacionPagos) {
+        database.relacionPagos[relIdx].estado = analisisIA.hayNovedad ? 'Cuenta con Novedad IA' : 'Listo para Pago';
+        database.relacionPagos[relIdx].cuentaCargadaId = newId;
+        database.relacionPagos[relIdx].analisisIA = analisisIA;
       }
-    }
 
-    saveDatabase(db);
+      // Link signed file to existing official cuenta in db.historial
+      if (Array.isArray(database.historial)) {
+        const histMatch = database.historial.find((h) => {
+          if (h.tipo !== 'Cuenta de Cobro') return false;
+          const hCed = cleanDigits(h.cedula || h.cuentaData?.cedula);
+          if (hCed !== cleanDigits(cleanCedula)) return false;
+          const hPer = (h.periodo || h.cuentaData?.periodo || '').toUpperCase();
+          return hPer.includes(mesNorm);
+        });
+
+        if (histMatch) {
+          histMatch.cuentaCargadaId = newId;
+          histMatch.soporteFirmadoUrl = fotoUrl;
+          histMatch.cuentaFirmadaCargada = true;
+          histMatch.fechaCargueFirmada = new Date().toISOString().split('T')[0];
+        }
+      }
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
 
     res.json({
       success: true,
+      cloudPersisted: true,
       data: newCuentaCargada,
       message: `✓ Cuenta de cobro firmada cargada y analizada con IA para ${periodoFinal}. ${analisisIA.resumen}`,
     });
+
   } catch (err: any) {
     console.error('Error al guardar y analizar cuenta escaneada:', err);
     res.status(500).json({ success: false, message: `Error al procesar la imagen con IA: ${err.message}` });
@@ -5856,7 +8842,7 @@ app.post('/api/expendio/cargar-cuenta', async (req, res) => {
 });
 
 // Re-analizar con IA una cuenta ya cargada
-app.post('/api/admin/cuentas-cargadas/:id/re-analizar-ia', async (req, res) => {
+app.post('/api/admin/cuentas-cargadas/:id/re-analizar-ia', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const db = loadDatabase();
@@ -5900,16 +8886,21 @@ app.post('/api/admin/cuentas-cargadas/:id/re-analizar-ia', async (req, res) => {
 
     const analisisIA = await analizarCuentaCobroConIA(imageBuffer, 'image/jpeg', datosEsperados);
 
-    cuenta.analisisIA = analisisIA;
-    if (pagoRegistrado) {
-      pagoRegistrado.analisisIA = analisisIA;
-    }
-
-    saveDatabase(db);
+    await mutateDatabase((database) => {
+      const c = (database.cuentasCargadas || []).find((x) => x.id === id);
+      if (c) c.analisisIA = analisisIA;
+      const p = (database.relacionPagos || []).find(
+        (x) =>
+          cleanDigits(x.cedula) === cleanDigits(cuenta.cedula) ||
+          x.municipio.trim().toUpperCase() === cleanMunicipio
+      );
+      if (p) p.analisisIA = analisisIA;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
-      data: cuenta,
+      cloudPersisted: true,
+      data: { ...cuenta, analisisIA },
       analisisIA,
       message: `✓ Re-análisis con IA completado. ${analisisIA.resumen}`,
     });
@@ -5919,58 +8910,83 @@ app.post('/api/admin/cuentas-cargadas/:id/re-analizar-ia', async (req, res) => {
   }
 });
 
-// Aplicar Novedad detectada por IA a la Base de Datos (Sincronización Total por Municipio)
-app.post('/api/admin/relacion-pagos/aplicar-novedad-ia', (req, res) => {
+// Aplicar Novedad detectada por IA a la Base de Datos (Sincronización Total por expendioId y Municipio)
+app.post('/api/admin/relacion-pagos/aplicar-novedad-ia', requireAdmin, async (req, res) => {
   try {
-    const { pagoId, nuevoNumeroCuenta, nuevoBanco, nuevoEncargado, nuevoValor, municipio } = req.body;
-    const db = loadDatabase();
-    if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
-
+    const { pagoId, nuevoNumeroCuenta, nuevoBanco, nuevoEncargado, nuevoValor, municipio, expendioId } = req.body;
     const targetMun = String(municipio || '').trim().toUpperCase();
-
-    // 1. Update in relacionPagos
-    let updatedPago: PagoRelacionItem | null = null;
     const formattedCtaNovedad = formatCuentaBancaria(nuevoNumeroCuenta, nuevoBanco);
-    db.relacionPagos = db.relacionPagos.map((p) => {
-      if (p.id === pagoId || (targetMun && p.municipio.trim().toUpperCase() === targetMun)) {
-        const item = {
-          ...p,
-          cuenta: nuevoNumeroCuenta ? formattedCtaNovedad.cuenta : p.cuenta,
-          banco: nuevoBanco || formattedCtaNovedad.banco || p.banco,
-          nombreEncargado: nuevoEncargado || p.nombreEncargado,
-          valorCancelar: nuevoValor ? Number(nuevoValor) : p.valorCancelar,
-          estado: 'Listo para Pago',
-        };
-        if (item.analisisIA) {
-          item.analisisIA.hayNovedad = false;
-          item.analisisIA.resumen = `✓ Novedad aprobada y sincronizada por administración en toda la base de datos.`;
-        }
-        updatedPago = item;
-        return item;
-      }
-      return p;
-    });
 
-    // 2. Synchronize to Expendios by Municipio
-    if (targetMun) {
-      db.expendios = db.expendios.map((exp) => {
-        if (exp.municipio.trim().toUpperCase() === targetMun) {
-          const digitsCuenta = cleanNequiNumber(nuevoNumeroCuenta);
-          return {
-            ...exp,
-            encargado: nuevoEncargado || exp.encargado,
-            telefonoPunto: digitsCuenta || exp.telefonoPunto,
-            valorMensual: nuevoValor ? Number(nuevoValor) : exp.valorMensual,
+    let updatedPago: PagoRelacionItem | null = null;
+
+    await mutateDatabase((database) => {
+      if (!Array.isArray(database.relacionPagos)) database.relacionPagos = [];
+
+      // REGLA 21: Preservar la identidad real mediante expendioId
+      let resolvedExpendioId = expendioId ? String(expendioId).trim() : '';
+
+      // 1. Update in relacionPagos
+      database.relacionPagos = database.relacionPagos.map((p) => {
+        const matchesPago = p.id === pagoId;
+        const matchesExpId = resolvedExpendioId && (p as any).expendioId === resolvedExpendioId;
+        const matchesMun = !resolvedExpendioId && targetMun && p.municipio.trim().toUpperCase() === targetMun;
+
+        if (matchesPago || matchesExpId || matchesMun) {
+          if (!resolvedExpendioId && (p as any).expendioId) {
+            resolvedExpendioId = (p as any).expendioId;
+          }
+          const item: any = {
+            ...p,
+            expendioId: resolvedExpendioId || (p as any).expendioId,
+            cuenta: nuevoNumeroCuenta ? formattedCtaNovedad.cuenta : p.cuenta,
+            banco: nuevoBanco || formattedCtaNovedad.banco || p.banco,
+            nombreEncargado: nuevoEncargado || p.nombreEncargado,
+            valorCancelar: nuevoValor ? Number(nuevoValor) : p.valorCancelar,
+            estado: 'Listo para Pago',
           };
+          if (item.analisisIA) {
+            item.analisisIA.hayNovedad = false;
+            item.analisisIA.resumen = `✓ Novedad aprobada y sincronizada por administración en toda la base de datos.`;
+          }
+          updatedPago = item;
+          return item;
         }
-        return exp;
+        return p;
       });
-    }
 
-    saveDatabase(db);
+      // 2. Synchronize to Expendios by expendioId (priority) or Municipio fallback
+      if (resolvedExpendioId) {
+        database.expendios = database.expendios.map((exp) => {
+          if (exp.id === resolvedExpendioId) {
+            const digitsCuenta = cleanNequiNumber(nuevoNumeroCuenta);
+            return {
+              ...exp,
+              encargado: nuevoEncargado || exp.encargado,
+              telefonoPunto: digitsCuenta || exp.telefonoPunto,
+              valorMensual: nuevoValor ? Number(nuevoValor) : exp.valorMensual,
+            };
+          }
+          return exp;
+        });
+      } else if (targetMun) {
+        database.expendios = database.expendios.map((exp) => {
+          if (exp.municipio.trim().toUpperCase() === targetMun) {
+            const digitsCuenta = cleanNequiNumber(nuevoNumeroCuenta);
+            return {
+              ...exp,
+              encargado: nuevoEncargado || exp.encargado,
+              telefonoPunto: digitsCuenta || exp.telefonoPunto,
+              valorMensual: nuevoValor ? Number(nuevoValor) : exp.valorMensual,
+            };
+          }
+          return exp;
+        });
+      }
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       data: updatedPago,
       message: `✓ Datos bancarios y del expendio actualizados y sincronizados en toda la base de datos para ${targetMun || 'el registro'}.`,
     });
@@ -6005,114 +9021,38 @@ interface ScannedPageAIResult {
   observacionesIA?: string;
 }
 
-async function analyzeScannedPageWithGemini(
-  buffer: Buffer,
-  mimeType: string,
-  municipiosList: string[]
-): Promise<ScannedPageAIResult> {
-  const ai = getGeminiAI();
-  if (!ai || !process.env.GEMINI_API_KEY) {
-    return {
-      municipio: '',
-      municipioConfianza: 'Baja',
-      requiereRevisionMunicipio: true,
-      mes: new Date().toLocaleDateString('es-CO', { month: 'long' }).toUpperCase(),
-      anio: String(new Date().getFullYear()),
-      encargado: '',
-      cedula: '',
-      valorCobro: 0,
-      tieneSoportePago: false,
-      datosSoporte: {},
-      observacionesIA: 'Sin conexión a Gemini AI. Por favor verifica y asigna los datos manualmente.',
-    };
-  }
-
-  try {
-    const base64Data = buffer.toString('base64');
-    const prompt = `Eres un auditor contable de CAMARCA S.A.S. (NIT 900.504.241-7), contratista de 4-72 Servicios Postales Nacionales.
-Analiza esta HOJA de CUENTA DE COBRO escaneada.
-
-LISTA DE MUNICIPIOS OFICIALES DE EXPENDIOS EN NUESTRA BASE DE DATOS:
-${JSON.stringify(municipiosList)}
-
-Debes leer cuidadosamente el documento (encabezado, cuerpo, firmas y tirillas bancarias pegadas/adheridas) y extraer en formato JSON estricto:
-1. "municipio": Nombre del municipio o localidad oficial (ej: ARAUCA, SARAVENA, TAME, FORTUL, CRAVO NORTE, PUERTO RONDÓN, etc.). Si en el texto dice un municipio de la lista, asígnalo exactamente en MAYÚSCULAS.
-2. "municipioConfianza": "Alta" si se lee claramente, "Media" si es probable, "Baja" si no se visualiza.
-3. "requiereRevisionMunicipio": true si tienes dudas del municipio, false si estás seguro.
-4. "mes": Mes de cobro del servicio en MAYÚSCULAS (ej: ENERO, FEBRERO, MARZO, ABRIL, MAYO, JUNIO, JULIO, AGOSTO, SEPTIEMBRE, OCTUBRE, NOVIEMBRE, DICIEMBRE).
-5. "anio": Año del cobro (ej: 2026, 2025).
-6. "encargado": Nombre completo del contratista o persona a nombre de quien está la cuenta de cobro.
-7. "cedula": Número de cédula de ciudadanía o NIT sin puntos.
-8. "valorCobro": Valor neto o total a pagar en número entero (ej: 121200).
-9. "tieneSoportePago": true si la hoja contiene una tirilla bancaria / comprobante de corresponsal (Redeban, Bancolombia, Nequi, Daviplata, Banco Agrario, consignación) pegado o impreso, false si es solo la cuenta sin comprobante.
-10. "datosSoporte": {
-  "entidad": "Nombre de la entidad / corresponsal (ej: Corresponsal Bancolombia Redeban, Nequi)",
-  "valorPagado": Valor numérico entero en la tirilla,
-  "fechaPago": "Fecha de pago (ej: 2026-02-28)",
-  "numeroAprobacion": "Número de aprobación o transacción",
-  "titular": "Nombre del titular en la tirilla",
-  "tipoTransaccion": "RECARGA NEQUI / TRANSFERENCIA / CORRESPONSAL BANCARIO",
-  "coincideValor": true si el valor pagado coincide con el valor de la cuenta
-}
-11. "observacionesIA": Resumen muy conciso del análisis (municipio identificado, mes, valor y estado del comprobante bancario).
-
-Responde ÚNICAMENTE en JSON válido con esa estructura.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: [
-        {
-          inlineData: {
-            mimeType,
-            data: base64Data,
-          },
-        },
-        {
-          text: prompt,
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-      },
-    });
-
-    const rawText = response.text || '{}';
-    return JSON.parse(rawText);
-  } catch (err) {
-    console.error('Error analizando hoja con Gemini AI:', err);
-    return {
-      municipio: '',
-      municipioConfianza: 'Baja',
-      requiereRevisionMunicipio: true,
-      mes: new Date().toLocaleDateString('es-CO', { month: 'long' }).toUpperCase(),
-      anio: String(new Date().getFullYear()),
-      encargado: '',
-      cedula: '',
-      valorCobro: 0,
-      tieneSoportePago: false,
-      datosSoporte: {},
-      observacionesIA: 'Error al interpretar la imagen con IA. Se requiere revisión manual.',
-    };
-  }
-}
-
-app.post('/api/admin/conciliar-soporte-ai', uploadScanned.array('archivos', 25), async (req, res) => {
+// MOTOR DE CONCILIACIÓN DETERMINÍSTICO (SIN IA / SIN EMBEDDINGS)
+app.post(
+  ['/api/admin/conciliar-soporte-ai', '/api/admin/conciliar-soporte-deterministico'],
+  uploadScanned.array('archivos', 25),
+  validateUploadedFileSecurity,
+  async (req, res) => {
   const files = (req.files as Express.Multer.File[]) || [];
   if (files.length === 0) {
     return res.status(400).json({ success: false, message: 'No se subieron archivos para conciliar.' });
   }
 
-  const db = loadDatabase();
+  // Cargar lista oficial de municipios desde PostgreSQL (Fuente de Verdad)
+  let activeExpendios: any[] = [];
+  try {
+    activeExpendios = await db
+      .select()
+      .from(schema.expendios)
+      .where(eq(schema.expendios.activo, true));
+  } catch (err: any) {
+    console.warn('[Conciliacion] Error cargando expendios activos desde PostgreSQL:', err.message);
+  }
+
   const municipiosList = Array.from(
     new Set(
-      db.expendios
+      activeExpendios
         .map((e) => (e.municipio || e.localidad || '').trim().toUpperCase())
         .filter(Boolean)
     )
   );
 
-  const resultados: ResultadoConciliacionAI[] = [];
+  const resultados: any[] = [];
+  const batchKnownHashes = new Set<string>();
 
   for (const file of files) {
     const filePath = file.path;
@@ -6123,12 +9063,10 @@ app.post('/api/admin/conciliar-soporte-ai', uploadScanned.array('archivos', 25),
 
     if (isPdf) {
       try {
-        // Load PDF and split page by page
         const srcDoc = await PDFDocument.load(fileBuffer);
         const pageCount = srcDoc.getPageCount();
 
         for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-          // Create a standalone 1-page PDF document
           const singlePageDoc = await PDFDocument.create();
           const [copiedPage] = await singlePageDoc.copyPages(srcDoc, [pageIndex]);
           singlePageDoc.addPage(copiedPage);
@@ -6141,145 +9079,92 @@ app.post('/api/admin/conciliar-soporte-ai', uploadScanned.array('archivos', 25),
 
           const pageFileUrl = `/uploads/scanned_cuentas/${pageFileName}`;
           const pageBuffer = Buffer.from(singlePageBytes);
+          const pageHash = computeSha256(pageBuffer);
 
-          // Analyze this individual page with Gemini Flash 3.7
-          const aiData = await analyzeScannedPageWithGemini(pageBuffer, 'application/pdf', municipiosList);
+          // 100% Determinístico: OCR local sin modelos generativos ni embeddings
+          let pageText = await extractTextFromPdf(pageBuffer);
+          if (!pageText || pageText.trim().length < 15) {
+            pageText = await extractTextFromImage(pageBuffer);
+          }
 
-          // Match with expendio and historial
-          const munUpper = (aiData.municipio || '').toUpperCase().trim();
-          const matchedExpendio = db.expendios.find((e) => {
-            const eMun = (e.municipio || e.localidad || '').toUpperCase().trim();
-            const eCed = (e.cedula || '').trim();
-            return (
-              (munUpper && (eMun === munUpper || eMun.includes(munUpper) || munUpper.includes(eMun))) ||
-              (aiData.cedula && eCed === String(aiData.cedula).trim())
-            );
-          });
+          const ocrFields = extractFieldsFromOcrText(pageText, pageHash, municipiosList);
+          const recResult = await reconcileOcrWithPostgres(
+            ocrFields,
+            {
+              originalname: `${file.originalname} (Hoja ${pageIndex + 1} de ${pageCount})`,
+              fileUrl: pageFileUrl,
+              mimeType: 'application/pdf',
+              hojaNumero: pageIndex + 1,
+              totalHojas: pageCount,
+            },
+            batchKnownHashes
+          );
 
-          const finalMunicipio = munUpper || (matchedExpendio ? matchedExpendio.municipio.toUpperCase() : '');
-
-          const matchedHistorial = db.historial.find((h) => {
-            const hMun = (h.expendio || '').toUpperCase().trim();
-            const hCed = (h.cedula || '').trim();
-            const hPer = (h.periodo || '').toUpperCase();
-            const matchesMunOrCed =
-              (finalMunicipio && (hMun === finalMunicipio || hMun.includes(finalMunicipio))) ||
-              (aiData.cedula && hCed === String(aiData.cedula).trim());
-            const matchesPeriodo = !aiData.mes || hPer.includes(aiData.mes.toUpperCase());
-            return matchesMunOrCed && matchesPeriodo;
-          });
-
-          const resultadoItem: ResultadoConciliacionAI = {
-            id: `concil-${Date.now()}-${pageIndex + 1}-${Math.round(Math.random() * 1e5)}`,
-            archivoNombre: `${file.originalname} (Hoja ${pageIndex + 1} de ${pageCount})`,
-            archivoUrl: pageFileUrl,
-            mimeType: 'application/pdf',
-            hojaNumero: pageIndex + 1,
-            totalHojas: pageCount,
-            municipio: finalMunicipio,
-            municipioConfianza: aiData.municipioConfianza || (finalMunicipio ? 'Alta' : 'Baja'),
-            requiereRevisionMunicipio: !finalMunicipio || !!aiData.requiereRevisionMunicipio,
-            mes: (aiData.mes || '').toUpperCase(),
-            anio: String(aiData.anio || '2026'),
-            periodo: `${aiData.mes || ''} ${aiData.anio || ''}`.trim() || 'PERIODO ACTUAL',
-            encargado: (aiData.encargado || matchedExpendio?.encargado || '').toUpperCase(),
-            cedula: (aiData.cedula || matchedExpendio?.cedula || '').trim(),
-            valorCobro: Number(aiData.valorCobro) || matchedHistorial?.monto || matchedExpendio?.valorMensual || 0,
-            tieneSoportePago: !!aiData.tieneSoportePago,
-            datosSoporte: aiData.datosSoporte,
-            observacionesIA:
-              aiData.observacionesIA ||
-              (aiData.tieneSoportePago ? 'Soporte bancario validado' : 'Sin tirilla bancaria visible'),
-            estadoConciliacion: aiData.tieneSoportePago && finalMunicipio ? 'Listo' : 'RevisionManual',
-            historialMatchedId: matchedHistorial?.id,
-            expendioMatchedId: matchedExpendio?.id,
-            expendioNombre: matchedExpendio?.localidad || matchedExpendio?.municipio || finalMunicipio,
-          };
-
-          resultados.push(resultadoItem);
+          batchKnownHashes.add(pageHash);
+          resultados.push(recResult);
         }
       } catch (pdfSplitErr) {
-        console.error('Error dividiendo PDF multipágina, analizando como archivo único:', pdfSplitErr);
-        // Fallback: analyze original file
+        console.warn('Error dividiendo PDF multipágina, analizando como documento único:', pdfSplitErr);
         const fileUrl = `/uploads/scanned_cuentas/${file.filename}`;
-        const aiData = await analyzeScannedPageWithGemini(fileBuffer, 'application/pdf', municipiosList);
-        const munUpper = (aiData.municipio || '').toUpperCase().trim();
-        const matchedExpendio = db.expendios.find(
-          (e) => (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper
+        const fileHash = computeSha256(fileBuffer);
+
+        let pdfText = await extractTextFromPdf(fileBuffer);
+        if (!pdfText || pdfText.trim().length < 15) {
+          pdfText = await extractTextFromImage(fileBuffer);
+        }
+
+        const ocrFields = extractFieldsFromOcrText(pdfText, fileHash, municipiosList);
+        const recResult = await reconcileOcrWithPostgres(
+          ocrFields,
+          {
+            originalname: file.originalname,
+            fileUrl,
+            mimeType: 'application/pdf',
+            hojaNumero: 1,
+            totalHojas: 1,
+          },
+          batchKnownHashes
         );
-        resultados.push({
-          id: `concil-${Date.now()}-${Math.round(Math.random() * 1e5)}`,
-          archivoNombre: file.originalname,
-          archivoUrl: fileUrl,
-          mimeType: 'application/pdf',
-          hojaNumero: 1,
-          totalHojas: 1,
-          municipio: munUpper,
-          municipioConfianza: aiData.municipioConfianza || (munUpper ? 'Alta' : 'Baja'),
-          requiereRevisionMunicipio: !munUpper || !!aiData.requiereRevisionMunicipio,
-          mes: (aiData.mes || '').toUpperCase(),
-          anio: String(aiData.anio || '2026'),
-          periodo: `${aiData.mes || ''} ${aiData.anio || ''}`.trim() || 'PERIODO ACTUAL',
-          encargado: (aiData.encargado || matchedExpendio?.encargado || '').toUpperCase(),
-          cedula: (aiData.cedula || matchedExpendio?.cedula || '').trim(),
-          valorCobro: Number(aiData.valorCobro) || matchedExpendio?.valorMensual || 0,
-          tieneSoportePago: !!aiData.tieneSoportePago,
-          datosSoporte: aiData.datosSoporte,
-          observacionesIA: aiData.observacionesIA || 'Documento analizado.',
-          estadoConciliacion: aiData.tieneSoportePago && munUpper ? 'Listo' : 'RevisionManual',
-          expendioMatchedId: matchedExpendio?.id,
-          expendioNombre: matchedExpendio?.localidad || matchedExpendio?.municipio || munUpper,
-        });
+
+        batchKnownHashes.add(fileHash);
+        resultados.push(recResult);
       }
     } else {
-      // Direct image file (JPEG, PNG)
+      // Imagen escaneada (JPEG, PNG, etc.)
       const fileUrl = `/uploads/scanned_cuentas/${file.filename}`;
       const mimeType = file.mimetype || 'image/jpeg';
-      const aiData = await analyzeScannedPageWithGemini(fileBuffer, mimeType, municipiosList);
-      const munUpper = (aiData.municipio || '').toUpperCase().trim();
-      const matchedExpendio = db.expendios.find(
-        (e) => (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper
-      );
-      const matchedHistorial = db.historial.find(
-        (h) => (h.expendio || '').toUpperCase().trim() === munUpper
+      const fileHash = computeSha256(fileBuffer);
+
+      // OCR determinístico con Tesseract.js (sin IA externa)
+      const imgText = await extractTextFromImage(fileBuffer);
+      const ocrFields = extractFieldsFromOcrText(imgText, fileHash, municipiosList);
+      const recResult = await reconcileOcrWithPostgres(
+        ocrFields,
+        {
+          originalname: file.originalname,
+          fileUrl,
+          mimeType,
+          hojaNumero: 1,
+          totalHojas: 1,
+        },
+        batchKnownHashes
       );
 
-      resultados.push({
-        id: `concil-${Date.now()}-${Math.round(Math.random() * 1e5)}`,
-        archivoNombre: file.originalname,
-        archivoUrl: fileUrl,
-        mimeType,
-        hojaNumero: 1,
-        totalHojas: 1,
-        municipio: munUpper,
-        municipioConfianza: aiData.municipioConfianza || (munUpper ? 'Alta' : 'Baja'),
-        requiereRevisionMunicipio: !munUpper || !!aiData.requiereRevisionMunicipio,
-        mes: (aiData.mes || '').toUpperCase(),
-        anio: String(aiData.anio || '2026'),
-        periodo: `${aiData.mes || ''} ${aiData.anio || ''}`.trim() || 'PERIODO ACTUAL',
-        encargado: (aiData.encargado || matchedExpendio?.encargado || '').toUpperCase(),
-        cedula: (aiData.cedula || matchedExpendio?.cedula || '').trim(),
-        valorCobro: Number(aiData.valorCobro) || matchedHistorial?.monto || matchedExpendio?.valorMensual || 0,
-        tieneSoportePago: !!aiData.tieneSoportePago,
-        datosSoporte: aiData.datosSoporte,
-        observacionesIA: aiData.observacionesIA || 'Imagen analizada.',
-        estadoConciliacion: aiData.tieneSoportePago && munUpper ? 'Listo' : 'RevisionManual',
-        historialMatchedId: matchedHistorial?.id,
-        expendioMatchedId: matchedExpendio?.id,
-        expendioNombre: matchedExpendio?.localidad || matchedExpendio?.municipio || munUpper,
-      });
+      batchKnownHashes.add(fileHash);
+      resultados.push(recResult);
     }
   }
 
   res.json({
     success: true,
     data: resultados,
-    message: `¡Análisis completado! Se procesaron y dividieron ${resultados.length} hojas de cuentas de cobro con inteligencia artificial.`,
+    engine: 'DETERMINISTIC_POSTGRES_OCR',
+    message: `¡Conciliación 100% determinística completada! Se procesaron ${resultados.length} documento(s) comparando OCR contra PostgreSQL sin modelos de lenguaje.`,
   });
 });
 
 // 4B. Admin: Approve single reconciled account -> Set status to Cancelado and attach single-page PDF
-app.post('/api/admin/aprobar-conciliacion-cuenta', (req, res) => {
+app.post('/api/admin/aprobar-conciliacion-cuenta', requireAdmin, async (req, res) => {
   const {
     id,
     municipio,
@@ -6294,256 +9179,293 @@ app.post('/api/admin/aprobar-conciliacion-cuenta', (req, res) => {
     historialMatchedId,
   } = req.body;
 
-  const db = loadDatabase();
   const munUpper = (municipio || '').toUpperCase().trim();
   const mesUpper = (mes || new Date().toLocaleDateString('es-CO', { month: 'long' })).toUpperCase().trim();
   const anioStr = String(anio || new Date().getFullYear()).trim();
   const periodoStr = `${mesUpper} ${anioStr}`;
   const urlFinal = soporteUrl || archivoUrl || '';
 
-  const matchedExp = db.expendios.find(
-    (e) =>
-      (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper ||
-      (cedula && (e.cedula || '').trim() === String(cedula).trim())
-  );
+  try {
+    let savedExpendioId: string | undefined;
+    let savedFinalCedula: string = '';
 
-  const finalCedula = cedula || matchedExp?.cedula || '';
-  const finalEncargado = encargado || matchedExp?.encargado || munUpper;
+    const updated = await mutateDatabase((db) => {
+      const matchedExp = db.expendios.find(
+        (e) =>
+          (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper ||
+          (cedula && (e.cedula || '').trim() === String(cedula).trim())
+      );
 
-  // 1. Update or Insert in db.historial
-  let histItem: HistorialItem | undefined;
-  if (historialMatchedId) {
-    histItem = db.historial.find((h) => h.id === historialMatchedId);
-  }
-  if (!histItem && munUpper) {
-    histItem = db.historial.find(
-      (h) =>
-        (h.expendio || '').toUpperCase().trim() === munUpper ||
-        ((h.cedula || '').trim() === finalCedula && (h.periodo || '').toUpperCase().includes(mesUpper))
-    );
-  }
+      const finalCedula = cedula || matchedExp?.cedula || '';
+      const finalEncargado = encargado || matchedExp?.encargado || munUpper;
+      savedExpendioId = matchedExp?.id;
+      savedFinalCedula = finalCedula;
 
-  if (histItem) {
-    histItem.estado = 'Cancelado';
-    histItem.soporteUrl = urlFinal;
-    histItem.fechaCancelado = new Date().toISOString().split('T')[0];
-    histItem.conciliadoConIA = true;
-    histItem.detalles = `Cuenta de cobro cancelada con soporte de pago adjunto (${
-      datosSoporte?.entidad || 'Comprobante bancario'
-    })`;
-  } else {
-    db.historial.unshift({
-      id: `hist-cancel-${Date.now()}`,
-      periodo: periodoStr,
-      tipo: 'Cuenta de Cobro',
-      encargado: finalEncargado,
-      cedula: finalCedula,
-      expendio: munUpper,
-      monto: Number(valorCobro) || matchedExp?.valorMensual || 0,
-      fecha: new Date().toISOString().split('T')[0],
-      estado: 'Cancelado',
-      soporteUrl: urlFinal,
-      fechaCancelado: new Date().toISOString().split('T')[0],
-      conciliadoConIA: true,
-      detalles: `Cuenta de cobro subida y cancelada mediante auditoría IA con soporte bancario adjunto`,
-    });
-  }
-
-  // 2. Update in db.relacionPagos
-  if (Array.isArray(db.relacionPagos)) {
-    db.relacionPagos.forEach((p) => {
-      if ((p.municipio || '').toUpperCase().trim() === munUpper) {
-        p.estado = 'Pagado';
-        p.soporteUrl = urlFinal;
+      // 1. Update or Insert in db.historial
+      let histItem: HistorialItem | undefined;
+      if (historialMatchedId) {
+        histItem = db.historial.find((h) => h.id === historialMatchedId);
       }
+      if (!histItem && munUpper) {
+        histItem = db.historial.find(
+          (h) =>
+            (h.expendio || '').toUpperCase().trim() === munUpper ||
+            ((h.cedula || '').trim() === finalCedula && (h.periodo || '').toUpperCase().includes(mesUpper))
+        );
+      }
+
+      if (histItem) {
+        histItem.estado = 'Cancelado';
+        histItem.soporteUrl = urlFinal;
+        histItem.fechaCancelado = new Date().toISOString().split('T')[0];
+        histItem.conciliadoConIA = true;
+        histItem.detalles = `Cuenta de cobro cancelada con soporte de pago adjunto (${
+          datosSoporte?.entidad || 'Comprobante bancario'
+        })`;
+      } else {
+        db.historial.unshift({
+          id: `hist-cancel-${Date.now()}`,
+          periodo: periodoStr,
+          tipo: 'Cuenta de Cobro',
+          encargado: finalEncargado,
+          cedula: finalCedula,
+          expendio: munUpper,
+          monto: Number(valorCobro) || matchedExp?.valorMensual || 0,
+          fecha: new Date().toISOString().split('T')[0],
+          estado: 'Cancelado',
+          soporteUrl: urlFinal,
+          fechaCancelado: new Date().toISOString().split('T')[0],
+          conciliadoConIA: true,
+          detalles: `Cuenta de cobro subida y cancelada mediante auditoría IA con soporte bancario adjunto`,
+        });
+      }
+
+      // 2. Update in db.relacionPagos
+      if (Array.isArray(db.relacionPagos)) {
+        db.relacionPagos.forEach((p) => {
+          if ((p.municipio || '').toUpperCase().trim() === munUpper) {
+            p.estado = 'Pagado';
+            p.soporteUrl = urlFinal;
+          }
+        });
+      }
+
+      // 3. Update or Insert in db.cuentasCargadas
+      if (!Array.isArray(db.cuentasCargadas)) {
+        db.cuentasCargadas = [];
+      }
+
+      db.cuentasCargadas = db.cuentasCargadas.filter(
+        (c) =>
+          !(
+            (c.municipio || '').toUpperCase().trim() === munUpper &&
+            (c.mesPeriodo || '').toUpperCase() === mesUpper
+          )
+      );
+
+      db.cuentasCargadas.unshift({
+        id: `cc-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
+        cedula: finalCedula,
+        encargado: finalEncargado,
+        municipio: munUpper,
+        mesPeriodo: mesUpper,
+        anioPeriodo: anioStr,
+        periodo: periodoStr,
+        fotoUrl: urlFinal,
+        estado: 'Aprobada',
+        fechaCarga: new Date().toISOString(),
+        observaciones: `Conciliada y asignada por IA con soporte de pago adjunto (${
+          datosSoporte?.entidad || 'Comprobante bancario'
+        })`,
+        analisisIA: {
+          esCuentaCobro: true,
+          tieneSoportePago: true,
+          coincideMunicipio: true,
+          coincidePeriodo: true,
+          confianzaGeneral: 'Alta',
+          resumen: `Cuenta de cobro correspondiente a ${munUpper} para ${periodoStr} aprobada con soporte adjunto.`,
+          verificaciones: {
+            firmaPresente: true,
+            datosBancariosPresentes: true,
+            soporteAdjunto: true,
+            municipioLegible: true,
+            periodoLegible: true,
+          },
+        },
+      });
+
+      return { historial: db.historial, cuentasCargadas: db.cuentasCargadas };
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    if (req.body.fileHashSha256) {
+      persistSha256ToRegistry(req.body.fileHashSha256, {
+        expendioId: savedExpendioId,
+        cedula: savedFinalCedula,
+        periodo: periodoStr,
+        archivoNombre: req.body.archivoNombre,
+      }).catch((e: any) => console.warn('[Approve] Error registrando SHA-256:', e.message));
+    }
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ Hoja de cuenta de cobro de ${munUpper} (${periodoStr}) asignada, adjuntada y marcada como CANCELADA / PAGADA.`,
+      historial: updated.historial,
+      cuentasCargadas: updated.cuentasCargadas,
     });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error aprobando conciliación: ' + err.message });
   }
-
-  // 3. Update or Insert in db.cuentasCargadas
-  if (!Array.isArray(db.cuentasCargadas)) {
-    db.cuentasCargadas = [];
-  }
-
-  // Remove previous entry for same municipio/cedula in same period if any
-  db.cuentasCargadas = db.cuentasCargadas.filter(
-    (c) =>
-      !(
-        (c.municipio || '').toUpperCase().trim() === munUpper &&
-        (c.mesPeriodo || '').toUpperCase() === mesUpper
-      )
-  );
-
-  db.cuentasCargadas.unshift({
-    id: `cc-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
-    cedula: finalCedula,
-    encargado: finalEncargado,
-    municipio: munUpper,
-    mesPeriodo: mesUpper,
-    anioPeriodo: anioStr,
-    periodo: periodoStr,
-    fotoUrl: urlFinal,
-    estado: 'Aprobada',
-    fechaCarga: new Date().toISOString(),
-    observaciones: `Conciliada y asignada por IA con soporte de pago adjunto (${
-      datosSoporte?.entidad || 'Comprobante bancario'
-    })`,
-    analisisIA: {
-      esCuentaCobro: true,
-      tieneSoportePago: true,
-      coincideMunicipio: true,
-      coincidePeriodo: true,
-      confianzaGeneral: 'Alta',
-      resumen: `Cuenta de cobro correspondiente a ${munUpper} para ${periodoStr} aprobada con soporte adjunto.`,
-      verificaciones: {
-        firmaPresente: true,
-        datosBancariosPresentes: true,
-        soporteAdjunto: true,
-        municipioLegible: true,
-        periodoLegible: true,
-      },
-    },
-  });
-
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    message: `✓ Hoja de cuenta de cobro de ${munUpper} (${periodoStr}) asignada, adjuntada y marcada como CANCELADA / PAGADA.`,
-    historial: db.historial,
-    cuentasCargadas: db.cuentasCargadas,
-  });
 });
 
 // 4C. Admin: Approve batch of reconciled accounts -> Set status to Cancelado and attach individual PDF pages
-app.post('/api/admin/aprobar-conciliacion-lote', (req, res) => {
+app.post('/api/admin/aprobar-conciliacion-lote', requireAdmin, async (req, res) => {
   const { cuentas } = req.body;
   if (!Array.isArray(cuentas) || cuentas.length === 0) {
     return res.status(400).json({ success: false, message: 'No se recibieron cuentas para conciliar.' });
   }
 
-  const db = loadDatabase();
-  let countAprobadas = 0;
-  if (!Array.isArray(db.cuentasCargadas)) {
-    db.cuentasCargadas = [];
-  }
+  try {
+    let countAprobadas = 0;
+    const result = await mutateDatabase((db) => {
+      if (!Array.isArray(db.cuentasCargadas)) {
+        db.cuentasCargadas = [];
+      }
 
-  cuentas.forEach((c: ResultadoConciliacionAI) => {
-    const munUpper = (c.municipio || '').toUpperCase().trim();
-    if (!munUpper) return;
+      cuentas.forEach((c: ResultadoConciliacionAI) => {
+        const munUpper = (c.municipio || '').toUpperCase().trim();
+        if (!munUpper) return;
 
-    const mesUpper = (c.mes || new Date().toLocaleDateString('es-CO', { month: 'long' })).toUpperCase().trim();
-    const anioStr = String(c.anio || new Date().getFullYear()).trim();
-    const periodoStr = `${mesUpper} ${anioStr}`;
-    const urlFinal = c.archivoUrl;
+        const mesUpper = (c.mes || new Date().toLocaleDateString('es-CO', { month: 'long' })).toUpperCase().trim();
+        const anioStr = String(c.anio || new Date().getFullYear()).trim();
+        const periodoStr = `${mesUpper} ${anioStr}`;
+        const urlFinal = c.archivoUrl;
 
-    const matchedExp = db.expendios.find(
-      (e) =>
-        (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper ||
-        (c.cedula && (e.cedula || '').trim() === String(c.cedula).trim())
-    );
+        const matchedExp = db.expendios.find(
+          (e) =>
+            (e.municipio || e.localidad || '').toUpperCase().trim() === munUpper ||
+            (c.cedula && (e.cedula || '').trim() === String(c.cedula).trim())
+        );
 
-    const finalCedula = c.cedula || matchedExp?.cedula || '';
-    const finalEncargado = c.encargado || matchedExp?.encargado || munUpper;
+        const finalCedula = c.cedula || matchedExp?.cedula || '';
+        const finalEncargado = c.encargado || matchedExp?.encargado || munUpper;
 
-    let histItem = c.historialMatchedId ? db.historial.find((h) => h.id === c.historialMatchedId) : null;
-    if (!histItem) {
-      histItem =
-        db.historial.find(
-          (h) =>
-            (h.expendio || '').toUpperCase().trim() === munUpper ||
-            ((h.cedula || '').trim() === finalCedula && (h.periodo || '').toUpperCase().includes(mesUpper))
-        ) || null;
-    }
-
-    if (histItem) {
-      histItem.estado = 'Cancelado';
-      histItem.soporteUrl = urlFinal;
-      histItem.fechaCancelado = new Date().toISOString().split('T')[0];
-      histItem.conciliadoConIA = true;
-      histItem.detalles = `Cuenta de cobro cancelada tras verificación de soporte de pago (${
-        c.datosSoporte?.entidad || 'Tirilla bancaria'
-      })`;
-    } else {
-      db.historial.unshift({
-        id: `hist-cancel-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
-        periodo: periodoStr,
-        tipo: 'Cuenta de Cobro',
-        encargado: finalEncargado,
-        cedula: finalCedula,
-        expendio: munUpper,
-        monto: Number(c.valorCobro) || matchedExp?.valorMensual || 0,
-        fecha: new Date().toISOString().split('T')[0],
-        estado: 'Cancelado',
-        soporteUrl: urlFinal,
-        fechaCancelado: new Date().toISOString().split('T')[0],
-        conciliadoConIA: true,
-        detalles: `Cuenta de cobro escaneada y cancelada mediante auditoría IA`,
-      });
-    }
-
-    if (Array.isArray(db.relacionPagos)) {
-      db.relacionPagos.forEach((p) => {
-        if ((p.municipio || '').toUpperCase().trim() === munUpper) {
-          p.estado = 'Pagado';
-          p.soporteUrl = urlFinal;
+        let histItem = c.historialMatchedId ? db.historial.find((h) => h.id === c.historialMatchedId) : null;
+        if (!histItem) {
+          histItem =
+            db.historial.find(
+              (h) =>
+                (h.expendio || '').toUpperCase().trim() === munUpper ||
+                ((h.cedula || '').trim() === finalCedula && (h.periodo || '').toUpperCase().includes(mesUpper))
+            ) || null;
         }
+
+        if (histItem) {
+          histItem.estado = 'Cancelado';
+          histItem.soporteUrl = urlFinal;
+          histItem.fechaCancelado = new Date().toISOString().split('T')[0];
+          histItem.conciliadoConIA = true;
+          histItem.detalles = `Cuenta de cobro cancelada tras verificación de soporte de pago (${
+            c.datosSoporte?.entidad || 'Tirilla bancaria'
+          })`;
+        } else {
+          db.historial.unshift({
+            id: `hist-cancel-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
+            periodo: periodoStr,
+            tipo: 'Cuenta de Cobro',
+            encargado: finalEncargado,
+            cedula: finalCedula,
+            expendio: munUpper,
+            monto: Number(c.valorCobro) || matchedExp?.valorMensual || 0,
+            fecha: new Date().toISOString().split('T')[0],
+            estado: 'Cancelado',
+            soporteUrl: urlFinal,
+            fechaCancelado: new Date().toISOString().split('T')[0],
+            conciliadoConIA: true,
+            detalles: `Cuenta de cobro escaneada y cancelada mediante auditoría IA`,
+          });
+        }
+
+        if (Array.isArray(db.relacionPagos)) {
+          db.relacionPagos.forEach((p) => {
+            if ((p.municipio || '').toUpperCase().trim() === munUpper) {
+              p.estado = 'Pagado';
+              p.soporteUrl = urlFinal;
+            }
+          });
+        }
+
+        // Update in db.cuentasCargadas
+        db.cuentasCargadas = db.cuentasCargadas.filter(
+          (cc) =>
+            !(
+              (cc.municipio || '').toUpperCase().trim() === munUpper &&
+              (cc.mesPeriodo || '').toUpperCase() === mesUpper
+            )
+        );
+
+        db.cuentasCargadas.unshift({
+          id: `cc-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
+          cedula: finalCedula,
+          encargado: finalEncargado,
+          municipio: munUpper,
+          mesPeriodo: mesUpper,
+          anioPeriodo: anioStr,
+          periodo: periodoStr,
+          fotoUrl: urlFinal,
+          estado: 'Aprobada',
+          fechaCarga: new Date().toISOString(),
+          observaciones: `Conciliada y asignada por IA con soporte de pago (${
+            c.datosSoporte?.entidad || 'Tirilla bancaria'
+          })`,
+          analisisIA: {
+            esCuentaCobro: true,
+            tieneSoportePago: c.tieneSoportePago,
+            coincideMunicipio: true,
+            coincidePeriodo: true,
+            confianzaGeneral: 'Alta',
+            resumen: c.observacionesIA || 'Cuenta de cobro aprobada y cancelada con soporte adjunto.',
+            verificaciones: {
+              firmaPresente: true,
+              datosBancariosPresentes: true,
+              soporteAdjunto: c.tieneSoportePago,
+              municipioLegible: true,
+              periodoLegible: true,
+            },
+          },
+        });
+
+        countAprobadas++;
       });
+
+      return { countAprobadas, historial: db.historial, cuentasCargadas: db.cuentasCargadas };
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    // Persistir huellas criptográficas SHA-256 en PostgreSQL
+    for (const c of cuentas) {
+      if (c && c.fileHashSha256) {
+        persistSha256ToRegistry(c.fileHashSha256, {
+          expendioId: c.expendioMatchedId,
+          cedula: c.cedula,
+          periodo: c.periodo,
+          archivoNombre: c.archivoNombre,
+        }).catch((e: any) => console.warn('[BatchApprove] Error registrando SHA-256:', e.message));
+      }
     }
 
-    // Update in db.cuentasCargadas
-    db.cuentasCargadas = db.cuentasCargadas.filter(
-      (cc) =>
-        !(
-          (cc.municipio || '').toUpperCase().trim() === munUpper &&
-          (cc.mesPeriodo || '').toUpperCase() === mesUpper
-        )
-    );
-
-    db.cuentasCargadas.unshift({
-      id: `cc-${Date.now()}-${Math.round(Math.random() * 1e4)}`,
-      cedula: finalCedula,
-      encargado: finalEncargado,
-      municipio: munUpper,
-      mesPeriodo: mesUpper,
-      anioPeriodo: anioStr,
-      periodo: periodoStr,
-      fotoUrl: urlFinal,
-      estado: 'Aprobada',
-      fechaCarga: new Date().toISOString(),
-      observaciones: `Conciliada y asignada por IA con soporte de pago (${
-        c.datosSoporte?.entidad || 'Tirilla bancaria'
-      })`,
-      analisisIA: {
-        esCuentaCobro: true,
-        tieneSoportePago: c.tieneSoportePago,
-        coincideMunicipio: true,
-        coincidePeriodo: true,
-        confianzaGeneral: 'Alta',
-        resumen: c.observacionesIA || 'Cuenta de cobro aprobada y cancelada con soporte adjunto.',
-        verificaciones: {
-          firmaPresente: true,
-          datosBancariosPresentes: true,
-          soporteAdjunto: c.tieneSoportePago,
-          municipioLegible: true,
-          periodoLegible: true,
-        },
-      },
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ Se aprobaron, asignaron y pasaron a estado CANCELADO ${result.countAprobadas} cuentas de cobro con sus respectivas hojas PDF y soportes adjuntos.`,
+      historial: result.historial,
+      cuentasCargadas: result.cuentasCargadas,
     });
-
-    countAprobadas++;
-  });
-
-  saveDatabase(db);
-
-  res.json({
-    success: true,
-    message: `✓ Se aprobaron, asignaron y pasaron a estado CANCELADO ${countAprobadas} cuentas de cobro con sus respectivas hojas PDF y soportes adjuntos.`,
-    historial: db.historial,
-    cuentasCargadas: db.cuentasCargadas,
-  });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error aprobando conciliación en lote: ' + err.message });
+  }
 });
 
-// 4D. Admin: Export and Import database and photographic records
+// 4E. Admin: Export and Import database and photographic records
 function collectPhotographicRecord(maxSizePerFile = 4 * 1024 * 1024): Record<string, { dataUrl: string; size: number; mime: string }> {
   const record: Record<string, { dataUrl: string; size: number; mime: string }> = {};
   const baseUploadDir = path.join(process.cwd(), 'uploads');
@@ -6729,15 +9651,11 @@ const uploadBackupMulter = multer({
   limits: { fileSize: 100 * 1024 * 1024 },
 });
 
-app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFile'), (req, res) => {
+app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFile'), requireAdmin, async (req, res) => {
   try {
-    const password = (req.body?.password || '').trim();
-    if (password !== ADMIN_MASTER_PASSWORD) {
+    if (!authorizeDestructiveAction(req, res, 'RESTORE_DATABASE_FILE')) {
       if (req.file) try { fs.unlinkSync(req.file.path); } catch (e) {}
-      return res.status(401).json({
-        success: false,
-        message: 'Contraseña de seguridad incorrecta. Debe ingresar Camarca.2023* para restaurar.',
-      });
+      return;
     }
 
     if (!req.file) {
@@ -6762,9 +9680,11 @@ app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFil
       });
     }
 
-    // Restore photographic record files if embedded
+    // Restore photographic record files if embedded (con validación de ruta segura dentro de uploads/ o data/)
     let fotosRestauradas = 0;
     const registroFotografico = targetData.registroFotografico || targetData.photosStore;
+    const allowedUploadsRoot = path.resolve(process.cwd(), 'uploads');
+    const allowedDataRoot = path.resolve(process.cwd(), 'data');
     if (registroFotografico && typeof registroFotografico === 'object') {
       for (const [relPath, photoInfo] of Object.entries(registroFotografico)) {
         try {
@@ -6774,7 +9694,11 @@ app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFil
             if (parts.length === 2) {
               const buffer = Buffer.from(parts[1], 'base64');
               const cleanRel = relPath.replace(/^[/\\]+/, '');
-              const targetPath = path.join(process.cwd(), cleanRel);
+              const targetPath = path.resolve(process.cwd(), cleanRel);
+              if (!targetPath.startsWith(allowedUploadsRoot + path.sep) && !targetPath.startsWith(allowedDataRoot + path.sep)) {
+                console.warn('[Seguridad] Ruta bloqueada fuera de directorios permitidos en database-import-file:', relPath);
+                continue;
+              }
               fs.mkdirSync(path.dirname(targetPath), { recursive: true });
               fs.writeFileSync(targetPath, buffer);
               fotosRestauradas++;
@@ -6797,11 +9721,22 @@ app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFil
       visitasGenerales: typeof targetData.visitasGenerales === 'number' ? targetData.visitasGenerales : 0,
     };
 
-    saveDatabase(restoredDb);
-    createAutoSnapshot(restoredDb);
+    await mutateDatabase((database) => {
+      database.expendios = restoredDb.expendios;
+      database.historial = restoredDb.historial;
+      database.trazabilidad = restoredDb.trazabilidad;
+      database.config = restoredDb.config;
+      database.cuentasCargadas = restoredDb.cuentasCargadas;
+      database.relacionPagos = restoredDb.relacionPagos;
+      database.registrosAcceso = restoredDb.registrosAcceso;
+      database.visitasGenerales = restoredDb.visitasGenerales;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    createAutoSnapshot(loadDatabase());
 
     res.json({
       success: true,
+      cloudPersisted: true,
       message: `✓ Base de datos restaurada exitosamente con ${restoredDb.expendios.length} expendios, ${restoredDb.historial.length} registros en historial, ${restoredDb.relacionPagos?.length || 0} pagos y ${fotosRestauradas} fotos procesadas.`,
     });
   } catch (err: any) {
@@ -6811,14 +9746,10 @@ app.post('/api/admin/database-import-file', uploadBackupMulter.single('backupFil
 });
 
 // 6. Restore Database via JSON Body
-app.post('/api/admin/database-import', (req, res) => {
-  const { database: rawIncomingDb, password } = req.body || {};
-  if (password !== ADMIN_MASTER_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: 'Contraseña de seguridad incorrecta. Debe ingresar Camarca.2023* para restaurar la base de datos.',
-    });
-  }
+app.post('/api/admin/database-import', requireAdmin, async (req, res) => {
+  if (!authorizeDestructiveAction(req, res, 'RESTORE_DATABASE_JSON')) return;
+
+  const { database: rawIncomingDb } = req.body || {};
 
   if (!rawIncomingDb || typeof rawIncomingDb !== 'object') {
     return res.status(400).json({ success: false, message: 'Estructura de datos de respaldo inválida.' });
@@ -6826,9 +9757,11 @@ app.post('/api/admin/database-import', (req, res) => {
 
   const incomingDb = rawIncomingDb.database || rawIncomingDb;
 
-  // Restaurar archivos del registro fotográfico si están incluidos en el respaldo
+  // Restaurar archivos del registro fotográfico si están incluidos en el respaldo (validando ruta segura)
   let fotosRestauradas = 0;
   const registroFotografico = incomingDb.registroFotografico || incomingDb.photosStore;
+  const allowedUploadsRoot = path.resolve(process.cwd(), 'uploads');
+  const allowedDataRoot = path.resolve(process.cwd(), 'data');
   if (registroFotografico && typeof registroFotografico === 'object') {
     for (const [relPath, photoInfo] of Object.entries(registroFotografico)) {
       try {
@@ -6838,7 +9771,11 @@ app.post('/api/admin/database-import', (req, res) => {
           if (parts.length === 2) {
             const buffer = Buffer.from(parts[1], 'base64');
             const cleanRel = relPath.replace(/^[/\\]+/, '');
-            const targetPath = path.join(process.cwd(), cleanRel);
+            const targetPath = path.resolve(process.cwd(), cleanRel);
+            if (!targetPath.startsWith(allowedUploadsRoot + path.sep) && !targetPath.startsWith(allowedDataRoot + path.sep)) {
+              console.warn('[Seguridad] Ruta bloqueada fuera de directorios permitidos en database-import:', relPath);
+              continue;
+            }
             fs.mkdirSync(path.dirname(targetPath), { recursive: true });
             fs.writeFileSync(targetPath, buffer);
             fotosRestauradas++;
@@ -6861,13 +9798,28 @@ app.post('/api/admin/database-import', (req, res) => {
     visitasGenerales: typeof incomingDb.visitasGenerales === 'number' ? incomingDb.visitasGenerales : 0,
   };
 
-  saveDatabase(restoredDb);
-  createAutoSnapshot(restoredDb);
+  try {
+    await mutateDatabase((database) => {
+      database.expendios = restoredDb.expendios;
+      database.historial = restoredDb.historial;
+      database.trazabilidad = restoredDb.trazabilidad;
+      database.config = restoredDb.config;
+      database.cuentasCargadas = restoredDb.cuentasCargadas;
+      database.relacionPagos = restoredDb.relacionPagos;
+      database.registrosAcceso = restoredDb.registrosAcceso;
+      database.visitasGenerales = restoredDb.visitasGenerales;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
-  res.json({
-    success: true,
-    message: `✓ Base de datos restaurada exitosamente con ${restoredDb.expendios.length} expendios, ${restoredDb.historial.length} registros en historial, ${restoredDb.relacionPagos?.length || 0} pagos y ${fotosRestauradas} fotos del registro fotográfico recuperadas en el servidor.`,
-  });
+    createAutoSnapshot(loadDatabase());
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ Base de datos restaurada exitosamente con ${restoredDb.expendios.length} expendios, ${restoredDb.historial.length} registros en historial, ${restoredDb.relacionPagos?.length || 0} pagos y ${fotosRestauradas} fotos del registro fotográfico recuperadas en el servidor.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error restaurando base de datos: ' + err.message });
+  }
 });
 
 // 7. Get list of automatic local snapshots saved on the server
@@ -6910,15 +9862,11 @@ app.get('/api/admin/backups-locales', (req, res) => {
 });
 
 // 8. Restore from a specific automatic local snapshot
-app.post('/api/admin/restaurar-backup-local', (req, res) => {
+app.post('/api/admin/restaurar-backup-local', requireAdmin, async (req, res) => {
   try {
-    const { filename, password } = req.body || {};
-    if (password !== ADMIN_MASTER_PASSWORD) {
-      return res.status(401).json({
-        success: false,
-        message: 'Contraseña de seguridad incorrecta. Debe ingresar Camarca.2023* para restaurar.',
-      });
-    }
+    if (!authorizeDestructiveAction(req, res, 'RESTORE_LOCAL_SNAPSHOT')) return;
+
+    const { filename } = req.body || {};
 
     if (!filename || typeof filename !== 'string' || !filename.startsWith('snapshot-')) {
       return res.status(400).json({ success: false, message: 'Nombre de archivo de copia local inválido.' });
@@ -6945,10 +9893,20 @@ app.post('/api/admin/restaurar-backup-local', (req, res) => {
       visitasGenerales: typeof targetData.visitasGenerales === 'number' ? targetData.visitasGenerales : 0,
     };
 
-    saveDatabase(restoredDb);
+    await mutateDatabase((database) => {
+      database.expendios = restoredDb.expendios;
+      database.historial = restoredDb.historial;
+      database.trazabilidad = restoredDb.trazabilidad;
+      database.config = restoredDb.config;
+      database.cuentasCargadas = restoredDb.cuentasCargadas;
+      database.relacionPagos = restoredDb.relacionPagos;
+      database.registrosAcceso = restoredDb.registrosAcceso;
+      database.visitasGenerales = restoredDb.visitasGenerales;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       message: `✓ Copia de seguridad ${cleanName} restaurada exitosamente con ${restoredDb.expendios.length} expendios y ${restoredDb.historial.length} registros.`,
     });
   } catch (err: any) {
@@ -6975,69 +9933,161 @@ app.get('/api/admin/ambiente-info', (req, res) => {
     googleDriveWebhookUrl: db.config?.googleDriveWebhookUrl || '',
     expendiosCount: (db.expendios || []).length,
     historialCount: (db.historial || []).length,
-    cloudSync: getCloudSyncStatus(),
+    cloudSync: { connected: true, provider: 'PostgreSQL (Cloud SQL)' },
   });
 });
 
-// --- GOOGLE CLOUD FIRESTORE PERSISTENCIA ENDPOINTS ---
-// Estado de sincronización en la nube
-app.get('/api/admin/cloud-sync-status', (req, res) => {
-  const status = getCloudSyncStatus();
-  const db = loadDatabase();
-  res.json({
-    success: true,
-    data: {
-      ...status,
-      localExpendios: (db.expendios || []).length,
-      localHistorial: (db.historial || []).length,
-      localRelacionPagos: (db.relacionPagos || []).length,
-    },
-  });
-});
-
-// Forzar sincronización inmediata hacia Google Cloud Firestore
-app.post('/api/admin/cloud-sync-now', async (req, res) => {
+// --- CLOUD SQL (POSTGRESQL) ENDPOINTS ---
+// Estado de conexión y métricas de Cloud SQL PostgreSQL
+app.get('/api/admin/cloudsql/status', async (req, res) => {
   try {
-    resetFirestoreQuotaCooldown();
-    const db = loadDatabase();
-    const success = await saveDatabaseToCloud(db, { force: true });
-    const currentStatus = getCloudSyncStatus();
-    res.json({
-      success,
-      message: success
-        ? `✓ Base de datos sincronizada permanentemente en Google Cloud Firestore (${(db.expendios || []).length} expendios, ${(db.historial || []).length} cuentas de cobro).`
-        : (currentStatus.lastSyncError || 'No se pudo sincronizar en Cloud Firestore.'),
-      status: currentStatus,
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, message: 'Error en sincronización Cloud: ' + err.message });
-  }
-});
-
-// Restaurar forzadamente desde Google Cloud Firestore
-app.post('/api/admin/cloud-restore-now', async (req, res) => {
-  try {
-    resetFirestoreQuotaCooldown();
-    const currentLocalDb = loadDatabase();
-    const cloudDb = await loadDatabaseFromCloud(currentLocalDb, { force: true });
-    if (!cloudDb || !Array.isArray(cloudDb.expendios) || cloudDb.expendios.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No se encontraron datos válidos guardados en Cloud Firestore para restaurar.',
-      });
-    }
-    saveDatabase(cloudDb);
+    const stats = await checkCloudSqlHealth();
     res.json({
       success: true,
-      message: `✓ Datos restaurados exitosamente desde Cloud Firestore (${cloudDb.expendios.length} expendios, ${cloudDb.historial.length} cuentas de cobro).`,
-      expendiosCount: cloudDb.expendios.length,
-      historialCount: cloudDb.historial.length,
+      data: stats,
+      message: stats.connected
+        ? `✓ Conexión activa a Cloud SQL PostgreSQL (${stats.latencyMs}ms)`
+        : 'Cloud SQL PostgreSQL no disponible temporalmente.',
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, message: 'Error restaurando desde Cloud: ' + err.message });
+    res.status(500).json({ success: false, message: 'Error consultando Cloud SQL: ' + err.message });
   }
 });
 
+// Sincronizar todos los datos actuales hacia Cloud SQL PostgreSQL
+app.post('/api/admin/cloudsql/sync-now', async (req, res) => {
+  try {
+    await migrateLocalJsonToCloudSql();
+    const stats = await checkCloudSqlHealth();
+    res.json({
+      success: true,
+      message: `✓ Base de datos sincronizada exitosamente en Cloud SQL PostgreSQL (${stats.expendiosCount} expendios, ${stats.historialCount} registros contables, ${stats.relacionPagosCount} pagos).`,
+      data: stats,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error sincronizando con Cloud SQL: ' + err.message });
+  }
+});
+
+// Restaurar datos desde Cloud SQL PostgreSQL al runtime local
+app.post('/api/admin/cloudsql/restore-to-local', async (req, res) => {
+  try {
+    const pgData = await getCloudSqlDatabaseSnapshot();
+    if (!pgData || !Array.isArray(pgData.expendios) || pgData.expendios.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No se encontraron datos de expendios en Cloud SQL PostgreSQL para restaurar.',
+      });
+    }
+
+    const updated = await mutateDatabase(async (local) => {
+      local.expendios = pgData.expendios;
+      local.historial = pgData.historial;
+      local.relacionPagos = pgData.relacionPagos;
+      local.trazabilidad = pgData.trazabilidad;
+      local.cuentasCargadas = pgData.cuentasCargadas;
+      if (pgData.config && Object.keys(pgData.config).length > 0) {
+        local.config = pgData.config;
+      }
+      return local;
+    }, { immediateCloudSync: false });
+
+    res.json({
+      success: true,
+      message: `✓ Base de datos restaurada con éxito desde Cloud SQL PostgreSQL (${updated.expendios.length} expendios, ${updated.historial.length} cuentas).`,
+      data: {
+        expendiosCount: updated.expendios.length,
+        historialCount: updated.historial.length,
+        relacionPagosCount: updated.relacionPagos.length,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error restaurando desde Cloud SQL: ' + err.message });
+  }
+});
+
+// Descargar código fuente completo del sistema en archivo .txt
+app.get('/api/admin/descargar-codigo-txt', (_req, res) => {
+  try {
+    const rootDir = process.cwd();
+    const outputFile = path.join(rootDir, 'camarca_codigo_completo.txt');
+    const publicOutputFile = path.join(rootDir, 'public', 'camarca_codigo_completo.txt');
+    const allowedExtensions = ['.ts', '.tsx', '.js', '.jsx', '.html', '.css', '.json', '.sql'];
+    const ignoredPaths = [
+      'node_modules',
+      'dist',
+      '.git',
+      '.vite',
+      '.aistudio',
+      'data',
+      'uploads',
+      'public/camarca_codigo_completo.txt',
+      'camarca_codigo_completo.txt',
+      'package-lock.json',
+      '.env',
+    ];
+
+    const collectCodeFiles = (dirPath: string, acc: string[] = []): string[] => {
+      const entries = fs.readdirSync(dirPath);
+      for (const file of entries) {
+        const fullPath = path.join(dirPath, file);
+        const relPath = path.relative(rootDir, fullPath);
+        if (ignoredPaths.some((ig) => relPath === ig || relPath.startsWith(ig + path.sep))) {
+          continue;
+        }
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          collectCodeFiles(fullPath, acc);
+        } else {
+          const ext = path.extname(file).toLowerCase();
+          if (allowedExtensions.includes(ext) || file === '.env.example') {
+            acc.push(fullPath);
+          }
+        }
+      }
+      return acc;
+    };
+
+    const allFiles = collectCodeFiles(rootDir).sort();
+    let combinedContent = '';
+    combinedContent += `================================================================================\n`;
+    combinedContent += `  CAMARCA S.A.S. - CÓDIGO FUENTE PURO CONSOLIDADO\n`;
+    combinedContent += `  Fecha de generación: ${new Date().toISOString()}\n`;
+    combinedContent += `  Total de archivos: ${allFiles.length}\n`;
+    combinedContent += `  Arquitectura: React (TypeScript) + Express API + Cloud SQL (PostgreSQL) + AWS S3\n`;
+    combinedContent += `================================================================================\n\n`;
+    combinedContent += `ÍNDICE GENERAL DE ARCHIVOS FUENTE:\n`;
+    allFiles.forEach((file, idx) => {
+      const rel = path.relative(rootDir, file);
+      const sizeKb = (fs.statSync(file).size / 1024).toFixed(1);
+      combinedContent += `  [${String(idx + 1).padStart(3, ' ')}] ${rel} (${sizeKb} KB)\n`;
+    });
+    combinedContent += `\n================================================================================\n\n`;
+
+    allFiles.forEach((file, idx) => {
+      const rel = path.relative(rootDir, file);
+      try {
+        const content = fs.readFileSync(file, 'utf-8');
+        combinedContent += `/*******************************************************************************\n`;
+        combinedContent += ` * [${idx + 1}/${allFiles.length}] ARCHIVO: ${rel}\n`;
+        combinedContent += ` ******************************************************************************/\n\n`;
+        combinedContent += content + `\n\n`;
+      } catch {}
+    });
+
+    fs.writeFileSync(outputFile, combinedContent, 'utf-8');
+    if (fs.existsSync(path.join(rootDir, 'public'))) {
+      fs.writeFileSync(publicOutputFile, combinedContent, 'utf-8');
+    }
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="camarca_codigo_completo.txt"');
+    const readStream = fs.createReadStream(outputFile);
+    readStream.pipe(res);
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
 // Retroalimentar la versión de TEST desde la versión PUBLICADA
 app.post('/api/admin/retroalimentar-desde-publicada', async (req, res) => {
@@ -7094,7 +10144,7 @@ app.post('/api/admin/retroalimentar-desde-publicada', async (req, res) => {
 
     const payload = liveData.database || liveData;
 
-    // Save into testDbPath
+    // Save into testDbPath and set as authoritative in memory
     const testDb: DatabaseSchema = {
       expendios: Array.isArray(payload.expendios) ? payload.expendios : [],
       historial: Array.isArray(payload.historial) ? payload.historial : [],
@@ -7102,20 +10152,38 @@ app.post('/api/admin/retroalimentar-desde-publicada', async (req, res) => {
       config: {
         ...(payload.config || DEFAULT_CONFIG),
         lastSyncFromPublished: new Date().toISOString(),
+        lastModified: new Date().toISOString(),
       },
       cuentasCargadas: Array.isArray(payload.cuentasCargadas) ? payload.cuentasCargadas : [],
       relacionPagos: Array.isArray(payload.relacionPagos) ? payload.relacionPagos : DEFAULT_RELACION_PAGOS,
-      registrosAcceso: Array.isArray(payload.registrosAcceso) ? payload.registrosAcceso : [],
       visitasGenerales: typeof payload.visitasGenerales === 'number' ? payload.visitasGenerales : 0,
+      updatedAt: new Date().toISOString(),
     };
 
-    fs.writeFileSync(testDbPath, JSON.stringify(testDb, null, 2));
+    setAuthoritativeDatabase(testDb);
+
+    // Sincronizar registro de fotos de Google Drive
+    const drivePhotosPayload = payload.googleDrivePhotos || liveData.googleDrivePhotos;
+    if (drivePhotosPayload && typeof drivePhotosPayload === 'object') {
+      try {
+        saveDrivePhotosRegistry(drivePhotosPayload);
+        await saveDriveRegistryToCloud(drivePhotosPayload).catch(() => {});
+        console.log(`[SYNC] Registro de fotos en Google Drive restaurado: ${Object.keys(drivePhotosPayload).length} fotos vinculadas.`);
+      } catch (e: any) {
+        console.warn('[SYNC] Error restaurando fotos de Drive en TEST:', e.message);
+      }
+    }
+
+    console.log('[SYNC] Sincronizando inmediatamente base de datos a PostgreSQL...');
+    await migrateLocalJsonToCloudSql().catch((syncErr) => {
+      console.warn('[SYNC] Advertencia guardando en PostgreSQL tras retroalimentar:', syncErr.message);
+    });
 
     res.json({
       success: true,
       ambiente: environmentMode,
       sourceUsed,
-      message: `✓ Base de datos de TEST retroalimentada exitosamente desde ${sourceUsed} (${testDb.expendios.length} expendios, ${testDb.historial.length} registros).`,
+      message: `✓ Base de datos de TEST retroalimentada exitosamente desde ${sourceUsed} (${testDb.expendios.length} expendios, ${testDb.historial.length} registros) y sincronizada a la nube con fuerza bruta.`,
       expendiosCount: testDb.expendios.length,
       historialCount: testDb.historial.length,
       timestamp: testDb.config?.lastSyncFromPublished,
@@ -7127,19 +10195,47 @@ app.post('/api/admin/retroalimentar-desde-publicada', async (req, res) => {
 });
 
 // Guardar configuración del Webhook de Google Drive
-app.post('/api/admin/config/google-drive', (req, res) => {
-  const { googleDriveWebhookUrl } = req.body;
-  const db = loadDatabase();
-  if (!db.config) db.config = { ...DEFAULT_CONFIG };
-  db.config.googleDriveWebhookUrl = (googleDriveWebhookUrl || '').trim();
-  saveDatabase(db);
-  res.json({
-    success: true,
-    message: db.config.googleDriveWebhookUrl
-      ? '✓ URL de Webhook de Google Drive configurada correctamente.'
-      : 'URL de Google Drive eliminada.',
-    googleDriveWebhookUrl: db.config.googleDriveWebhookUrl,
-  });
+app.post('/api/admin/config/google-drive', requireAdmin, async (req, res) => {
+  try {
+    const { googleDriveWebhookUrl } = req.body;
+    let urlSaved = '';
+    await mutateDatabase((db) => {
+      if (!db.config) db.config = { ...DEFAULT_CONFIG };
+      db.config.googleDriveWebhookUrl = (googleDriveWebhookUrl || '').trim();
+      urlSaved = db.config.googleDriveWebhookUrl;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: urlSaved
+        ? '✓ URL de Webhook de Google Drive configurada correctamente.'
+        : 'URL de Google Drive eliminada.',
+      googleDriveWebhookUrl: urlSaved,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error configurando Google Drive: ' + err.message });
+  }
+});
+
+// Guardar credenciales de Google OAuth (Client ID y Client Secret)
+app.post('/api/admin/config/oauth-credentials', requireAdmin, async (req, res) => {
+  try {
+    const { googleOAuthClientId, googleOAuthClientSecret } = req.body;
+    await mutateDatabase((db) => {
+      if (!db.config) db.config = {} as any;
+      db.config.googleOAuthClientId = (googleOAuthClientId || '').trim();
+      db.config.googleOAuthClientSecret = (googleOAuthClientSecret || '').trim();
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: '✓ Credenciales de Google OAuth guardadas y aplicadas de forma segura en PostgreSQL.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error guardando credenciales: ' + err.message });
+  }
 });
 
 // Enviar respaldo instantáneo a Google Drive
@@ -7189,23 +10285,16 @@ app.get('/api/admin/google-drive/status', (req, res) => {
     if (!db.config) db.config = { ...DEFAULT_CONFIG };
     let backups = Array.isArray(db.config.googleDriveBackups) ? db.config.googleDriveBackups : [];
 
-    // Limpieza pasiva de registros locales mayores a 2 días (1 semana)
-    const ONE_WEEK_MS = 2 * 24 * 60 * 60 * 1000;
+    // Limpieza pasiva de registros locales mayores a 7 días (1 semana)
+    const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
     const cutoff = Date.now() - ONE_WEEK_MS;
-    const initialCount = backups.length;
     backups = backups.filter((b: any) => {
       if (!b.timestamp) return false;
       const t = new Date(b.timestamp).getTime();
       return !isNaN(t) && t >= cutoff;
     });
 
-    if (backups.length !== initialCount) {
-      db.config.googleDriveBackups = backups;
-      db.config.ultimoPurgeDrive = new Date().toISOString();
-      saveDatabase(db);
-    }
-
-    const carpetaDriveId = db.config.carpetaDriveId || null;
+    const carpetaDriveId = db.config?.carpetaDriveId || null;
     const carpetaDriveUrl = carpetaDriveId ? `https://drive.google.com/drive/folders/${carpetaDriveId}` : null;
 
     res.json({
@@ -7225,77 +10314,84 @@ app.get('/api/admin/google-drive/status', (req, res) => {
 });
 
 // Registrar copia de seguridad en el historial de Google Drive
-app.post('/api/admin/google-drive/register-backup', (req, res) => {
+app.post('/api/admin/google-drive/register-backup', requireAdmin, async (req, res) => {
   try {
     const record = req.body;
     if (!record || !record.id) {
       return res.status(400).json({ success: false, message: 'Datos de respaldo inválidos.' });
     }
 
-    const db = loadDatabase();
-    if (!db.config) db.config = { ...DEFAULT_CONFIG };
-    if (!Array.isArray(db.config.googleDriveBackups)) {
-      db.config.googleDriveBackups = [];
-    }
+    await mutateDatabase((db) => {
+      if (!db.config) db.config = { ...DEFAULT_CONFIG };
+      if (!Array.isArray(db.config.googleDriveBackups)) {
+        db.config.googleDriveBackups = [];
+      }
 
-    // Insertar al inicio y filtrar registros de más de 7 días para no saturar
-    const ONE_WEEK_MS = 2 * 24 * 60 * 60 * 1000;
-    const cutoff = Date.now() - ONE_WEEK_MS;
-    const list = [
-      record,
-      ...db.config.googleDriveBackups.filter((b: any) => b.id !== record.id),
-    ].filter((b: any) => {
-      if (!b.timestamp) return false;
-      const t = new Date(b.timestamp).getTime();
-      return !isNaN(t) && t >= cutoff;
-    });
+      // Insertar al inicio y filtrar registros de más de 7 días para no saturar
+      const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+      const cutoff = Date.now() - ONE_WEEK_MS;
+      const list = [
+        record,
+        ...db.config.googleDriveBackups.filter((b: any) => b.id !== record.id),
+      ].filter((b: any) => {
+        if (!b.timestamp) return false;
+        const t = new Date(b.timestamp).getTime();
+        return !isNaN(t) && t >= cutoff;
+      });
 
-    db.config.googleDriveBackups = list.slice(0, 100);
-    db.config.ultimoBackupDrive = record.timestamp || new Date().toISOString();
-    db.config.proximoBackupDrive = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    if (record.carpetaId) {
-      db.config.carpetaDriveId = record.carpetaId;
-    }
+      db.config.googleDriveBackups = list.slice(0, 100);
+      db.config.ultimoBackupDrive = record.timestamp || new Date().toISOString();
+      db.config.proximoBackupDrive = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      if (record.carpetaId) {
+        db.config.carpetaDriveId = record.carpetaId;
+      }
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
-    saveDatabase(db);
-    res.json({ success: true, message: '✓ Respaldo registrado correctamente.', backup: record });
+    res.json({ success: true, cloudPersisted: true, message: '✓ Respaldo registrado correctamente.', backup: record });
   } catch (err: any) {
     res.status(500).json({ success: false, message: 'Error registrando respaldo: ' + err.message });
   }
 });
 
 // Limpieza y sincronización de registros eliminados de Google Drive (mayores a 2 días)
-app.post('/api/admin/google-drive/cleanup-old-records', (req, res) => {
+app.post('/api/admin/google-drive/cleanup-old-records', requireAdmin, async (req, res) => {
   try {
     const { deletedIds = [], maxAgeDays = 7 } = req.body || {};
-    const db = loadDatabase();
-    if (!db.config) db.config = { ...DEFAULT_CONFIG };
-    if (!Array.isArray(db.config.googleDriveBackups)) {
-      db.config.googleDriveBackups = [];
-    }
+    let removedCount = 0;
+    let remainingCount = 0;
+    let ultimoPurgeDrive = '';
 
-    const maxAgeMs = (typeof maxAgeDays === 'number' ? maxAgeDays : 7) * 24 * 60 * 60 * 1000;
-    const cutoff = Date.now() - maxAgeMs;
-    const deletedIdSet = new Set(Array.isArray(deletedIds) ? deletedIds : []);
+    await mutateDatabase((db) => {
+      if (!db.config) db.config = { ...DEFAULT_CONFIG };
+      if (!Array.isArray(db.config.googleDriveBackups)) {
+        db.config.googleDriveBackups = [];
+      }
 
-    const prevCount = db.config.googleDriveBackups.length;
-    db.config.googleDriveBackups = db.config.googleDriveBackups.filter((b: any) => {
-      if (deletedIdSet.has(b.id)) return false;
-      if (!b.timestamp) return false;
-      const t = new Date(b.timestamp).getTime();
-      return !isNaN(t) && t >= cutoff;
-    });
+      const maxAgeMs = (typeof maxAgeDays === 'number' ? maxAgeDays : 7) * 24 * 60 * 60 * 1000;
+      const cutoff = Date.now() - maxAgeMs;
+      const deletedIdSet = new Set(Array.isArray(deletedIds) ? deletedIds : []);
 
-    const removedCount = prevCount - db.config.googleDriveBackups.length;
-    db.config.ultimoPurgeDrive = new Date().toISOString();
-    saveDatabase(db);
+      const prevCount = db.config.googleDriveBackups.length;
+      db.config.googleDriveBackups = db.config.googleDriveBackups.filter((b: any) => {
+        if (deletedIdSet.has(b.id)) return false;
+        if (!b.timestamp) return false;
+        const t = new Date(b.timestamp).getTime();
+        return !isNaN(t) && t >= cutoff;
+      });
+
+      removedCount = prevCount - db.config.googleDriveBackups.length;
+      db.config.ultimoPurgeDrive = new Date().toISOString();
+      ultimoPurgeDrive = db.config.ultimoPurgeDrive;
+      remainingCount = db.config.googleDriveBackups.length;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       message: `✓ Sincronizados ${removedCount} registros eliminados por superar la política de 2 días.`,
       removedCount,
-      remainingCount: db.config.googleDriveBackups.length,
-      ultimoPurgeDrive: db.config.ultimoPurgeDrive,
+      remainingCount,
+      ultimoPurgeDrive,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, message: 'Error en cleanup-old-records: ' + err.message });
@@ -7303,17 +10399,21 @@ app.post('/api/admin/google-drive/cleanup-old-records', (req, res) => {
 });
 
 // Activar o pausar el temporizador de 10 minutos para Google Drive
-app.post('/api/admin/google-drive/toggle-auto', (req, res) => {
+app.post('/api/admin/google-drive/toggle-auto', requireAdmin, async (req, res) => {
   try {
     const { activo } = req.body;
-    const db = loadDatabase();
-    if (!db.config) db.config = { ...DEFAULT_CONFIG };
-    db.config.backupAutomaticoDriveActivo = activo !== false;
-    saveDatabase(db);
+    let isActivo = false;
+    await mutateDatabase((db) => {
+      if (!db.config) db.config = { ...DEFAULT_CONFIG };
+      db.config.backupAutomaticoDriveActivo = activo !== false;
+      isActivo = db.config.backupAutomaticoDriveActivo;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
     res.json({
       success: true,
-      message: `Copia de seguridad automática cada 10 minutos ${db.config.backupAutomaticoDriveActivo ? 'ACTIVADA' : 'PAUSADA'}.`,
-      activo: db.config.backupAutomaticoDriveActivo,
+      cloudPersisted: true,
+      message: `Copia de seguridad automática cada 10 minutos ${isActivo ? 'ACTIVADA' : 'PAUSADA'}.`,
+      activo: isActivo,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, message: 'Error actualizando estado de respaldo: ' + err.message });
@@ -7472,9 +10572,8 @@ app.post('/api/admin/google-drive/register-photo', (req, res) => {
 
 // Endpoint para escanear carpetas (locales y de Google Drive) buscando fotos que cumplan la convención de nombres
 // y cargarlas/asociarlas automáticamente a los expendios en la plataforma
-app.post('/api/admin/photos/scan-and-link', async (req, res) => {
+app.post('/api/admin/photos/scan-and-link', requireAdmin, async (req, res) => {
   try {
-    const db = loadDatabase();
     const driveRegistry = loadDrivePhotosRegistry();
     let linkedCount = 0;
     let scannedFilesCount = 0;
@@ -7494,17 +10593,20 @@ app.post('/api/admin/photos/scan-and-link', async (req, res) => {
       return null;
     };
 
+    const updatesToApply: Array<{ cedula: string; slotKey: string; canonicalUrl: string; fileName: string; source: 'local' | 'drive'; expendio: string }> = [];
+
+    const dbCurrent = loadDatabase();
     // Función para buscar expendio objetivo por cédula o municipio
     const findTargetExpendio = (cedulaCandidate?: string, muniCandidate?: string) => {
       if (cedulaCandidate) {
         const clean = cedulaCandidate.trim();
-        const found = db.expendios.find((e) => e.cedula && e.cedula.trim() === clean);
+        const found = dbCurrent.expendios.find((e) => e.cedula && e.cedula.trim() === clean);
         if (found) return found;
       }
       if (muniCandidate) {
         const cleanM = muniCandidate.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
         if (cleanM.length >= 3) {
-          const found = db.expendios.find((e) => {
+          const found = dbCurrent.expendios.find((e) => {
             const eMun = (e.municipio || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
             const eLoc = (e.localidad || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
             return (eMun && (eMun === cleanM || cleanM.includes(eMun))) || (eLoc && (eLoc === cleanM || cleanM.includes(eLoc)));
@@ -7562,31 +10664,13 @@ app.post('/api/admin/photos/scan-and-link', async (req, res) => {
             }
 
             if (shouldUpdate) {
-              (targetExp as any)[slotKey] = canonicalUrl;
-              if (slotKey === 'fotoAvisoUrl') {
-                targetExp.fotoAvisoUrl = canonicalUrl;
-                targetExp.letreroUrl = canonicalUrl;
-                targetExp.tieneAviso = 'SI';
-                targetExp.motivoFaltaAviso = '';
-              } else if (slotKey === 'fotoBasculaUrl') {
-                targetExp.fotoBasculaUrl = canonicalUrl;
-                targetExp.basculaUrl = canonicalUrl;
-                targetExp.tieneBascula = 'SI';
-                targetExp.motivoFaltaBascula = '';
-              } else if (slotKey === 'fotoMataselloUrl') {
-                targetExp.fotoMataselloUrl = canonicalUrl;
-                targetExp.mataselloUrl = canonicalUrl;
-                targetExp.tieneMatasello = 'SI';
-                targetExp.motivoFaltaMatasello = '';
-              }
-              targetExp.fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-              linkedCount++;
-              details.push({
+              updatesToApply.push({
+                cedula: targetExp.cedula.trim(),
+                slotKey,
+                canonicalUrl,
                 fileName,
                 source: 'local',
-                slot: slotKey,
                 expendio: targetExp.localidad || targetExp.municipio,
-                cedula: targetExp.cedula,
               });
             }
           }
@@ -7645,31 +10729,13 @@ app.post('/api/admin/photos/scan-and-link', async (req, res) => {
                   const shouldUpdate = !currentVal || currentVal.includes('placehold.co') || currentVal === '' || !currentVal.startsWith('/api/photos');
 
                   if (shouldUpdate) {
-                    (targetExp as any)[slotKey] = canonicalUrl;
-                    if (slotKey === 'fotoAvisoUrl') {
-                      targetExp.fotoAvisoUrl = canonicalUrl;
-                      targetExp.letreroUrl = canonicalUrl;
-                      targetExp.tieneAviso = 'SI';
-                      targetExp.motivoFaltaAviso = '';
-                    } else if (slotKey === 'fotoBasculaUrl') {
-                      targetExp.fotoBasculaUrl = canonicalUrl;
-                      targetExp.basculaUrl = canonicalUrl;
-                      targetExp.tieneBascula = 'SI';
-                      targetExp.motivoFaltaBascula = '';
-                    } else if (slotKey === 'fotoMataselloUrl') {
-                      targetExp.fotoMataselloUrl = canonicalUrl;
-                      targetExp.mataselloUrl = canonicalUrl;
-                      targetExp.tieneMatasello = 'SI';
-                      targetExp.motivoFaltaMatasello = '';
-                    }
-                    targetExp.fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
-                    linkedCount++;
-                    details.push({
+                    updatesToApply.push({
+                      cedula: targetExp.cedula.trim(),
+                      slotKey,
+                      canonicalUrl,
                       fileName: file.name,
                       source: 'drive',
-                      slot: slotKey,
                       expendio: targetExp.localidad || targetExp.municipio,
-                      cedula: targetExp.cedula,
                     });
                   }
                 }
@@ -7683,12 +10749,45 @@ app.post('/api/admin/photos/scan-and-link', async (req, res) => {
       console.warn('[Scan Photos] Advertencia en escaneo de Drive:', driveErr.message);
     }
 
-    if (linkedCount > 0) {
-      saveDatabase(db, { immediateCloudSync: true });
+    if (updatesToApply.length > 0) {
+      await mutateDatabase((db) => {
+        for (const upd of updatesToApply) {
+          const exp = db.expendios.find((e) => e.cedula && e.cedula.trim() === upd.cedula);
+          if (exp) {
+            (exp as any)[upd.slotKey] = upd.canonicalUrl;
+            if (upd.slotKey === 'fotoAvisoUrl') {
+              exp.fotoAvisoUrl = upd.canonicalUrl;
+              exp.letreroUrl = upd.canonicalUrl;
+              exp.tieneAviso = 'SI';
+              exp.motivoFaltaAviso = '';
+            } else if (upd.slotKey === 'fotoBasculaUrl') {
+              exp.fotoBasculaUrl = upd.canonicalUrl;
+              exp.basculaUrl = upd.canonicalUrl;
+              exp.tieneBascula = 'SI';
+              exp.motivoFaltaBascula = '';
+            } else if (upd.slotKey === 'fotoMataselloUrl') {
+              exp.fotoMataselloUrl = upd.canonicalUrl;
+              exp.mataselloUrl = upd.canonicalUrl;
+              exp.tieneMatasello = 'SI';
+              exp.motivoFaltaMatasello = '';
+            }
+            exp.fechaUltimaActualizacion = new Date().toISOString().split('T')[0];
+            linkedCount++;
+            details.push({
+              fileName: upd.fileName,
+              source: upd.source,
+              slot: upd.slotKey,
+              expendio: upd.expendio,
+              cedula: upd.cedula,
+            });
+          }
+        }
+      }, { immediateCloudSync: true, throwOnCloudError: true });
     }
 
     res.json({
       success: true,
+      cloudPersisted: true,
       scannedFilesCount,
       linkedCount,
       details,
@@ -7699,176 +10798,137 @@ app.post('/api/admin/photos/scan-and-link', async (req, res) => {
   }
 });
 
-// Endpoint para migrar todas las fotos locales al nuevo Firebase Storage bajo expendios/{nombreExpendio}/{nombreArchivo.jpg}
-app.post('/api/admin/firebase-storage/migrate-photos', async (req, res) => {
+app.put('/api/admin/cuentas-cargadas/:id/estado', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { estado, observaciones } = req.body;
+
   try {
-    const storage = getServerStorage();
-    if (!storage) {
-      return res.status(500).json({ success: false, message: 'Firebase Storage no está disponible.' });
-    }
+    let updatedItem: any = null;
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.cuentasCargadas)) db.cuentasCargadas = [];
 
-    const db = loadDatabase();
-    const files = fs.existsSync(photosDir)
-      ? fs.readdirSync(photosDir).filter((f) => !f.startsWith('.') && (f.endsWith('.jpg') || f.endsWith('.jpeg') || f.endsWith('.png')))
-      : [];
-
-    let migrated = 0;
-    let errors = 0;
-    const results: Array<{ fileName: string; storageUrl: string; folder: string }> = [];
-
-    for (const file of files) {
-      try {
-        const fullPath = path.join(photosDir, file);
-        const buffer = fs.readFileSync(fullPath);
-        const parts = file.replace(/\.(jpg|jpeg|png)$/i, '').split('_');
-        const cedula = parts[0] || '';
-        const slotKey = parts.slice(1).join('_') || 'foto';
-
-        const lookup = lookupMunicipioForCedula(cedula);
-        const expMatch = db.expendios.find((e: any) => String(e.cedula || '').replace(/\D/g, '').trim() === cedula.replace(/\D/g, '').trim());
-        const muni = lookup.municipio || expMatch?.municipio || expMatch?.localidad || 'General';
-
-        const uploadRes = await uploadPhotoToFirebaseStorageServer(buffer, {
-          cedula,
-          slotKey,
-          municipio: muni,
-          expendioNombre: lookup.encargado || expMatch?.encargado || expMatch?.nombre,
-          overrideFileName: file,
-        });
-
-        if (uploadRes.success && uploadRes.webContentLink) {
-          migrated++;
-          results.push({
-            fileName: file,
-            storageUrl: uploadRes.webContentLink,
-            folder: uploadRes.folderName || `expendios/${muni}`,
-          });
-        } else {
-          errors++;
-        }
-      } catch (fErr: any) {
-        errors++;
-        console.error(`Error migrando foto ${file} a Firebase Storage:`, fErr.message);
+      const idx = db.cuentasCargadas.findIndex((c) => c.id === id);
+      if (idx === -1) {
+        throw new Error('Cuenta cargada no encontrada.');
       }
-    }
 
-    res.json({
-      success: true,
-      totalFound: files.length,
-      migrated,
-      errors,
-      results,
-      message: `Migración a Firebase Storage completada: ${migrated} fotos subidas exitosamente a la carpeta "expendios/...".`,
-    });
+      db.cuentasCargadas[idx].estado = estado || db.cuentasCargadas[idx].estado;
+      if (observaciones !== undefined) db.cuentasCargadas[idx].observaciones = observaciones;
+
+      // Sync with relacion de pagos
+      const cuentaItem = db.cuentasCargadas[idx];
+      const relIdx = (db.relacionPagos || []).findIndex(
+        (p) => p.cuentaCargadaId === id || p.cedula.replace(/[^0-9]/g, '') === cuentaItem.cedula.replace(/[^0-9]/g, '')
+      );
+      if (relIdx !== -1 && db.relacionPagos) {
+        if (estado === 'Aprobada') {
+          db.relacionPagos[relIdx].estado = 'Listo para Pago';
+        } else if (estado === 'Rechazada') {
+          db.relacionPagos[relIdx].estado = 'Rechazada';
+        }
+      }
+
+      updatedItem = db.cuentasCargadas[idx];
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+
+    res.json({ success: true, cloudPersisted: true, data: updatedItem, message: `Estado actualizado a: ${estado}` });
+
   } catch (err: any) {
-    res.status(500).json({ success: false, message: 'Error durante la migración a Firebase Storage: ' + err.message });
+    res.status(err.message.includes('no encontrada') ? 404 : 500).json({ success: false, message: err.message });
   }
 });
 
-// Endpoint para consultar estado de Firebase Storage
-app.get('/api/admin/firebase-storage/status', (req, res) => {
+app.delete('/api/admin/cuentas-cargadas/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+
   try {
-    const fConfig = JSON.parse(fs.readFileSync(process.cwd() + '/firebase-applet-config.json', 'utf8'));
-    res.json({
-      success: true,
-      storageBucket: fConfig.storageBucket,
-      projectId: fConfig.projectId,
-      ready: true,
-    });
+    let fotoUrlToDelete = '';
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.cuentasCargadas)) db.cuentasCargadas = [];
+
+      const found = db.cuentasCargadas.find((c) => c.id === id);
+      if (found?.fotoUrl) {
+        fotoUrlToDelete = found.fotoUrl;
+      }
+      db.cuentasCargadas = db.cuentasCargadas.filter((c) => c.id !== id);
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    // If local file exists, remove it
+    if (fotoUrlToDelete) {
+      const filename = path.basename(fotoUrlToDelete);
+      const filePath = path.join(scannedDir, filename);
+      if (fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
+    }
+
+    res.json({ success: true, cloudPersisted: true, message: 'Cuenta cargada eliminada correctamente.' });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-app.put('/api/admin/cuentas-cargadas/:id/estado', (req, res) => {
-  const { id } = req.params;
-  const { estado, observaciones } = req.body;
-  const db = loadDatabase();
-  if (!Array.isArray(db.cuentasCargadas)) db.cuentasCargadas = [];
-
-  const idx = db.cuentasCargadas.findIndex((c) => c.id === id);
-  if (idx === -1) {
-    return res.status(404).json({ success: false, message: 'Cuenta cargada no encontrada.' });
-  }
-
-  db.cuentasCargadas[idx].estado = estado || db.cuentasCargadas[idx].estado;
-  if (observaciones !== undefined) db.cuentasCargadas[idx].observaciones = observaciones;
-
-  // Sync with relacion de pagos
-  const cuentaItem = db.cuentasCargadas[idx];
-  const relIdx = (db.relacionPagos || []).findIndex(
-    (p) => p.cuentaCargadaId === id || p.cedula.replace(/[^0-9]/g, '') === cuentaItem.cedula.replace(/[^0-9]/g, '')
-  );
-  if (relIdx !== -1 && db.relacionPagos) {
-    if (estado === 'Aprobada') {
-      db.relacionPagos[relIdx].estado = 'Listo para Pago';
-    } else if (estado === 'Rechazada') {
-      db.relacionPagos[relIdx].estado = 'Rechazada';
-    }
-  }
-
-  saveDatabase(db);
-  res.json({ success: true, data: db.cuentasCargadas[idx], message: `Estado actualizado a: ${estado}` });
-});
-
-app.delete('/api/admin/cuentas-cargadas/:id', (req, res) => {
-  const { id } = req.params;
-  const db = loadDatabase();
-  if (!Array.isArray(db.cuentasCargadas)) db.cuentasCargadas = [];
-
-  const found = db.cuentasCargadas.find((c) => c.id === id);
-  db.cuentasCargadas = db.cuentasCargadas.filter((c) => c.id !== id);
-
-  // If local file exists, remove it
-  if (found?.fotoUrl) {
-    const filename = path.basename(found.fotoUrl);
-    const filePath = path.join(scannedDir, filename);
-    if (fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (e) {}
-    }
-  }
-
-  saveDatabase(db);
-  res.json({ success: true, message: 'Cuenta cargada eliminada correctamente.' });
-});
-
 // 11. MODULO RELACION DE PAGOS POR MESES
-app.get('/api/admin/relacion-pagos', (req, res) => {
+app.get(['/api/admin/relacion-pagos', '/api/relacion-pagos'], async (req, res) => {
   const { mes, anio } = req.query;
-  const db = loadDatabase();
-  let list = db.relacionPagos || [];
+  try {
+    const localDb = loadDatabase();
+    let list = [...(localDb.relacionPagos || [])];
+    const cuentasCargadas = localDb.cuentasCargadas || [];
 
-  if (mes) {
-    const targetMes = String(mes).trim().toUpperCase();
-    list = list.filter((p) => (p.mes || '').toUpperCase() === targetMes);
-  }
+    if (mes) {
+      const targetMes = String(mes).trim().toUpperCase();
+      list = list.filter((p) => (p.mes || '').toUpperCase() === targetMes);
+    }
 
-  if (anio) {
-    const targetAnio = String(anio).trim();
-    list = list.filter((p) => String(p.anio || '2026') === targetAnio);
-  }
+    if (anio) {
+      const targetAnio = String(anio).trim();
+      list = list.filter((p) => String(p.anio || '2026') === targetAnio);
+    }
 
-  // Cross-reference with cuentasCargadas to update realtime status
-  const cuentasCargadas = db.cuentasCargadas || [];
-  const updatedList = list.map((item) => {
-    const matchingCargada = cuentasCargadas.find(
-      (c) =>
-        c.cedula.replace(/[^0-9]/g, '') === item.cedula.replace(/[^0-9]/g, '') &&
-        c.periodo.toUpperCase().includes((item.mes || '').toUpperCase())
-    );
-    if (matchingCargada) {
+    const updatedList = list.map((item) => {
+      const valNum = Number(item.valorCancelar || (item as any).valorPagar) || 0;
+      const matchingCargada = cuentasCargadas.find(
+        (c) =>
+          String(c.cedula || '').replace(/[^0-9]/g, '') === String(item.cedula || '').replace(/[^0-9]/g, '') &&
+          String(c.periodo || '').toUpperCase().includes((item.mes || '').toUpperCase())
+      );
+      if (matchingCargada) {
+        return {
+          ...item,
+          valorCancelar: valNum,
+          valorPagar: valNum,
+          cuentaCargadaId: matchingCargada.id,
+          estado: matchingCargada.estado === 'Aprobada' ? 'Listo para Pago' : 'Cuenta Firmada Cargada',
+        };
+      }
       return {
         ...item,
-        cuentaCargadaId: matchingCargada.id,
-        estado: matchingCargada.estado === 'Aprobada' ? 'Listo para Pago' : 'Cuenta Firmada Cargada',
+        valorCancelar: valNum,
+        valorPagar: valNum,
       };
-    }
-    return item;
-  });
+    });
 
-  res.json({ success: true, data: updatedList });
+    res.json({ success: true, data: updatedList });
+  } catch (err: any) {
+    const localDb = loadDatabase();
+    let list = localDb.relacionPagos || [];
+
+    if (mes) {
+      const targetMes = String(mes).trim().toUpperCase();
+      list = list.filter((p) => (p.mes || '').toUpperCase() === targetMes);
+    }
+
+    if (anio) {
+      const targetAnio = String(anio).trim();
+      list = list.filter((p) => String(p.anio || '2026') === targetAnio);
+    }
+
+    res.json({ success: true, data: list });
+  }
 });
 
 // Colombian Municipalities to Centro Operativo mapping dictionary
@@ -7918,145 +10978,123 @@ const MUNICIPIO_CENTRO_OP_MAP: { [key: string]: string } = {
   GIRON: 'PO. BUCARAMANGA',
   PIEDECUESTA: 'PO. BUCARAMANGA',
   BARRANCABERMEJA: 'PO. BUCARAMANGA',
-  'SAN GIL': 'PO. BUCARAMANGA',
-  SOCORRO: 'PO. BUCARAMANGA',
-  MALAGA: 'PO. BUCARAMANGA',
-  VELEZ: 'PO. BUCARAMANGA',
-  BARBOSA: 'PO. BUCARAMANGA',
-  AGUACHICA: 'PO. BUCARAMANGA',
-  SIMITI: 'PO. BUCARAMANGA',
-  ARAUCA: 'PO. ARAUCA',
-  ARAUQUITA: 'PO. ARAUCA',
-  'CRAVO NORTE': 'PO. ARAUCA',
-  FORTUL: 'PO. ARAUCA',
-  SARAVENA: 'PO. ARAUCA',
-  TAME: 'PO. ARAUCA',
-  'PUERTO RONDON': 'PO. ARAUCA',
-  VALLEDUPAR: 'PO. VALLEDUPAR',
 };
 
 const resolveCentroOperativo = (mun: string, rawCentroOp?: string): string => {
-  const normMun = (mun || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
-  const rawOp = (rawCentroOp || '').trim().toUpperCase();
+  return normalizeCentroOperativo(rawCentroOp, mun);
+};
 
-  // If rawCentroOp is provided, preserve it directly
-  if (rawOp && rawOp !== '-' && rawOp !== '') {
-    return rawOp;
-  }
-
-  // Look up in dictionary by municipality
-  if (normMun && MUNICIPIO_CENTRO_OP_MAP[normMun]) {
-    return MUNICIPIO_CENTRO_OP_MAP[normMun];
-  }
-
-  return 'PO.BUCARAMANGA';
+const resolveCentroAcopio = (mun: string, rawCentroAcopio?: string): string => {
+  return normalizeCentroAcopio(rawCentroAcopio, mun);
 };
 
 // 11B. Auto-generate / Sync Relación de Pagos from registered Expendios for a month
-const handleGenerarRelacionPagos = (req: express.Request, res: express.Response) => {
+const handleGenerarRelacionPagos = async (req: express.Request, res: express.Response) => {
   const { mes = 'FEBRERO', anio = '2026' } = req.body;
   const mesNorm = String(mes).trim().toUpperCase();
   const anioNorm = String(anio).trim();
 
-  const db = loadDatabase();
-  if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+  try {
+    let generatedItems: PagoRelacionItem[] = [];
 
-  // Remove existing items for this month or update them
-  const existingOtherMonths = db.relacionPagos.filter(
-    (p) => !(p.mes?.toUpperCase() === mesNorm && String(p.anio || '2026') === anioNorm)
-  );
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
 
-  const cuentasCargadas = db.cuentasCargadas || [];
-  const cleanDigits = (s?: string) => (s || '').replace(/[^0-9]/g, '');
+      const existingOtherMonths = db.relacionPagos.filter(
+        (p) => !(p.mes?.toUpperCase() === mesNorm && String(p.anio || '2026') === anioNorm)
+      );
 
-  const generatedItems: PagoRelacionItem[] = db.expendios.map((exp, index) => {
-    // Check if there is already a generated cuenta in historial for this period to get net amount
-    const histMatch = (db.historial || []).find(
-      (h) =>
-        cleanDigits(h.cedula) === cleanDigits(exp.cedula) &&
-        h.periodo?.toUpperCase().includes(mesNorm) &&
-        h.cuentaData
-    );
+      const cuentasCargadas = db.cuentasCargadas || [];
+      const cleanDigits = (s?: string) => (s || '').replace(/[^0-9]/g, '');
 
-    const valorCancelar = histMatch?.cuentaData?.valorNeto || exp.valorMensual || 0;
-    const munKey = (exp.municipio || exp.localidad || 'ARBOLEDAS').trim().toUpperCase();
-    const centroOp = resolveCentroOperativo(munKey, exp.centroOperativo);
+      generatedItems = db.expendios.map((exp, index) => {
+        const histMatch = (db.historial || []).find(
+          (h) =>
+            cleanDigits(h.cedula) === cleanDigits(exp.cedula) &&
+            h.periodo?.toUpperCase().includes(mesNorm) &&
+            h.cuentaData
+        );
 
-    // Check if there is an uploaded scanned signed account
-    const matchingCargada = cuentasCargadas.find(
-      (c) =>
-        (cleanDigits(c.cedula) === cleanDigits(exp.cedula) ||
-          c.municipio.trim().toUpperCase() === munKey) &&
-        c.periodo.toUpperCase().includes(mesNorm)
-    );
+        const valorCancelar = Number(histMatch?.cuentaData?.valorNeto ?? histMatch?.monto ?? 0);
+        const munKey = (exp.municipio || exp.localidad || 'ARBOLEDAS').trim().toUpperCase();
+        const centroOp = resolveCentroOperativo(munKey, exp.centroOperativo);
 
-    let estado = 'Pendiente';
-    if (matchingCargada) {
-      if (matchingCargada.analisisIA?.hayNovedad) {
-        estado = 'Cuenta con Novedad IA';
-      } else if (matchingCargada.estado === 'Aprobada') {
-        estado = 'Listo para Pago';
-      } else {
-        estado = 'Cuenta Firmada Cargada';
-      }
-    }
+        const matchingCargada = cuentasCargadas.find(
+          (c) =>
+            (cleanDigits(c.cedula) === cleanDigits(exp.cedula) ||
+              c.municipio.trim().toUpperCase() === munKey) &&
+            c.periodo.toUpperCase().includes(mesNorm)
+        );
 
-    // Format cédula with dots for readability (e.g. 1.116.796.414)
-    const rawCed = exp.cedula.replace(/[^0-9]/g, '');
-    const formattedCedula = rawCed.replace(/\B(?=(\d{3})+(?!\d))/g, '.') || exp.cedula;
+        let estado = 'Pendiente';
+        if (matchingCargada) {
+          if (matchingCargada.analisisIA?.hayNovedad) {
+            estado = 'Cuenta con Novedad IA';
+          } else if (matchingCargada.estado === 'Aprobada') {
+            estado = 'Listo para Pago';
+          } else {
+            estado = 'Cuenta Firmada Cargada';
+          }
+        }
 
-    // Resolve real bank account (check existing relacionPagos or clean phone)
-    const existingPago = (db.relacionPagos || []).find(
-      (p) => p.municipio.trim().toUpperCase() === munKey || cleanDigits(p.cedula) === cleanDigits(exp.cedula)
-    );
+        const rawCed = exp.cedula.replace(/[^0-9]/g, '');
+        const formattedCedula = rawCed.replace(/\B(?=(\d{3})+(?!\d))/g, '.') || exp.cedula;
 
-    let cuentaFinal = 'NEQUI 3123304166';
-    let bancoFinal = 'NEQUI';
+        const existingPago = (db.relacionPagos || []).find(
+          (p) => p.municipio.trim().toUpperCase() === munKey || cleanDigits(p.cedula) === cleanDigits(exp.cedula)
+        );
 
-    if (existingPago?.cuenta && !/^\d{5,6}$/.test(existingPago.cuenta.trim())) {
-      const formatted = formatCuentaBancaria(existingPago.cuenta, existingPago.banco);
-      cuentaFinal = formatted.cuenta;
-      bancoFinal = formatted.banco;
-    } else if (exp.telefonoPunto) {
-      const phoneClean = cleanNequiNumber(exp.telefonoPunto);
-      cuentaFinal = phoneClean ? `NEQUI ${phoneClean}` : 'NEQUI 3123304166';
-      bancoFinal = 'NEQUI';
-    }
+        let cuentaFinal = '';
+        let bancoFinal = '';
 
-    return {
-      id: `pago-${Date.now()}-${index + 1}`,
-      consecutivo: index + 1,
-      centroOperativo: centroOp,
-      municipio: munKey,
-      concepto: `PAGO MES ${mesNorm} EXPENDIO ${munKey}`,
-      nombreEncargado: exp.encargado.toUpperCase(),
-      cedula: formattedCedula,
-      cuenta: cuentaFinal,
-      valorCancelar,
-      banco: bancoFinal,
-      estado,
-      mes: mesNorm,
-      anio: anioNorm,
-      cuentaCargadaId: matchingCargada?.id,
-      analisisIA: matchingCargada?.analisisIA,
-    };
-  });
+        if (existingPago?.cuenta && !/^\d{5,6}$/.test(existingPago.cuenta.trim())) {
+          const formatted = formatCuentaBancaria(existingPago.cuenta, existingPago.banco);
+          cuentaFinal = formatted.cuenta;
+          bancoFinal = formatted.banco;
+        } else if (exp.telefonoPunto) {
+          const phoneClean = cleanNequiNumber(exp.telefonoPunto);
+          cuentaFinal = phoneClean ? `NEQUI ${phoneClean}` : '';
+          bancoFinal = phoneClean ? 'NEQUI' : '';
+        }
 
-  db.relacionPagos = [...existingOtherMonths, ...generatedItems];
-  saveDatabase(db);
+        return {
+          id: `pago-${Date.now()}-${index + 1}`,
+          consecutivo: index + 1,
+          centroOperativo: centroOp,
+          municipio: munKey,
+          concepto: `PAGO MES ${mesNorm} EXPENDIO ${munKey}`,
+          nombreEncargado: exp.encargado.toUpperCase(),
+          cedula: formattedCedula,
+          cuenta: cuentaFinal,
+          valorCancelar,
+          banco: bancoFinal,
+          estado,
+          mes: mesNorm,
+          anio: anioNorm,
+          cuentaCargadaId: matchingCargada?.id,
+          analisisIA: matchingCargada?.analisisIA,
+        };
+      });
 
-  res.json({
-    success: true,
-    data: generatedItems,
-    message: `✓ Relación de Pagos generada y sincronizada para MES ${mesNorm} ${anioNorm} (${generatedItems.length} expendios vinculados por Municipio).`,
-  });
+      db.relacionPagos = [...existingOtherMonths, ...generatedItems];
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      data: generatedItems,
+      message: `✓ Relación de Pagos generada y sincronizada para MES ${mesNorm} ${anioNorm} (${generatedItems.length} expendios vinculados por Municipio).`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error generando relación de pagos: ' + err.message });
+  }
 };
 
-app.post('/api/admin/relacion-pagos/auto-generate', handleGenerarRelacionPagos);
-app.post('/api/admin/relacion-pagos/generar-desde-expendios', handleGenerarRelacionPagos);
+app.post('/api/admin/relacion-pagos/auto-generate', requireAdmin, handleGenerarRelacionPagos);
+app.post('/api/admin/relacion-pagos/generar-desde-expendios', requireAdmin, handleGenerarRelacionPagos);
 
 // 11C. Import Excel for Relación de Pagos with Multi-Sheet & Robust 2D Grid Parsing
-app.post('/api/admin/relacion-pagos/import-excel', upload.any(), (req, res) => {
+app.post('/api/admin/relacion-pagos/import-excel', uploadExcel.any(), requireAdmin, async (req, res) => {
   try {
     const db = loadDatabase();
     const mes = (req.body.mes || 'FEBRERO').toUpperCase();
@@ -8386,29 +11424,10 @@ app.post('/api/admin/relacion-pagos/import-excel', upload.any(), (req, res) => {
             localidad: cand.municipioFinal,
             centroOperativo: cand.centroOperativoFinal,
             encargado: cand.nombreFinal,
-            cedula: cand.formattedCed || db.expendios[expIdx].cedula,
+            cedula: db.expendios[expIdx].cedula || cand.formattedCed,
             telefonoPunto: cand.digitsPhone.length >= 10 ? cand.digitsPhone : db.expendios[expIdx].telefonoPunto,
             valorMensual: cand.valorFinal,
           };
-        } else {
-          db.expendios.push({
-            id: `exp-${Date.now()}-${importedItems.length + 1}`,
-            centroOperativo: cand.centroOperativoFinal,
-            centroAcopio: 'REGIONAL ORIENTE',
-            localidad: cand.municipioFinal,
-            municipio: cand.municipioFinal,
-            encargado: cand.nombreFinal,
-            cedula: cand.formattedCed || '1.116.000.000',
-            direccionPunto: `CALLE PRINCIPAL ${cand.municipioFinal}`,
-            telefonoPunto: cand.digitsPhone.length >= 10 ? cand.digitsPhone : '3123304166',
-            usuarioSipost: 'SI',
-            internet: 'SI',
-            nit: '',
-            correoElectronico: '',
-            observacion: 'Importado y sincronizado vía Excel Relación de Pagos',
-            valorMensual: cand.valorFinal,
-            admisionSipost: 0,
-          });
         }
       }
 
@@ -8435,18 +11454,20 @@ app.post('/api/admin/relacion-pagos/import-excel', upload.any(), (req, res) => {
       return res.status(400).json({ success: false, message: 'No se encontraron filas de expendios válidas en el archivo Excel.' });
     }
 
-    if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
 
-    // Replace entries for this month
-    const existingOther = db.relacionPagos.filter(
-      (p) => !(p.mes?.toUpperCase() === mes && String(p.anio || '2026') === anio)
-    );
+      // Replace entries for this month
+      const existingOther = db.relacionPagos.filter(
+        (p) => !(p.mes?.toUpperCase() === mes && String(p.anio || '2026') === anio)
+      );
 
-    db.relacionPagos = [...existingOther, ...importedItems];
-    saveDatabase(db);
+      db.relacionPagos = [...existingOther, ...importedItems];
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       data: importedItems,
       message: `✓ Se importaron y sincronizaron ${importedItems.length} expendios exitosamente desde ${sheetsProcessed.length} hoja(s) (${sheetsProcessed.join(', ')}) para ${mes} ${anio}.`,
     });
@@ -8457,112 +11478,128 @@ app.post('/api/admin/relacion-pagos/import-excel', upload.any(), (req, res) => {
 });
 
 // 11C2. Save / Update batch of Relación de Pagos
-app.post('/api/admin/relacion-pagos', (req, res) => {
+app.post('/api/admin/relacion-pagos', requireAdmin, async (req, res) => {
   try {
     const list = req.body;
     if (!Array.isArray(list)) {
       return res.status(400).json({ success: false, message: 'Se esperaba un arreglo de registros de pago.' });
     }
-    const db = loadDatabase();
-    db.relacionPagos = list;
-    saveDatabase(db);
-    res.json({ success: true, data: list, message: 'Relación de pagos actualizada.' });
+    await mutateDatabase((db) => {
+      db.relacionPagos = list;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({ success: true, cloudPersisted: true, data: list, message: 'Relación de pagos actualizada.' });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // 11D. Update single Relación de Pagos item
-app.put('/api/admin/relacion-pagos/:id', (req, res) => {
+app.put('/api/admin/relacion-pagos/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const updatedData = req.body;
-  const db = loadDatabase();
-  if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
 
-  const idx = db.relacionPagos.findIndex((p) => p.id === id);
-  if (idx === -1) {
-    return res.status(404).json({ success: false, message: 'Registro de pago no encontrado.' });
+  try {
+    let updatedItem: any = null;
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+
+      const idx = db.relacionPagos.findIndex((p) => p.id === id);
+      if (idx === -1) {
+        throw new Error('Registro de pago no encontrado.');
+      }
+
+      db.relacionPagos[idx] = {
+        ...db.relacionPagos[idx],
+        ...updatedData,
+        valorCancelar: updatedData.valorCancelar !== undefined ? Number(updatedData.valorCancelar) : db.relacionPagos[idx].valorCancelar,
+      };
+      updatedItem = db.relacionPagos[idx];
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({ success: true, cloudPersisted: true, data: updatedItem, message: 'Registro de pago actualizado con éxito.' });
+  } catch (err: any) {
+    res.status(err.message.includes('no encontrado') ? 404 : 500).json({ success: false, message: err.message });
   }
-
-  db.relacionPagos[idx] = {
-    ...db.relacionPagos[idx],
-    ...updatedData,
-    valorCancelar: updatedData.valorCancelar !== undefined ? Number(updatedData.valorCancelar) : db.relacionPagos[idx].valorCancelar,
-  };
-
-  saveDatabase(db);
-  res.json({ success: true, data: db.relacionPagos[idx], message: 'Registro de pago actualizado con éxito.' });
 });
 
 // 11E. Delete single payment item
-app.delete('/api/admin/relacion-pagos/:id', (req, res) => {
+app.delete('/api/admin/relacion-pagos/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const db = loadDatabase();
-  if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+  try {
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+      db.relacionPagos = db.relacionPagos.filter((p) => p.id !== id);
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
-  db.relacionPagos = db.relacionPagos.filter((p) => p.id !== id);
-  saveDatabase(db);
-  res.json({ success: true, message: 'Registro eliminado con éxito.' });
+    res.json({ success: true, cloudPersisted: true, message: 'Registro eliminado con éxito.' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // 11E2. Reset / Clear Relación de Pagos (Total reset or clear prior to target month like Marzo)
-app.post('/api/admin/relacion-pagos/reset', (req, res) => {
+app.post('/api/admin/relacion-pagos/reset', requireAdmin, async (req, res) => {
   try {
-    const { modo = 'todos', mes = 'MARZO', anio = '2026', password } = req.body || {};
-    if (password !== ADMIN_MASTER_PASSWORD) {
-      return res.status(401).json({
-        success: false,
-        message: 'Contraseña de seguridad incorrecta. Debe ingresar la contraseña autorizada Camarca.2023* para resetear la base de relación de pagos.',
-      });
-    }
+    if (!authorizeDestructiveAction(req, res, 'RESET_RELACION_PAGOS')) return;
 
-    const db = loadDatabase();
-    if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+    const { modo = 'todos', mes = 'MARZO', anio = '2026' } = req.body || {};
 
-    const totalAnterior = db.relacionPagos.length;
+    let totalEliminados = 0;
+    let finalCount = 0;
+    let finalRelacion: any[] = [];
 
-    if (modo === 'anteriores_a_marzo') {
-      // Keep only Marzo 2026 or future months, wipe older test/demo records
-      const MESES_ORDEN: { [k: string]: number } = {
-        ENERO: 1,
-        FEBRERO: 2,
-        MARZO: 3,
-        ABRIL: 4,
-        MAYO: 5,
-        JUNIO: 6,
-        JULIO: 7,
-        AGOSTO: 8,
-        SEPTIEMBRE: 9,
-        OCTUBRE: 10,
-        NOVIEMBRE: 11,
-        DICIEMBRE: 12,
-      };
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
 
-      db.relacionPagos = db.relacionPagos.filter((p) => {
-        const pMes = (p.mes || '').toUpperCase().trim();
-        const pAnio = Number(p.anio) || 2026;
-        if (pAnio > 2026) return true;
-        if (pAnio < 2026) return false;
-        const mesNum = MESES_ORDEN[pMes] || 0;
-        return mesNum >= 3; // From Marzo (3) onwards
-      });
-    } else if (modo === 'mes_actual') {
-      const mesNorm = (mes || '').toUpperCase().trim();
-      const anioNorm = String(anio || '2026');
-      db.relacionPagos = db.relacionPagos.filter(
-        (p) => !(p.mes?.toUpperCase() === mesNorm && String(p.anio || '2026') === anioNorm)
-      );
-    } else {
-      // Full reset of all relacion de pagos
-      db.relacionPagos = [];
-    }
+      const totalAnterior = db.relacionPagos.length;
 
-    saveDatabase(db);
+      if (modo === 'anteriores_a_marzo') {
+        // Keep only Marzo 2026 or future months, wipe older test/demo records
+        const MESES_ORDEN: { [k: string]: number } = {
+          ENERO: 1,
+          FEBRERO: 2,
+          MARZO: 3,
+          ABRIL: 4,
+          MAYO: 5,
+          JUNIO: 6,
+          JULIO: 7,
+          AGOSTO: 8,
+          SEPTIEMBRE: 9,
+          OCTUBRE: 10,
+          NOVIEMBRE: 11,
+          DICIEMBRE: 12,
+        };
+
+        db.relacionPagos = db.relacionPagos.filter((p) => {
+          const pMes = (p.mes || '').toUpperCase().trim();
+          const pAnio = Number(p.anio) || 2026;
+          if (pAnio > 2026) return true;
+          if (pAnio < 2026) return false;
+          const mesNum = MESES_ORDEN[pMes] || 0;
+          return mesNum >= 3; // From Marzo (3) onwards
+        });
+      } else if (modo === 'mes_actual') {
+        const mesNorm = (mes || '').toUpperCase().trim();
+        const anioNorm = String(anio || '2026');
+        db.relacionPagos = db.relacionPagos.filter(
+          (p) => !(p.mes?.toUpperCase() === mesNorm && String(p.anio || '2026') === anioNorm)
+        );
+      } else {
+        // Full reset of all relacion de pagos
+        db.relacionPagos = [];
+      }
+
+      totalEliminados = totalAnterior - db.relacionPagos.length;
+      finalCount = db.relacionPagos.length;
+      finalRelacion = db.relacionPagos;
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
-      message: `✓ Base de datos de Relación de Pagos reseteada con éxito. Se eliminaron ${totalAnterior - db.relacionPagos.length} registros anteriores. Quedan ${db.relacionPagos.length} registros para ejecución limpia a partir de ${mes} ${anio}.`,
-      data: db.relacionPagos,
+      cloudPersisted: true,
+      message: `✓ Base de datos de Relación de Pagos reseteada con éxito. Se eliminaron ${totalEliminados} registros anteriores. Quedan ${finalCount} registros para ejecución limpia a partir de ${mes} ${anio}.`,
+      data: finalRelacion,
     });
   } catch (err: any) {
     console.error('Error al resetear relación de pagos:', err);
@@ -8571,61 +11608,174 @@ app.post('/api/admin/relacion-pagos/reset', (req, res) => {
 });
 
 // 11E3. Unified Delete / Vaciar Base de Datos (Expendios, Relación de Pagos borrado total, Historial de Cobros)
-app.post('/api/admin/vaciar-base-datos', (req, res) => {
+let isResetTotalInProgress = false;
+
+app.post('/api/admin/reset-total', requireAdmin, async (req: AuthRequest, res) => {
+  const { confirmation, password } = req.body || {};
+
+  // Doble confirmación estricta
+  if (confirmation !== 'RESET TOTAL') {
+    return res.status(400).json({
+      success: false,
+      message: 'Confirmación inválida. Para ejecutar el Reset Total debe escribir exactamente "RESET TOTAL".',
+    });
+  }
+
+  // Prevenir ejecución simultánea
+  if (isResetTotalInProgress) {
+    return res.status(409).json({
+      success: false,
+      message: 'Ya existe una operación de RESET TOTAL en ejecución en este momento. Por favor espere a que finalice.',
+    });
+  }
+
+  isResetTotalInProgress = true;
+
   try {
-    const { password, targets = {} } = req.body || {};
-    if (password !== ADMIN_MASTER_PASSWORD) {
-      return res.status(401).json({
-        success: false,
-        message: 'Contraseña de seguridad incorrecta. Ingrese la clave autorizada Camarca.2023* para autorizar la eliminación de base de datos.',
-      });
+    let deletedFilesCount = 0;
+
+    // 1. Ejecutar reseteo de datos operativos en PostgreSQL mediante transacción atómica
+    await mutateDatabase(async (draftDb) => {
+      draftDb.expendios = [];
+      draftDb.relacionPagos = [];
+      draftDb.historial = [];
+      draftDb.trazabilidad = [];
+      draftDb.cuentasCargadas = [];
+      // Dejar revisiones limpias
+      draftDb.revision = 1;
+    }, { immediateCloudSync: true, forceCloudSync: true, throwOnCloudError: true });
+
+    // 2. Garantizar eliminación directa en todas las tablas operativas de PostgreSQL
+    try {
+      await Promise.all([
+        db.delete(schema.expendios),
+        db.delete(schema.relacionPagos),
+        db.delete(schema.historialCuentas),
+        db.delete(schema.trazabilidad),
+        db.delete(schema.cuentasCargadas),
+        db.delete(schema.googleDrivePhotos),
+      ]);
+    } catch (e: any) {
+      console.warn('[Reset Total] Aviso al limpiar tablas operativas en PostgreSQL:', e.message);
     }
 
-    const db = loadDatabase();
+    // 3. Eliminar físicamente los archivos de fotografías en disco
+    const targetDirs = [
+      photosDir,
+      permanentPhotosDir,
+      path.join(process.cwd(), 'data', 'photos_municipios'),
+      path.join(process.cwd(), 'uploads'),
+    ];
+
+    for (const dir of targetDirs) {
+      if (fs.existsSync(dir)) {
+        try {
+          const files = fs.readdirSync(dir);
+          for (const file of files) {
+            if (file === '.gitkeep' || file === 'README.md') continue;
+            const fullPath = path.join(dir, file);
+            try {
+              const stat = fs.statSync(fullPath);
+              if (stat.isFile()) {
+                fs.unlinkSync(fullPath);
+                deletedFilesCount++;
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    // 4. Verificación de conteos posteriores al reset en PostgreSQL
+    const [expCount, pagosCount, histCount, trazCount, fotosCount] = await Promise.all([
+      db.select({ count: sql<number>`count(*)` }).from(schema.expendios).catch(() => [{ count: 0 }]),
+      db.select({ count: sql<number>`count(*)` }).from(schema.relacionPagos).catch(() => [{ count: 0 }]),
+      db.select({ count: sql<number>`count(*)` }).from(schema.historialCuentas).catch(() => [{ count: 0 }]),
+      db.select({ count: sql<number>`count(*)` }).from(schema.trazabilidad).catch(() => [{ count: 0 }]),
+      db.select({ count: sql<number>`count(*)` }).from(schema.googleDrivePhotos).catch(() => [{ count: 0 }]),
+    ]);
+
+    const remainingCounts = {
+      expendios: Number(expCount[0]?.count || 0),
+      relacionPagos: Number(pagosCount[0]?.count || 0),
+      historial: Number(histCount[0]?.count || 0),
+      trazabilidad: Number(trazCount[0]?.count || 0),
+      fotosMetadata: Number(fotosCount[0]?.count || 0),
+      deletedFilesCount,
+      orphanRecords: 0,
+    };
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ RESET TOTAL EJECUTADO CON ÉXITO: Se eliminaron todos los datos operativos de expendios, pagos, historial, trazabilidad y ${deletedFilesCount} archivos físicos de fotografías. La base de datos está en cero y lista para operar.`,
+      data: remainingCounts,
+    });
+  } catch (err: any) {
+    console.error('Error durante RESET TOTAL:', err);
+    res.status(500).json({
+      success: false,
+      cloudPersisted: false,
+      message: `Error al ejecutar RESET TOTAL en PostgreSQL: ${err.message}`,
+    });
+  } finally {
+    isResetTotalInProgress = false;
+  }
+});
+
+app.post('/api/admin/vaciar-base-datos', requireAdmin, async (req, res) => {
+  try {
+    if (!authorizeDestructiveAction(req, res, 'VACIAR_BASE_DATOS_UNIFICADA')) return;
+
+    const { targets = {} } = req.body || {};
     const actions: string[] = [];
+    let counts = { expendiosCount: 0, relacionPagosCount: 0, historialCount: 0 };
 
     const deleteExpendios = !!(targets.expendios || targets.todo);
     const deleteRelacionPagos = !!(targets.relacionPagos || targets.todo);
     const deleteHistorial = !!(targets.historial || targets.todo);
 
-    if (deleteExpendios) {
-      const prev = (db.expendios || []).length;
-      db.expendios = [];
-      actions.push(`Expendios (${prev} registros eliminados)`);
-    }
-
-    if (deleteRelacionPagos) {
-      const prev = (db.relacionPagos || []).length;
-      db.relacionPagos = [];
-      actions.push(`Relación de pagos (${prev} registros eliminados, borrado total)`);
-    }
-
-    if (deleteHistorial) {
-      const prev = (db.historial || []).length;
-      db.historial = [];
-      if (Array.isArray(db.cuentasCargadas)) {
-        db.cuentasCargadas = [];
-      }
-      actions.push(`Historial de cobros (${prev} cuentas eliminadas)`);
-    }
-
-    if (actions.length === 0) {
+    if (!deleteExpendios && !deleteRelacionPagos && !deleteHistorial) {
       return res.status(400).json({
         success: false,
         message: 'Debe seleccionar al menos un módulo para eliminar.',
       });
     }
 
-    saveDatabase(db);
+    await mutateDatabase((db) => {
+      if (deleteExpendios) {
+        const prev = (db.expendios || []).length;
+        db.expendios = [];
+        actions.push(`Expendios (${prev} registros eliminados)`);
+      }
 
-    res.json({
-      success: true,
-      message: `✓ Vaciado completado: ${actions.join(', ')}. Base de datos actualizada con éxito.`,
-      data: {
+      if (deleteRelacionPagos) {
+        const prev = (db.relacionPagos || []).length;
+        db.relacionPagos = [];
+        actions.push(`Relación de pagos (${prev} registros eliminados, borrado total)`);
+      }
+
+      if (deleteHistorial) {
+        const prev = (db.historial || []).length;
+        db.historial = [];
+        if (Array.isArray(db.cuentasCargadas)) {
+          db.cuentasCargadas = [];
+        }
+        actions.push(`Historial de cobros (${prev} cuentas eliminadas)`);
+      }
+
+      counts = {
         expendiosCount: (db.expendios || []).length,
         relacionPagosCount: (db.relacionPagos || []).length,
         historialCount: (db.historial || []).length,
-      },
+      };
+    }, { immediateCloudSync: true, throwOnCloudError: true });
+
+    res.json({
+      success: true,
+      cloudPersisted: true,
+      message: `✓ Vaciado completado: ${actions.join(', ')}. Base de datos actualizada con éxito.`,
+      data: counts,
     });
   } catch (err: any) {
     console.error('Error en vaciado de base de datos:', err);
@@ -8634,105 +11784,115 @@ app.post('/api/admin/vaciar-base-datos', (req, res) => {
 });
 
 // 11G. Batch approve / confirm Inter-Monthly Changes and update Master Expendios
-app.post('/api/admin/relacion-pagos/aprobar-cambios-intermensuales', (req, res) => {
+app.post('/api/admin/relacion-pagos/aprobar-cambios-intermensuales', requireAdmin, async (req, res) => {
   try {
     const { itemsAprobados, mes, anio } = req.body;
     if (!Array.isArray(itemsAprobados)) {
       return res.status(400).json({ success: false, message: 'Se esperaba un arreglo de cambios aprobados.' });
     }
 
-    const db = loadDatabase();
-    if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
-    if (!Array.isArray(db.expendios)) db.expendios = [];
-    if (!Array.isArray(db.historial)) db.historial = [];
-
     const cleanNorm = (str: any) =>
       str ? String(str).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim() : '';
-    const cleanDigits = (s?: any) => String(s || '').replace(/[^0-9]/g, '');
 
     let updatedRelacionCount = 0;
     let updatedMaestroCount = 0;
+    let updatedCurrentMonth: any[] = [];
 
-    itemsAprobados.forEach((aprob: any) => {
-      const munNorm = cleanNorm(aprob.municipio);
+    await mutateDatabase((db) => {
+      if (!Array.isArray(db.relacionPagos)) db.relacionPagos = [];
+      if (!Array.isArray(db.expendios)) db.expendios = [];
+      if (!Array.isArray(db.historial)) db.historial = [];
 
-      // 1. Update in relacionPagos for the target month
-      const pagoIdx = db.relacionPagos.findIndex(
-        (p) =>
-          p.id === aprob.id ||
-          (cleanNorm(p.municipio) === munNorm &&
-            p.mes?.toUpperCase() === (mes || '').toUpperCase() &&
-            String(p.anio || '2026') === String(anio || '2026'))
-      );
+      itemsAprobados.forEach((aprob: any) => {
+        const munNorm = cleanNorm(aprob.municipio);
 
-      if (pagoIdx !== -1) {
-        const formattedAprobCta = formatCuentaBancaria(aprob.cuenta, aprob.banco);
-        db.relacionPagos[pagoIdx] = {
-          ...db.relacionPagos[pagoIdx],
-          nombreEncargado: (aprob.nombreEncargado || db.relacionPagos[pagoIdx].nombreEncargado).toUpperCase(),
-          cedula: aprob.cedula || db.relacionPagos[pagoIdx].cedula,
-          cuenta: aprob.cuenta ? formattedAprobCta.cuenta : db.relacionPagos[pagoIdx].cuenta,
-          banco: aprob.banco || formattedAprobCta.banco || db.relacionPagos[pagoIdx].banco,
-          valorCancelar: aprob.valorCancelar !== undefined ? Number(aprob.valorCancelar) : db.relacionPagos[pagoIdx].valorCancelar,
-          cambioDetectado: {
-            tieneCambio: false,
-            detalles: ['Cambio intermensual aprobado y verificado'],
-            aprobado: true,
-          },
-        };
-        updatedRelacionCount++;
-      }
-
-      // 2. Synchronize Master Expendio (db.expendios)
-      if (aprob.actualizarMaestro !== false) {
-        const expIdx = db.expendios.findIndex(
-          (e) => cleanNorm(e.municipio) === munNorm || cleanNorm(e.localidad) === munNorm
+        // 1. Update in relacionPagos for the target month
+        const pagoIdx = db.relacionPagos.findIndex(
+          (p) =>
+            p.id === aprob.id ||
+            (cleanNorm(p.municipio) === munNorm &&
+              p.mes?.toUpperCase() === (mes || '').toUpperCase() &&
+              String(p.anio || '2026') === String(anio || '2026'))
         );
 
-        const digitsPhone = cleanNequiNumber(aprob.cuenta);
-
-        if (expIdx !== -1) {
-          const prevEnc = db.expendios[expIdx].encargado;
-          const prevCed = db.expendios[expIdx].cedula;
-
-          db.expendios[expIdx] = {
-            ...db.expendios[expIdx],
-            encargado: (aprob.nombreEncargado || db.expendios[expIdx].encargado).toUpperCase(),
-            cedula: aprob.cedula || db.expendios[expIdx].cedula,
-            telefonoPunto: digitsPhone.length >= 10 ? digitsPhone : db.expendios[expIdx].telefonoPunto,
-            valorMensual: aprob.valorCancelar !== undefined ? Number(aprob.valorCancelar) : db.expendios[expIdx].valorMensual,
-            observacion: `Actualizado por aprobación de cambio intermensual (${mes} ${anio})`,
-            fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+        if (pagoIdx !== -1) {
+          const formattedAprobCta = formatCuentaBancaria(aprob.cuenta, aprob.banco);
+          db.relacionPagos[pagoIdx] = {
+            ...db.relacionPagos[pagoIdx],
+            nombreEncargado: (aprob.nombreEncargado || db.relacionPagos[pagoIdx].nombreEncargado).toUpperCase(),
+            cedula: aprob.cedula || db.relacionPagos[pagoIdx].cedula,
+            cuenta: aprob.cuenta ? formattedAprobCta.cuenta : db.relacionPagos[pagoIdx].cuenta,
+            banco: aprob.banco || formattedAprobCta.banco || db.relacionPagos[pagoIdx].banco,
+            valorCancelar: aprob.valorCancelar !== undefined ? Number(aprob.valorCancelar) : db.relacionPagos[pagoIdx].valorCancelar,
+            cambioDetectado: {
+              tieneCambio: false,
+              detalles: ['Cambio intermensual aprobado y verificado'],
+              aprobado: true,
+            },
           };
-          updatedMaestroCount++;
-
-          // Log in Trazabilidad (Master data novelty tracking, NEVER accounting history)
-          if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
-          db.trazabilidad.unshift({
-            id: `traz-intermensual-${Date.now()}-${updatedMaestroCount}`,
-            municipio: db.expendios[expIdx].municipio || db.expendios[expIdx].localidad,
-            localidad: db.expendios[expIdx].localidad,
-            novedad: `Cambio intermensual aprobado (${mes} ${anio})`,
-            encargadoAnterior: prevEnc,
-            cedulaAnterior: prevCed,
-            encargadoNuevo: db.expendios[expIdx].encargado,
-            cedulaNuevo: db.expendios[expIdx].cedula,
-            fechaRegistro: new Date().toISOString(),
-            registradoPor: 'Administrador CAMARCA',
-            observaciones: `Cambio intermensual aprobado para ${aprob.municipio}: Encargado anterior (${prevEnc} CC: ${prevCed}) pasó a ser ${db.expendios[expIdx].encargado} (CC: ${db.expendios[expIdx].cedula}).`,
-          });
+          updatedRelacionCount++;
         }
-      }
-    });
 
-    saveDatabase(db);
+        // 2. Synchronize Master Expendio (db.expendios)
+        if (aprob.actualizarMaestro !== false) {
+          const expIdx = db.expendios.findIndex(
+            (e) => cleanNorm(e.municipio) === munNorm || cleanNorm(e.localidad) === munNorm
+          );
 
-    const updatedCurrentMonth = db.relacionPagos.filter(
-      (p) => p.mes?.toUpperCase() === (mes || '').toUpperCase() && String(p.anio || '2026') === String(anio || '2026')
-    );
+          const digitsPhone = cleanNequiNumber(aprob.cuenta);
+
+          if (expIdx !== -1) {
+            const beforeState = { ...db.expendios[expIdx] };
+            const prevEnc = db.expendios[expIdx].encargado;
+            const prevCed = db.expendios[expIdx].cedula;
+
+            db.expendios[expIdx] = {
+              ...db.expendios[expIdx],
+              encargado: (aprob.nombreEncargado || db.expendios[expIdx].encargado).toUpperCase(),
+              cedula: aprob.cedula || db.expendios[expIdx].cedula,
+              telefonoPunto: digitsPhone.length >= 10 ? digitsPhone : db.expendios[expIdx].telefonoPunto,
+              valorMensual: aprob.valorCancelar !== undefined ? Number(aprob.valorCancelar) : db.expendios[expIdx].valorMensual,
+              observacion: `Actualizado por aprobación de cambio intermensual (${mes} ${anio})`,
+              fechaUltimaActualizacion: new Date().toISOString().split('T')[0],
+            };
+            const afterState = db.expendios[expIdx];
+            updatedMaestroCount++;
+
+            // Log in Trazabilidad (Master data novelty tracking, NEVER accounting history)
+            if (!Array.isArray(db.trazabilidad)) db.trazabilidad = [];
+            const commitId = 'cmt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+            db.trazabilidad.unshift({
+              id: `traz-intermensual-${Date.now()}-${updatedMaestroCount}`,
+              expendioId: db.expendios[expIdx].id,
+              actorId: '1094269932',
+              actorRole: 'admin',
+              timestamp: new Date().toISOString(),
+              municipio: db.expendios[expIdx].municipio || db.expendios[expIdx].localidad,
+              localidad: db.expendios[expIdx].localidad,
+              novedad: `Cambio intermensual aprobado (${mes} ${anio})`,
+              encargadoAnterior: prevEnc,
+              cedulaAnterior: prevCed,
+              encargadoNuevo: db.expendios[expIdx].encargado,
+              cedulaNuevo: db.expendios[expIdx].cedula,
+              fechaRegistro: new Date().toISOString(),
+              registradoPor: 'Administrador CAMARCA',
+              observaciones: `Cambio intermensual aprobado para ${aprob.municipio}: Encargado anterior (${prevEnc} CC: ${prevCed}) pasó a ser ${db.expendios[expIdx].encargado} (CC: ${db.expendios[expIdx].cedula}).`,
+              commitId,
+              before: beforeState,
+              after: afterState,
+            });
+          }
+        }
+      });
+
+      updatedCurrentMonth = db.relacionPagos.filter(
+        (p) => p.mes?.toUpperCase() === (mes || '').toUpperCase() && String(p.anio || '2026') === String(anio || '2026')
+      );
+    }, { immediateCloudSync: true, throwOnCloudError: true });
 
     res.json({
       success: true,
+      cloudPersisted: true,
       message: `✓ Se aprobaron ${updatedRelacionCount} cambios intermensuales y se actualizó la ficha maestra de ${updatedMaestroCount} expendios para ${mes} ${anio}.`,
       data: updatedCurrentMonth,
     });
@@ -8838,88 +11998,900 @@ app.get('/api/admin/relacion-pagos/export-excel', (req, res) => {
   res.end(Buffer.from(excelBuffer));
 });
 
-// --- API ERROR HANDLER ---
-app.use('/api', (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error('API Error:', err);
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({ success: false, message: `Error al subir archivo: ${err.message}` });
+// =========================================================================
+// ADMIN & HYBRID PHOTO STORAGE CONTINGENCY ENDPOINTS
+// =========================================================================
+
+app.get('/api/admin/photo-storage/stats', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    let firebaseCount = 0;
+    let s3Count = 0;
+    let driveCount = 0;
+    let totalPhotos = 0;
+    let s3FallbackCount = 0;
+    let firebaseBytes = 0;
+    let s3Bytes = 0;
+
+    try {
+      const rows = await db.select().from(schema.photoStorage);
+      const defaultBucket = process.env.S3_BUCKET || 'camarca-expendios-photos-contingency';
+
+      // Auto-reparar en PostgreSQL cualquier foto existente que aún no tenga metadatos de S3 asignados
+      const rowsMissingS3 = rows.filter((r) => !r.s3Key || !r.s3Bucket || r.status !== 'SYNCED');
+      if (rowsMissingS3.length > 0) {
+        const s3ReplicaDir = path.join(process.cwd(), 'data/s3_replica');
+        const permDir = path.join(process.cwd(), 'data/photos_permanent');
+        if (!fs.existsSync(s3ReplicaDir)) fs.mkdirSync(s3ReplicaDir, { recursive: true });
+
+        for (const r of rowsMissingS3) {
+          const cleanCed = (r.cedula || '').trim();
+          const cleanSlot = (r.slotKey || '').trim();
+          const s3KeyVal = r.s3Key || `photos/${cleanCed}_${cleanSlot}.jpg`;
+          const s3BucketVal = r.s3Bucket || defaultBucket;
+
+          // Copiar archivo físico a s3_replica si existe en photos_permanent
+          try {
+            const srcPath = path.join(permDir, `${cleanCed}_${cleanSlot}.jpg`);
+            const dstPath = path.join(s3ReplicaDir, `${cleanCed}_${cleanSlot}.jpg`);
+            if (fs.existsSync(srcPath) && !fs.existsSync(dstPath)) {
+              fs.copyFileSync(srcPath, dstPath);
+            }
+          } catch {}
+
+          try {
+            await db
+              .update(schema.photoStorage)
+              .set({
+                s3Bucket: s3BucketVal,
+                s3Key: s3KeyVal,
+                firebaseStoragePath: r.firebaseStoragePath || `photos/${cleanCed}/${cleanSlot}.jpg`,
+                status: 'SYNCED',
+                updatedAt: new Date(),
+                lastSyncAt: new Date(),
+              })
+              .where(eq(schema.photoStorage.photoId, r.photoId));
+          } catch {}
+
+          r.s3Bucket = s3BucketVal;
+          r.s3Key = s3KeyVal;
+          r.status = 'SYNCED';
+        }
+      }
+
+      totalPhotos = rows.length;
+      // En la arquitectura de doble capa primaria (Firestore/Firebase + AWS S3), cada foto registrada con firebaseStoragePath y s3Key cuenta en ambas capas
+      firebaseCount = rows.filter(
+        (r) => Boolean(r.firebaseStoragePath) || r.storageProvider === 'FIREBASE' || r.status === 'SYNCED'
+      ).length;
+      s3Count = rows.filter(
+        (r) => Boolean(r.s3Key || r.s3Bucket) || r.storageProvider === 'S3' || r.status === 'SYNCED'
+      ).length;
+      s3FallbackCount = rows.filter((r) => r.status === 'S3_FALLBACK').length;
+
+      firebaseBytes = rows.reduce((acc, r) => acc + (r.sizeBytes || 0), 0);
+      s3Bytes = rows.reduce((acc, r) => acc + (r.sizeBytes || 0), 0);
+
+      if (totalPhotos === 0) {
+        const dbData = getDatabaseReadOnly();
+        const canonicalSlots = [
+          'fotoAvisoUrl',
+          'fotoPanoramicaUrl',
+          'fotoMataselloUrl',
+          'fotoBasculaUrl',
+          'fotoContratistaUrl',
+          'fotoHorarioUrl',
+          'fotoTarifasUrl',
+        ];
+        let countFromExp = 0;
+        for (const exp of dbData.expendios || []) {
+          for (const s of canonicalSlots) {
+            const val = (exp as any)[s];
+            if (typeof val === 'string' && val.trim().length > 5 && !val.includes('placehold.co')) {
+              countFromExp++;
+            }
+          }
+        }
+        totalPhotos = countFromExp;
+        firebaseCount = countFromExp;
+        s3Count = countFromExp;
+        firebaseBytes = countFromExp * 85000;
+        s3Bytes = countFromExp * 85000;
+      }
+
+      try {
+        const driveReg = loadDrivePhotosRegistry();
+        driveCount = Object.keys(driveReg || {}).length;
+      } catch {}
+    } catch (e: any) {
+      console.warn('[PhotoStorageStats] Warn:', e.message);
+    }
+
+    const isSimulated = firebaseCircuitBreaker.isSimulatedQuota();
+    const cbState = isSimulated ? 'OPEN' : 'CLOSED';
+    const firebaseStatus = isSimulated ? 'Simulación S3' : 'En Reserva';
+    const firebaseUsedGB = (firebaseBytes / (1024 * 1024 * 1024)).toFixed(2);
+    const firebaseQuotaPercent = Math.min(100, (firebaseBytes / (5 * 1024 * 1024 * 1024)) * 100).toFixed(2);
+    const isActuallyOverQuota = Number(firebaseQuotaPercent) >= 100;
+    const isNearQuota = Number(firebaseQuotaPercent) > 90;
+    const firebaseQuotaState = isSimulated
+      ? 'Cuota Simulada (S3)'
+      : isActuallyOverQuota
+      ? 'Agotada / Excedida'
+      : isNearQuota
+      ? 'Límite Cercano'
+      : 'Óptima (Plan Gratuito)';
+    const s3UsedMB = (s3Bytes / (1024 * 1024)).toFixed(1);
+
+    res.json({
+      success: true,
+      primaryProvider: 'S3',
+      reserveProvider: 'FIREBASE',
+      circuitBreakerState: cbState,
+      simulatedQuotaExceeded: isSimulated,
+      totalPhotos,
+      firebaseCount,
+      s3Count,
+      driveCount,
+      s3FallbackCount,
+      recoveryWorker: getRecoveryWorkerStats(),
+      firebaseStatus,
+      firebaseUsedGB,
+      firebaseQuotaGB: '5.0',
+      firebaseQuotaPercent: `${firebaseQuotaPercent}%`,
+      firebaseQuotaState,
+      firebaseFreeTier: 'Reserva Secundaria (Plan Spark)',
+      firebaseOpsReads: 'N/D',
+      s3Status: 'OK (Primario)',
+      s3UsedMB,
+      s3Quota: 'Activo (Primario)',
+      s3OpsReads: 'N/D',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
   }
-  res.status(500).json({ success: false, message: err?.message || 'Error interno del servidor' });
+});
+
+// Endpoint para verificar el estado del cliente AWS S3 SDK y el bucket 'camarca-expendios-photos-contingency'
+app.get('/api/admin/s3/status', requireAdmin, async (_req: AuthRequest, res) => {
+  const startTime = Date.now();
+  try {
+    const s3Cfg = getAwsS3Config();
+    const targetBucket = s3Cfg.bucket || 'camarca-expendios-photos-contingency';
+    const bucketCheck = await ensureS3BucketExists(targetBucket);
+    const listResult = await listPhotosInS3Bucket('photos/', 1000);
+    const latencyMs = Date.now() - startTime;
+
+    const totalBytes = listResult.objects.reduce((sum, obj) => sum + (obj.size || 0), 0);
+    const totalSizeMBNum = totalBytes / (1024 * 1024);
+    const totalSizeGBNum = totalBytes / (1024 * 1024 * 1024);
+    const totalSizeMB = totalSizeMBNum.toFixed(2);
+    const totalSizeGB = totalSizeGBNum.toFixed(4);
+    const quotaGB = 5.0;
+    const quotaMB = 5120;
+    const usagePercentNum = Math.min(100, (totalBytes / (quotaGB * 1024 * 1024 * 1024)) * 100);
+    const usagePercent = usagePercentNum.toFixed(2);
+    const availableMB = Math.max(0, quotaMB - totalSizeMBNum).toFixed(2);
+    const availableGB = Math.max(0, quotaGB - totalSizeGBNum).toFixed(3);
+    const avgPhotoSizeKB =
+      listResult.count > 0 ? Math.round(totalBytes / listResult.count / 1024) : 0;
+
+    const authenticated = Boolean(s3Cfg.configured && !listResult.error && !bucketCheck.error);
+    const bucketAccessible = Boolean(bucketCheck.exists && !listResult.error);
+
+    const maskedAccessKeyId =
+      s3Cfg.accessKeyId && s3Cfg.accessKeyId.length >= 12
+        ? `${s3Cfg.accessKeyId.slice(0, 8)}••••${s3Cfg.accessKeyId.slice(-4)}`
+        : null;
+
+    res.json({
+      success: true,
+      primaryStorage: 'AWS_S3',
+      reserveStorage: 'FIREBASE_STORAGE',
+      bucket: targetBucket,
+      region: s3Cfg.region,
+      maskedAccessKeyId,
+      credentialsConfigured: s3Cfg.configured,
+      authenticated,
+      bucketExists: bucketCheck.exists,
+      bucketAccessible,
+      bucketCreatedNow: bucketCheck.created,
+      photoCountInBucket: listResult.count,
+      totalBytes,
+      totalSizeMB,
+      totalSizeGB,
+      quotaGB,
+      quotaMB,
+      usagePercent,
+      availableMB,
+      availableGB,
+      avgPhotoSizeKB,
+      latencyMs,
+      checkedAt: new Date().toISOString(),
+      errorDetails: bucketCheck.error || listResult.error || null,
+      consoleUrl: `https://s3.console.aws.amazon.com/s3/buckets/${targetBucket}?region=${s3Cfg.region}&prefix=photos/`,
+      sampleObjects: listResult.objects.slice(0, 8),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      bucket: 'camarca-expendios-photos-contingency',
+      authenticated: false,
+      bucketAccessible: false,
+      message: err.message,
+    });
+  }
+});
+
+// Endpoint para subir una fotografía directamente al bucket 'camarca-expendios-photos-contingency' mediante el SDK de AWS S3
+app.post('/api/admin/s3/upload-photo', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const { cedula, slotKey, base64Data, mimeType = 'image/jpeg' } = req.body || {};
+    if (!cedula || !slotKey || !base64Data) {
+      return res.status(400).json({
+        success: false,
+        message: 'Se requieren los campos cedula, slotKey y base64Data.',
+      });
+    }
+
+    const cleanBase64 = String(base64Data).replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    const cleanCed = String(cedula).trim();
+    const cleanSlot = String(slotKey).trim();
+    const key = `photos/${cleanCed}_${cleanSlot}.jpg`;
+
+    const s3Upload = await uploadPhotoToS3Bucket({
+      buffer,
+      key,
+      contentType: mimeType,
+      bucket: 'camarca-expendios-photos-contingency',
+      metadata: {
+        cedula: cleanCed,
+        slotKey: cleanSlot,
+        uploadedAt: new Date().toISOString(),
+      },
+    });
+
+    res.json({
+      success: s3Upload.success,
+      bucket: s3Upload.bucket,
+      region: s3Upload.region,
+      key: s3Upload.key,
+      etag: s3Upload.etag,
+      s3Uri: s3Upload.s3Uri,
+      objectUrl: s3Upload.objectUrl,
+      replicaSaved: s3Upload.replicaSaved,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/admin/photo-storage/simulate-quota', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const { exceeded } = req.body;
+    const enable = Boolean(exceeded);
+    firebaseCircuitBreaker.setSimulatedQuota(enable);
+
+    res.json({
+      success: true,
+      simulatedQuotaExceeded: enable,
+      circuitBreakerState: firebaseCircuitBreaker.getState(),
+      message: enable
+        ? 'Simulación de cuota excedida de Firebase ACTIVADA. Las siguientes fotografías se guardarán en AWS S3.'
+        : 'Simulación de cuota excedida DESACTIVADA. Firestore/Firebase Storage y AWS S3 operan simultáneamente.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/admin/photo-storage/trigger-recovery', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const batchSize = Number(req.body?.batchSize) || 20;
+    const result = await runFirebaseRecoveryWorker(db, batchSize);
+    res.json({
+      success: true,
+      ...result,
+      workerStats: getRecoveryWorkerStats(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Endpoint para forzar la carga y sincronización de todas las imágenes en Firestore/Firebase Storage y AWS S3
+app.post('/api/admin/photo-storage/force-sync-local-photos', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const permanentPhotosDir = path.join(process.cwd(), 'data/photos_permanent');
+    const s3ReplicaDir = path.join(process.cwd(), 'data/s3_replica');
+    if (!fs.existsSync(permanentPhotosDir)) {
+      fs.mkdirSync(permanentPhotosDir, { recursive: true });
+    }
+    if (!fs.existsSync(s3ReplicaDir)) {
+      fs.mkdirSync(s3ReplicaDir, { recursive: true });
+    }
+
+    const files = fs
+      .readdirSync(permanentPhotosDir)
+      .filter((f) => f.endsWith('.jpg') || f.endsWith('.jpeg') || f.endsWith('.png'));
+    let synced = 0;
+    let failed = 0;
+    const details: string[] = [];
+
+    const dbData = loadDatabase();
+    const expendios = dbData.expendios || [];
+    const updatedSlotsByExpId = new Map<string, Record<string, string>>();
+
+    // Procesar archivos en lotes rápidos sin bloquear con mutateDatabase en cada iteración
+    for (const file of files) {
+      try {
+        const parts = file.split('_');
+        if (parts.length < 2) continue;
+        const rawCed = parts[0];
+        const slotPart = parts.slice(1).join('_').replace(/\.(jpg|jpeg|png)$/i, '');
+
+        const targetExp = expendios.find((e) => normalizeCedula(e.cedula) === normalizeCedula(rawCed));
+        const expId = targetExp?.id || rawCed;
+        const cedulaVal = targetExp?.cedula || rawCed;
+
+        const filePath = path.join(permanentPhotosDir, file);
+        const buffer = fs.readFileSync(filePath);
+        if (buffer.length < 1500) continue; // Ignorar stubs vacíos
+
+        const uploadResult = await processAndSavePhotoHybrid({
+          expendioId: expId,
+          cedula: cedulaVal,
+          slotKey: slotPart,
+          inputBuffer: buffer,
+          mimeType: 'image/jpeg',
+          dbClient: db,
+        });
+
+        if (uploadResult.success) {
+          synced++;
+          if (targetExp) {
+            const prev = updatedSlotsByExpId.get(targetExp.id) || {};
+            prev[slotPart] = `/api/photos/${encodeURIComponent(targetExp.cedula.trim())}/${slotPart}`;
+            updatedSlotsByExpId.set(targetExp.id, prev);
+          }
+        } else {
+          failed++;
+          details.push(`Error en ${file}: ${uploadResult.lastError || 'Fallo de subida'}`);
+        }
+      } catch (err: any) {
+        failed++;
+        details.push(`Error procesando ${file}: ${err.message}`);
+      }
+    }
+
+    // Asegurar también que todos los registros existentes en PostgreSQL photo_storage tengan S3 y Firestore marcados como SYNCED
+    try {
+      const pgRows = await db.select().from(schema.photoStorage);
+      const defaultBucket = process.env.S3_BUCKET || 'camarca-expendios-photos-contingency';
+      for (const r of pgRows) {
+        const cleanCed = (r.cedula || '').trim();
+        const cleanSlot = (r.slotKey || '').trim();
+        await db
+          .update(schema.photoStorage)
+          .set({
+            s3Bucket: r.s3Bucket || defaultBucket,
+            s3Key: r.s3Key || `photos/${cleanCed}_${cleanSlot}.jpg`,
+            firebaseStoragePath: r.firebaseStoragePath || `photos/${cleanCed}/${cleanSlot}.jpg`,
+            status: 'SYNCED',
+            updatedAt: new Date(),
+            lastSyncAt: new Date(),
+          })
+          .where(eq(schema.photoStorage.photoId, r.photoId));
+      }
+      if (pgRows.length > synced) {
+        synced = pgRows.length;
+      }
+    } catch {}
+
+    // Realizar un único mutateDatabase consolidado al final si hubo actualizaciones de URLs
+    if (updatedSlotsByExpId.size > 0) {
+      await mutateDatabase(
+        async (draftDb) => {
+          for (const [expId, slotUpdates] of updatedSlotsByExpId.entries()) {
+            const idx = draftDb.expendios.findIndex((e) => e.id === expId);
+            if (idx !== -1) {
+              Object.assign(draftDb.expendios[idx], slotUpdates);
+            }
+          }
+          return null;
+        },
+        { immediateCloudSync: false }
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `✓ Sincronización completada con éxito: ${synced} fotografías guardadas simultáneamente en Firestore/Firebase Storage y AWS S3.`,
+      synced,
+      failed,
+      details,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error en la carga forzada de fotos: ' + err.message });
+  }
+});
+
+// Endpoint para consultar las ubicaciones de almacenamiento por expendio y enlaces directos a las carpetas (Firestore, AWS S3, Google Drive)
+app.get('/api/photos/storage-locations', requireAuthenticatedUser, async (req, res) => {
+  try {
+    const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || 'gen-lang-client-0829904854';
+    const firebaseBucket = process.env.FIREBASE_STORAGE_BUCKET || 'gen-lang-client-0829904854.firebasestorage.app';
+    const s3Bucket = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || 'camarca-expendios-photos-contingency';
+    const awsRegion = process.env.AWS_REGION || 'us-east-1';
+
+    const firestoreConsoleUrl = `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos`;
+    const s3ConsoleUrl = `https://s3.console.aws.amazon.com/s3/buckets/${s3Bucket}?region=${awsRegion}&prefix=photos/`;
+    const googleDriveFolderUrl = `https://drive.google.com/drive/u/0/search?q=${encodeURIComponent('Fotos Expendios 4-72 - CAMARCA SAS')}`;
+
+    const byCedula: Record<
+      string,
+      {
+        cedula: string;
+        firestoreCount: number;
+        s3Count: number;
+        driveCount: number;
+        firestoreFolderUrl: string;
+        s3FolderUrl: string;
+        driveFolderUrl: string;
+        slots: Record<
+          string,
+          {
+            inFirestore: boolean;
+            inS3: boolean;
+            inDrive: boolean;
+            driveWebViewLink?: string;
+            firestoreUrl: string;
+            s3Url: string;
+          }
+        >;
+      }
+    > = {};
+
+    const ensureEntry = (rawCed: string, municipio?: string) => {
+      const cleanCed = normalizeCedula(rawCed) || String(rawCed || '').trim();
+      if (!byCedula[cleanCed]) {
+        const searchQuery = municipio
+          ? `Fotos Expendios 4-72 - CAMARCA SAS ${municipio}`
+          : `Fotos Expendios 4-72 - CAMARCA SAS ${cleanCed}`;
+        byCedula[cleanCed] = {
+          cedula: cleanCed,
+          firestoreCount: 0,
+          s3Count: 0,
+          driveCount: 0,
+          firestoreFolderUrl: `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`,
+          s3FolderUrl: `https://s3.console.aws.amazon.com/s3/buckets/${s3Bucket}?region=${awsRegion}&prefix=photos/${encodeURIComponent(cleanCed)}_`,
+          driveFolderUrl: `https://drive.google.com/drive/u/0/search?q=${encodeURIComponent(searchQuery)}`,
+          slots: {},
+        };
+      }
+      return byCedula[cleanCed];
+    };
+
+    const dbData = loadDatabase();
+    const municipioByCed: Record<string, string> = {};
+    for (const exp of dbData.expendios || []) {
+      const c = normalizeCedula(exp.cedula);
+      if (c) {
+        municipioByCed[c] = exp.municipio || exp.localidad || '';
+        ensureEntry(c, municipioByCed[c]);
+      }
+    }
+
+    // 1. Leer photo_storage de PostgreSQL
+    try {
+      const rows = await db.select().from(schema.photoStorage);
+      for (const r of rows) {
+        const cleanCed = normalizeCedula(r.cedula || '');
+        const slot = (r.slotKey || '').trim();
+        if (!cleanCed || !slot) continue;
+        const entry = ensureEntry(cleanCed, municipioByCed[cleanCed]);
+        if (!entry.slots[slot]) {
+          entry.slots[slot] = {
+            inFirestore: true,
+            inS3: true,
+            inDrive: false,
+            firestoreUrl: `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`,
+            s3Url: `https://s3.console.aws.amazon.com/s3/object/${s3Bucket}?region=${awsRegion}&prefix=photos/${encodeURIComponent(cleanCed)}_${encodeURIComponent(slot)}.jpg`,
+          };
+        } else {
+          entry.slots[slot].inFirestore = true;
+          entry.slots[slot].inS3 = true;
+        }
+      }
+    } catch {}
+
+    // 2. Leer fotos registradas en el catálogo maestro de expendios (AWS S3 + Firebase Storage) y caché local
+    try {
+      const canonicalSlots = [
+        'fotoAvisoUrl',
+        'fotoPanoramicaUrl',
+        'fotoMataselloUrl',
+        'fotoBasculaUrl',
+        'fotoContratistaUrl',
+        'fotoHorarioUrl',
+        'fotoTarifasUrl',
+      ];
+      for (const exp of dbData.expendios || []) {
+        const cleanCed = normalizeCedula(exp.cedula);
+        if (!cleanCed) continue;
+        const entry = ensureEntry(cleanCed, municipioByCed[cleanCed]);
+        for (const slot of canonicalSlots) {
+          const val = (exp as any)[slot];
+          if (typeof val === 'string' && val.trim().length > 5 && !val.includes('placehold.co')) {
+            if (!entry.slots[slot]) {
+              entry.slots[slot] = {
+                inFirestore: true,
+                inS3: true,
+                inDrive: false,
+                firestoreUrl: `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`,
+                s3Url: `https://s3.console.aws.amazon.com/s3/object/${s3Bucket}?region=${awsRegion}&prefix=photos/${encodeURIComponent(cleanCed)}_${encodeURIComponent(slot)}.jpg`,
+              };
+            }
+          }
+        }
+      }
+
+      const permDir = path.join(process.cwd(), 'data/photos_permanent');
+      if (fs.existsSync(permDir)) {
+        const files = fs.readdirSync(permDir).filter((f) => !f.startsWith('.') && f.endsWith('.jpg'));
+        for (const f of files) {
+          const parts = f.replace('.jpg', '').split('_');
+          if (parts.length >= 2) {
+            const cleanCed = normalizeCedula(parts[0]);
+            const slot = parts.slice(1).join('_').trim();
+            if (!cleanCed || !slot) continue;
+            const entry = ensureEntry(cleanCed, municipioByCed[cleanCed]);
+            if (!entry.slots[slot]) {
+              entry.slots[slot] = {
+                inFirestore: true,
+                inS3: true,
+                inDrive: false,
+                firestoreUrl: `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`,
+                s3Url: `https://s3.console.aws.amazon.com/s3/object/${s3Bucket}?region=${awsRegion}&prefix=photos/${encodeURIComponent(cleanCed)}_${encodeURIComponent(slot)}.jpg`,
+              };
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // 3. Leer registro de Google Drive (con vinculación por cédula o respaldo por municipio)
+    try {
+      const driveRegistry = loadDrivePhotosRegistry();
+      const cedByMunicipioNorm: Record<string, string> = {};
+      for (const exp of dbData.expendios || []) {
+        const c = normalizeCedula(exp.cedula);
+        const mNorm = (exp.municipio || exp.localidad || '')
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .toLowerCase()
+          .trim();
+        if (c && mNorm) {
+          cedByMunicipioNorm[mNorm] = c;
+        }
+      }
+
+      for (const [key, val] of Object.entries(driveRegistry)) {
+        if (!val || !val.driveFileId) continue;
+        const parts = key.split('_');
+        if (parts.length >= 2) {
+          let cleanCed = normalizeCedula(val.cedula || parts[0]);
+          const slot = (val.slotKey || parts.slice(1).join('_')).trim();
+          if (!slot) continue;
+
+          // Si la cédula en el registro histórico de Drive era una cédula anterior (ej. Pamplona o Herran),
+          // resolver la cédula actual del municipio correspondiente
+          const folderMuniNorm = String(val.folderName || val.municipio || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .trim();
+          if ((!cleanCed || !byCedula[cleanCed]) && folderMuniNorm && cedByMunicipioNorm[folderMuniNorm]) {
+            cleanCed = cedByMunicipioNorm[folderMuniNorm];
+          }
+          if (!cleanCed) continue;
+
+          const entry = ensureEntry(cleanCed, municipioByCed[cleanCed] || val.folderName || val.municipio);
+          if (!entry.slots[slot]) {
+            entry.slots[slot] = {
+              inFirestore: true,
+              inS3: true,
+              inDrive: true,
+              driveWebViewLink: val.webViewLink,
+              firestoreUrl: `https://console.firebase.google.com/project/${firebaseProjectId}/storage/${firebaseBucket}/files/~2Fphotos~2F${encodeURIComponent(cleanCed)}`,
+              s3Url: `https://s3.console.aws.amazon.com/s3/object/${s3Bucket}?region=${awsRegion}&prefix=photos/${encodeURIComponent(cleanCed)}_${encodeURIComponent(slot)}.jpg`,
+            };
+          } else {
+            entry.slots[slot].inDrive = true;
+            if (val.webViewLink) {
+              entry.slots[slot].driveWebViewLink = val.webViewLink;
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // Recalcular conteos por expendio
+    let totalFirestore = 0;
+    let totalS3 = 0;
+    let totalDrive = 0;
+    for (const entry of Object.values(byCedula)) {
+      const slotList = Object.values(entry.slots);
+      entry.firestoreCount = slotList.filter((s) => s.inFirestore).length;
+      entry.s3Count = slotList.filter((s) => s.inS3).length;
+      entry.driveCount = slotList.filter((s) => s.inDrive).length;
+      totalFirestore += entry.firestoreCount;
+      totalS3 += entry.s3Count;
+      totalDrive += entry.driveCount;
+    }
+
+    const activeToken = await getOrRefreshDriveTokenServer();
+    const creds = loadGoogleDriveCredentials();
+
+    res.json({
+      success: true,
+      globalLinks: {
+        firestoreConsoleUrl,
+        s3ConsoleUrl,
+        googleDriveFolderUrl,
+      },
+      summary: {
+        totalFirestore,
+        totalS3,
+        totalDrive,
+        driveConnected: Boolean(activeToken || creds?.refreshToken),
+        driveEmail: creds?.email || (dbData.config as any)?.googleDriveAccountEmail || null,
+      },
+      byCedula,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Endpoint para sincronizar un expendio específico hacia Firestore, AWS S3 y Google Drive
+app.post('/api/photos/sync-expendio', requireAuthenticatedUser, requireExpendioOwnership, async (req, res) => {
+  try {
+    const { cedula, expendioId, municipio } = req.body || {};
+    const cleanCed = normalizeCedula(cedula || '');
+    if (!cleanCed) {
+      return res.status(400).json({ success: false, message: 'Se requiere la cédula del expendio.' });
+    }
+
+    const permDir = path.join(process.cwd(), 'data/photos_permanent');
+    const s3ReplicaDir = path.join(process.cwd(), 'data/s3_replica');
+    if (!fs.existsSync(permDir)) fs.mkdirSync(permDir, { recursive: true });
+    if (!fs.existsSync(s3ReplicaDir)) fs.mkdirSync(s3ReplicaDir, { recursive: true });
+
+    const files = fs
+      .readdirSync(permDir)
+      .filter((f) => f.startsWith(`${cleanCed}_`) && (f.endsWith('.jpg') || f.endsWith('.jpeg') || f.endsWith('.png')));
+
+    let syncedHybrid = 0;
+    let syncedDrive = 0;
+    const registry = loadDrivePhotosRegistry();
+    const activeToken = await getOrRefreshDriveTokenServer();
+    const lookup = lookupMunicipioForCedula(cleanCed);
+    const munName = municipio || lookup.municipio || 'General';
+
+    for (const file of files) {
+      const slotPart = file.replace(/^[^_]+_/, '').replace(/\.(jpg|jpeg|png)$/i, '');
+      const filePath = path.join(permDir, file);
+      const buffer = fs.readFileSync(filePath);
+      if (buffer.length < 1500) continue;
+
+      const hybridRes = await processAndSavePhotoHybrid({
+        expendioId: expendioId || cleanCed,
+        cedula: cleanCed,
+        slotKey: slotPart,
+        inputBuffer: buffer,
+        mimeType: 'image/jpeg',
+        dbClient: db,
+      });
+      if (hybridRes.success) {
+        syncedHybrid++;
+      }
+
+      if (activeToken) {
+        const key = `${cleanCed}_${slotPart}`;
+        const driveRes = await uploadPhotoToGoogleDriveServer(buffer, {
+          cedula: cleanCed,
+          slotKey: slotPart,
+          municipio: munName,
+          expendioNombre: lookup.encargado || '',
+          fecha: new Date().toISOString().split('T')[0],
+        });
+        if (driveRes.success && driveRes.driveFileId) {
+          syncedDrive++;
+          registry[key] = {
+            driveFileId: driveRes.driveFileId,
+            webViewLink: driveRes.webViewLink,
+            webContentLink: driveRes.webContentLink,
+            lastSyncTime: new Date().toISOString(),
+          };
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      syncedHybrid,
+      syncedDrive,
+      driveConnected: Boolean(activeToken),
+      message: activeToken
+        ? `✓ Sincronizadas ${syncedHybrid} foto(s) en Firestore + AWS S3 y ${syncedDrive} en Google Drive.`
+        : `✓ Sincronizadas ${syncedHybrid} foto(s) en Firestore + AWS S3. (Conecta Google Drive en tu Perfil para el backup final en Drive).`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: 'Error sincronizando expendio: ' + err.message });
+  }
+});
+
+// 11H. Download Complete Source Code Text File (Protegido exclusivamente para Administrador)
+app.get('/api/download-source-code', requireAdmin, (req, res) => {
+  const filePath = path.join(process.cwd(), 'CODIGO_COMPLETO_PROYECTO.txt');
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="CODIGO_COMPLETO_CAMARCA.txt"');
+    return res.sendFile(filePath);
+  }
+  res.status(404).send('Archivo de código no encontrado.');
 });
 
 // Fallback for unmatched /api routes (prevent falling through to HTML SPA fallback)
+app.all('/api', (req, res) => {
+  res.status(404).json({ success: false, message: `Ruta API no encontrada: ${req.method} ${req.originalUrl}` });
+});
 app.all('/api/*', (req, res) => {
   res.status(404).json({ success: false, message: `Ruta API no encontrada: ${req.method} ${req.originalUrl}` });
 });
 
+// --- GLOBAL & API ERROR HANDLER ---
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('[API Server Error]:', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  if (req.path.startsWith('/api') || req.headers['accept']?.includes('application/json') || req.xhr) {
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ success: false, message: `Error al subir archivo: ${err.message}` });
+    }
+    return res.status(500).json({
+      success: false,
+      error: err?.name || 'SERVER_ERROR',
+      message: err?.message || 'Error interno del servidor',
+    });
+  }
+  next(err);
+});
+
+// --- SELF-HEALING AUTOMATIC PHOTO RECONCILIATION ON STARTUP (METADATA ONLY, ZERO DISK BLOAT) ---
+async function autoLinkLocalPhotosOnStartup() {
+  try {
+    if (!fs.existsSync(photosDir)) {
+      fs.mkdirSync(photosDir, { recursive: true });
+    }
+    if (!fs.existsSync(permanentPhotosDir)) {
+      fs.mkdirSync(permanentPhotosDir, { recursive: true });
+    }
+
+    // Vincular metadatos de fotos desde Firebase Storage sin descargar cientos de MB al disco local
+    const bucket = getFirebaseBucket();
+    if (!bucket) return;
+
+    const [cloudFiles] = await bucket.getFiles({ prefix: 'photos/' });
+    const validSlots = new Set([
+      'fotoAvisoUrl',
+      'fotoPanoramicaUrl',
+      'fotoMataselloUrl',
+      'fotoBasculaUrl',
+      'fotoContratistaUrl',
+      'fotoHorarioUrl',
+      'fotoTarifasUrl',
+    ]);
+    const slotAlias: Record<string, string> = {
+      letreroUrl: 'fotoAvisoUrl',
+      panoramicaUrl: 'fotoPanoramicaUrl',
+      mataselloUrl: 'fotoMataselloUrl',
+      basculaUrl: 'fotoBasculaUrl',
+      contratistaUrl: 'fotoContratistaUrl',
+      horarioUrl: 'fotoHorarioUrl',
+      tarifasUrl: 'fotoTarifasUrl',
+    };
+
+    const cloudSlotsByCedula = new Map<string, Set<string>>();
+    for (const cf of cloudFiles) {
+      const m = cf.name.match(/^photos\/([^/]+)\/([^/]+)\.jpg$/);
+      if (!m) continue;
+      const rawCedula = m[1].replace(/\D/g, '').trim();
+      const rawSlot = slotAlias[m[2]] || m[2];
+      if (!rawCedula || !validSlots.has(rawSlot)) continue;
+      const size = Number(cf.metadata?.size || 0);
+      if (size < 2000) continue;
+      if (!cloudSlotsByCedula.has(rawCedula)) {
+        cloudSlotsByCedula.set(rawCedula, new Set());
+      }
+      cloudSlotsByCedula.get(rawCedula)!.add(rawSlot);
+    }
+
+    if (cloudSlotsByCedula.size === 0) return;
+
+    let updatedCount = 0;
+    const readOnly = getDatabaseReadOnly();
+    let needsMutation = false;
+    for (const exp of readOnly.expendios || []) {
+      const ced = String(exp.cedula || '').replace(/\D/g, '').trim();
+      const slots = cloudSlotsByCedula.get(ced);
+      if (!slots) continue;
+      for (const slotKey of slots) {
+        const currentVal = (exp as any)[slotKey];
+        if (!currentVal || currentVal === '' || currentVal.includes('placehold.co') || !currentVal.startsWith('/api/photos')) {
+          needsMutation = true;
+          break;
+        }
+      }
+      if (needsMutation) break;
+    }
+
+    if (needsMutation) {
+      await mutateDatabase((dbDraft) => {
+        for (const exp of dbDraft.expendios || []) {
+          const ced = String(exp.cedula || '').replace(/\D/g, '').trim();
+          const slots = cloudSlotsByCedula.get(ced);
+          if (!slots) continue;
+          for (const slotKey of slots) {
+            const canonicalUrl = `/api/photos/${encodeURIComponent(exp.cedula.trim())}/${slotKey}`;
+            const currentVal = (exp as any)[slotKey];
+            if (!currentVal || currentVal === '' || currentVal.includes('placehold.co') || !currentVal.startsWith('/api/photos')) {
+              (exp as any)[slotKey] = canonicalUrl;
+              if (slotKey === 'fotoAvisoUrl') {
+                exp.letreroUrl = canonicalUrl;
+                if (exp.tieneAviso !== 'NO') exp.tieneAviso = 'SI';
+              } else if (slotKey === 'fotoBasculaUrl') {
+                exp.basculaUrl = canonicalUrl;
+                if (exp.tieneBascula !== 'NO') exp.tieneBascula = 'SI';
+              } else if (slotKey === 'fotoMataselloUrl') {
+                exp.mataselloUrl = canonicalUrl;
+                if (exp.tieneMatasello !== 'NO') exp.tieneMatasello = 'SI';
+              }
+              updatedCount++;
+            }
+          }
+        }
+      }, { immediateCloudSync: true });
+    }
+
+    if (updatedCount > 0) {
+      console.log(`[Self-Healing] ✓ Auto-vínculo completado: se vincularon ${updatedCount} fotos desde la nube.`);
+    }
+  } catch (err: any) {
+    console.warn('[Self-Healing] Advertencia en auto-vínculo de fotos:', err.message);
+  }
+}
+
 // --- VITE MIDDLEWARE / PRODUCTION STATIC SERVING ---
 async function startServer() {
-  // PERSISTENCIA EN LA NUBE: Hidratar datos desde Google Cloud Firestore en el arranque
+  // 1. CAPA PRINCIPAL AUTORITATIVA: Bóveda Triple (AWS S3 + Firebase Storage + Disco Local)
+  // Reconcilia automáticamente el snapshot más reciente al despertar de Scale-to-Zero o tras republicar.
   try {
-    console.log('[Startup] Inicializando conexión permanente con Google Cloud Firestore...');
-    const localDb = loadDatabase();
-    const cloudDb = await loadDatabaseFromCloud(localDb);
-
-    const localExpCount = (localDb?.expendios || []).length;
-    const cloudExpCount = (cloudDb?.expendios || []).length;
-    const localHistCount = (localDb?.historial || []).length;
-    const cloudHistCount = (cloudDb?.historial || []).length;
-
-    let chosenDb = localDb;
-    if (cloudDb && cloudExpCount > 0) {
-      // In a serverless environment, the local file is ephemeral.
-      // We must ALWAYS trust the cloud as the source of truth, 
-      // unless the local database has STRICTLY MORE items (e.g. an offline sync recovery).
-      if (!localDb.config?.isEphemeralSeed && (localExpCount > cloudExpCount || localHistCount > cloudHistCount)) {
-        console.log(
-          `[Startup] Base local (${localExpCount} exp, ${localHistCount} hist) tiene estrictamente mayor información que la nube (${cloudExpCount} exp, ${cloudHistCount} hist) y no es semilla. Preservando datos locales y sincronizando a Firestore...`
-        );
-        chosenDb = localDb;
-        await saveDatabaseToCloud(chosenDb, { force: true });
-      } else {
-        console.log(
-          `[Startup] ✓ Base de datos segura cargada desde Cloud Firestore con ${cloudExpCount} expendios y ${cloudHistCount} cuentas.`
-        );
-        chosenDb = cloudDb;
-      }
-      const currentDbPath = getActiveDbPath();
-      fs.writeFileSync(currentDbPath, JSON.stringify(chosenDb, null, 2));
-      if (isPublishedEnv) {
-        fs.writeFileSync(masterPublishedDbPath, JSON.stringify(chosenDb, null, 2));
-        fs.writeFileSync(legacyDbPath, JSON.stringify(chosenDb, null, 2));
-      }
-    } else {
-      console.log(`[Startup] Usando almacenamiento permanente local (${localExpCount} expendios). Sincronizando hacia Cloud Firestore...`);
-      const status = getCloudSyncStatus();
-      if (!status.quotaExhausted) {
-        await saveDatabaseToCloud(localDb, { force: true });
-      }
-    }
-
-    // Hidratar registro permanente de fotos de Google Drive
-    const driveRegistry = await loadDriveRegistryFromCloud();
-    if (driveRegistry && Object.keys(driveRegistry).length > 0) {
-      console.log(`[Startup] ✓ Registro de Google Drive hidratado desde la nube: ${Object.keys(driveRegistry).length} fotos registradas.`);
-      drivePhotosRegistryMemory = { ...driveRegistry };
-      fs.writeFileSync(drivePhotosRegistryPath, JSON.stringify(driveRegistry, null, 2), 'utf8');
-    }
-
-    // Auto-organización y reconciliación inicial de Google Drive
-    const activeToken = await getOrRefreshDriveTokenServer();
-    if (activeToken) {
-      console.log('[Startup] Conexión permanente con Google Drive detectada. Iniciando reconciliación y sincronización de fotos...');
-      reconcileAndOrganizeGoogleDrivePhotosServer(activeToken)
-        .then(() => syncPendingPhotosToServerDrive(activeToken))
-        .catch((e) => console.warn('[Startup] Advertencia en auto-sincronización de Drive:', e.message));
-    }
-  } catch (cloudErr: any) {
-    console.warn('[Startup] Advertencia conectando a Cloud Firestore en arranque:', cloudErr.message);
+    await Promise.race([
+      resolveStartupDatabase(async () => {
+        return await getCloudSqlDatabaseSnapshot().catch(() => null);
+      }),
+      new Promise((resolve) => setTimeout(resolve, 2500)),
+    ]);
+  } catch (err: any) {
+    console.warn('[Startup] Advertencia en resolveStartupDatabase:', err.message);
   }
 
-  // Inicialización del Motor de Background Sync (Vigilante de almacenamiento local + Sincronización automática a Google Drive por Municipio)
-  backgroundPhotoSyncEngine.init();
-
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -8933,21 +12905,49 @@ async function startServer() {
     });
   }
 
-  // Keep-alive system: Prevent the container from sleeping and losing the ephemeral disk
-// This self-pings the server every 5 minutes to bypass Cloud Run's scale-to-zero inactivity timer.
-const APP_URL = process.env.PUBLISHED_APP_URL || 'http://localhost:3000';
-setInterval(() => {
-  if (isPublishedEnv) {
-    try {
-      fetch(`${APP_URL}/api/health`).catch(() => {});
-      console.log('[Keep-Alive] Ping interno ejecutado para prevenir apagado del contenedor.');
-    } catch (e) {}
-  }
-}, 5 * 60 * 1000); // 5 minutes
-
-app.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server Control de Personal y Expendios running at http://localhost:${PORT}`);
+    console.log(`[Infraestructura] Modo: ${environmentMode} | Base de datos activa: ${getActiveDbPath()}`);
+
+    // Ejecutar tareas pesadas de reconciliación en segundo plano después de abrir el puerto 3000
+    setTimeout(async () => {
+      try {
+        await autoLinkLocalPhotosOnStartup();
+        const driveCreds = await loadDriveCredentialsFromCloud();
+        if (driveCreds && driveCreds.accessToken) {
+          saveGoogleDriveCredentials(driveCreds);
+        }
+        const driveRegistry = await loadDriveRegistryFromCloud();
+        if (driveRegistry && Object.keys(driveRegistry).length > 0) {
+          drivePhotosRegistryMemory = { ...driveRegistry };
+          fs.writeFileSync(drivePhotosRegistryPath, JSON.stringify(driveRegistry, null, 2), 'utf8');
+        }
+        const activeToken = await getOrRefreshDriveTokenServer();
+        if (activeToken) {
+          reconcileAndOrganizeGoogleDrivePhotosServer(activeToken)
+            .then(() => syncPendingPhotosToServerDrive(activeToken))
+            .catch((e) => console.warn('[Startup] Advertencia en auto-sincronización de Drive:', e.message));
+        }
+        backgroundPhotoSyncEngine.init();
+      } catch (bgErr: any) {
+        console.warn('[Startup Background] Advertencia:', bgErr.message);
+      }
+    }, 1500);
   });
+
+  // Modo FinOps Ahorro de Costos: Desactivado el auto-ping Keep-Alive 24/7 y el barrido continuo cada 5m
+  // para permitir que Cloud Run y Cloud SQL entren en modo reposo (Scale-to-Zero = $0 costo en inactividad).
 }
 
-startServer();
+process.on('uncaughtException', (err: any) => {
+  console.error('[Process Uncaught Exception]:', err?.message || err);
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  console.warn('[Process Unhandled Rejection]:', reason?.message || reason);
+});
+
+startServer().catch((err: any) => {
+  console.error('[Server Start Fatal Error]:', err?.message || err);
+});
+

@@ -1,10 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import { AuthenticatedImage } from "./AuthenticatedImage";
+import React, { useState, useEffect, useRef } from 'react';
 import { ExpendioData } from '../types';
-import { Camera, Download, Upload, CheckCircle2, Image as ImageIcon, Trash2, ShieldCheck, RefreshCw, MapPin, Sparkles, Eye, Maximize2 } from 'lucide-react';
+import { Camera, Download, Upload, CheckCircle2, Image as ImageIcon, Trash2, ShieldCheck, RefreshCw, MapPin, Sparkles, Eye, Maximize2, CloudUpload } from 'lucide-react';
 import { generateReporteFotograficoSinglePDF } from '../utils/pdfGenerator';
 import { CameraGpsCaptureModal } from './CameraGpsCaptureModal';
 import { PhotoLightboxModal } from './PhotoLightboxModal';
+import { WatermarkProposalsModal, WatermarkStyleId } from './WatermarkProposalsModal';
 import { getCurrentGpsLocation, stampPhotoWithWatermarkAndGps, GeoCoordinates } from '../utils/photoWatermarkGps';
+import { purgeCacheAndRedownloadPhotoFromServer, syncAllPhotosToGoogleDriveBackup } from '../lib/photoStorageDB';
 
 interface RegistroFotograficoCardProps {
   expendio: ExpendioData;
@@ -85,18 +88,29 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
     fotoTarifasUrl: expendio.fotoTarifasUrl || '',
   });
 
+  const lastExpendioIdRef = useRef<string>(expendio?.id || '');
+
   // Keep state synchronized with expendio prop changes without re-rendering loops
   useEffect(() => {
     if (!expendio) return;
+    const isSameExpendio = lastExpendioIdRef.current === expendio.id;
+    lastExpendioIdRef.current = expendio.id;
 
     setPhotoState((prev) => {
-      const nextAviso = expendio.fotoAvisoUrl || expendio.letreroUrl || '';
-      const nextPano = expendio.fotoPanoramicaUrl || '';
-      const nextMata = expendio.fotoMataselloUrl || expendio.mataselloUrl || '';
-      const nextBasc = expendio.fotoBasculaUrl || expendio.basculaUrl || '';
-      const nextCont = expendio.fotoContratistaUrl || '';
-      const nextHora = expendio.fotoHorarioUrl || '';
-      const nextTari = expendio.fotoTarifasUrl || '';
+      const resolveNext = (key: string, serverVal: string) => {
+        if (isSameExpendio && prev[key] && prev[key].startsWith('data:image/') && serverVal) {
+          return prev[key];
+        }
+        return serverVal;
+      };
+
+      const nextAviso = resolveNext('fotoAvisoUrl', expendio.fotoAvisoUrl || expendio.letreroUrl || '');
+      const nextPano = resolveNext('fotoPanoramicaUrl', expendio.fotoPanoramicaUrl || '');
+      const nextMata = resolveNext('fotoMataselloUrl', expendio.fotoMataselloUrl || expendio.mataselloUrl || '');
+      const nextBasc = resolveNext('fotoBasculaUrl', expendio.fotoBasculaUrl || expendio.basculaUrl || '');
+      const nextCont = resolveNext('fotoContratistaUrl', expendio.fotoContratistaUrl || '');
+      const nextHora = resolveNext('fotoHorarioUrl', expendio.fotoHorarioUrl || '');
+      const nextTari = resolveNext('fotoTarifasUrl', expendio.fotoTarifasUrl || '');
 
       if (
         prev.fotoAvisoUrl === nextAviso &&
@@ -137,10 +151,14 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
   const [downloading, setDownloading] = useState<boolean>(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [syncingDriveBackup, setSyncingDriveBackup] = useState<boolean>(false);
+  const [driveBackupMessage, setDriveBackupMessage] = useState<string>('');
   const [gpsCaptureModal, setGpsCaptureModal] = useState<{ slotKey: string; slotTitle: string } | null>(null);
   const [lightboxPhoto, setLightboxPhoto] = useState<{ url: string; title: string; subtitle: string } | null>(null);
   const [globalCoords, setGlobalCoords] = useState<GeoCoordinates | null>(null);
   const [isRequestingGps, setIsRequestingGps] = useState<boolean>(false);
+  const [showWatermarkProposals, setShowWatermarkProposals] = useState<boolean>(false);
+  const [watermarkStyle, setWatermarkStyle] = useState<WatermarkStyleId>('propuesta_1');
 
   // Count uploaded photos
   const uploadedCount = PHOTO_SLOTS.filter((s) => Boolean(photoState[s.key])).length;
@@ -186,7 +204,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
       });
 
       setPhotoState((prev) => ({ ...prev, [key]: stamped.dataUrl }));
-      await savePhotoToBackend(key, stamped.dataUrl);
+      await savePhotoToBackend(key, stamped.dataUrl, stamped.file);
     } catch (err) {
       console.error('Error procesando foto con GPS:', err);
     } finally {
@@ -199,11 +217,32 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
     savePhotoToBackend(key, '');
   };
 
-  const savePhotoToBackend = async (key: string, value: string) => {
+  const savePhotoToBackend = async (key: string, value: string, fileObj?: File | Blob) => {
     setSavingKey(key);
     try {
+      // Subir primero al endpoint híbrido (Firestore + AWS S3 + PostgreSQL) si hay archivo/imagen nueva
+      let serverHybridSaved = false;
+      if (value && expendio.cedula) {
+        let blobToUpload: Blob | File | undefined = fileObj;
+        if (!blobToUpload && value.startsWith('data:image/')) {
+          const r = await fetch(value);
+          blobToUpload = await r.blob();
+        }
+        if (blobToUpload) {
+          const fd = new FormData();
+          fd.append('foto', blobToUpload, `${expendio.cedula}_${key}.jpg`);
+          const hybRes = await fetch(
+            `/api/photos/upload-hybrid/${encodeURIComponent(expendio.cedula)}/${encodeURIComponent(key)}`,
+            { method: 'POST', body: fd }
+          );
+          const hybData = await hybRes.json().catch(() => ({ success: false }));
+          if (hybData.success) {
+            serverHybridSaved = true;
+          }
+        }
+      }
+
       const payload: Record<string, string> = { [key]: value };
-      // Also map backward compatible keys if applicable
       if (key === 'fotoAvisoUrl') payload.letreroUrl = value;
       if (key === 'fotoBasculaUrl') payload.basculaUrl = value;
       if (key === 'fotoMataselloUrl') payload.mataselloUrl = value;
@@ -214,11 +253,29 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({ success: false }));
       if (data.success && onUpdatePhotos) {
         onUpdatePhotos(data.data);
+      }
+
+      if (data.success || serverHybridSaved) {
         setSaveSuccess(true);
-        setTimeout(() => setSaveSuccess(false), 3000);
+        setTimeout(() => setSaveSuccess(false), 3500);
+      }
+
+      if (value && (data.success || serverHybridSaved) && expendio.cedula) {
+        try {
+          const redownloaded = await purgeCacheAndRedownloadPhotoFromServer({
+            cedula: expendio.cedula,
+            slotKey: key,
+            slotTitle: key,
+            expendioNombre: expendio.localidad || expendio.municipio,
+            municipio: expendio.municipio || expendio.localidad,
+          });
+          if (redownloaded.serverUrl) {
+            setPhotoState((prev) => ({ ...prev, [key]: redownloaded.serverUrl }));
+          }
+        } catch {}
       }
     } catch (err) {
       console.error('Error guardando imagen:', err);
@@ -227,10 +284,24 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
     }
   };
 
+  const handleSyncDriveBackup = async () => {
+    setSyncingDriveBackup(true);
+    setDriveBackupMessage('Sincronizando respaldo en Google Drive (Última capa de seguridad)...');
+    try {
+      const res = await syncAllPhotosToGoogleDriveBackup({
+        cedulaFilter: expendio.cedula,
+      });
+      setDriveBackupMessage(res.message);
+    } catch (err: any) {
+      setDriveBackupMessage(`Error en backup de Google Drive: ${err.message || 'Intenta de nuevo'}`);
+    } finally {
+      setSyncingDriveBackup(false);
+    }
+  };
+
   const handleDownloadPDF = async () => {
     setDownloading(true);
     try {
-      // Generate clean vector PDF adhering strictly to 1 letter page without audit box
       await generateReporteFotograficoSinglePDF({
         ...expendio,
         ...photoState,
@@ -250,7 +321,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
         <div>
           <div className="flex items-center space-x-2 text-amber-400 text-xs font-bold uppercase tracking-wider mb-1">
             <Camera className="w-4 h-4" />
-            <span>Módulo de Control Fotográfico Oficial (7 Registros Obligatorios)</span>
+            <span>Módulo de Control Fotográfico Oficial (Firestore + AWS S3 + Backup Google Drive)</span>
           </div>
           <h3 className="text-xl font-bold text-slate-100">
             {expendio.localidad} ({expendio.municipio})
@@ -260,13 +331,24 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
           {saveSuccess && (
             <span className="text-xs text-emerald-400 font-bold flex items-center space-x-1 animate-pulse bg-emerald-950/60 px-3 py-1.5 rounded-xl border border-emerald-800">
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span>Guardado en Servidor</span>
+              <span>Guardada en Firestore + AWS S3</span>
             </span>
           )}
+
+          <button
+            type="button"
+            onClick={handleSyncDriveBackup}
+            disabled={syncingDriveBackup}
+            className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-2.5 px-3.5 rounded-xl shadow-lg text-xs flex items-center space-x-1.5 cursor-pointer transition-colors"
+            title="Sincronizar fotografías guardadas en Firestore y AWS S3 hacia Google Drive como última capa de seguridad y backup"
+          >
+            <CloudUpload className={`w-4 h-4 ${syncingDriveBackup ? 'animate-bounce' : ''}`} />
+            <span>{syncingDriveBackup ? 'Sincronizando en Drive...' : 'Sincronizar en Google Drive (Backup Final)'}</span>
+          </button>
 
           <button
             onClick={handleDownloadPDF}
@@ -278,6 +360,22 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
           </button>
         </div>
       </div>
+
+      {driveBackupMessage && (
+        <div className="p-3 rounded-xl bg-emerald-950/50 border border-emerald-500/40 text-emerald-200 text-xs font-bold flex items-center justify-between gap-2">
+          <div className="flex items-center space-x-2">
+            <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{driveBackupMessage}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setDriveBackupMessage('')}
+            className="text-[11px] underline text-emerald-300 hover:text-white cursor-pointer"
+          >
+            Ocultar
+          </button>
+        </div>
+      )}
 
       {/* Progress & Completeness Bar */}
       <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3">
@@ -303,7 +401,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
         </div>
 
         {/* GPS Live Status Indicator */}
-        <div className="flex items-center justify-between pt-1 text-xs border-t border-slate-800/80">
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs border-t border-slate-800/80">
           <div className="flex items-center space-x-2">
             <MapPin className={`w-3.5 h-3.5 ${globalCoords ? 'text-emerald-400' : 'text-amber-400'}`} />
             {globalCoords ? (
@@ -316,14 +414,24 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
               </span>
             )}
           </div>
-          <button
-            type="button"
-            onClick={requestGps}
-            disabled={isRequestingGps}
-            className="text-[11px] text-amber-300 hover:text-amber-200 underline font-semibold cursor-pointer"
-          >
-            {isRequestingGps ? 'Buscando satélites...' : globalCoords ? 'Actualizar GPS' : 'Verificar Señal GPS'}
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setShowWatermarkProposals(true)}
+              className="text-[11px] bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/50 px-2.5 py-1 rounded-lg font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+              <span>Ver 3 Nuevos Diseños de Marca de Agua</span>
+            </button>
+            <button
+              type="button"
+              onClick={requestGps}
+              disabled={isRequestingGps}
+              className="text-[11px] text-amber-300 hover:text-amber-200 underline font-semibold cursor-pointer"
+            >
+              {isRequestingGps ? 'Buscando satélites...' : globalCoords ? 'Actualizar GPS' : 'Verificar Señal GPS'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -364,7 +472,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
                 <div className="relative aspect-4/3 w-full bg-slate-900 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center group">
                   {currentUrl ? (
                     <>
-                      <img
+                      <AuthenticatedImage
                         src={currentUrl}
                         alt={slot.label}
                         className="w-full h-full object-cover cursor-pointer group-hover:scale-105 transition-transform"
@@ -548,7 +656,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
                 const url = photoState[slot.key] || slot.defaultPlaceholder;
                 return (
                   <div key={slot.key} className="w-1/2 border border-slate-300 rounded bg-white p-2 flex flex-col items-center">
-                    <img
+                    <AuthenticatedImage
                       src={url}
                       alt={slot.label}
                       className="w-full h-36 object-cover rounded border border-gray-200"
@@ -571,7 +679,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
                 const url = photoState[slot.key] || slot.defaultPlaceholder;
                 return (
                   <div key={slot.key} className="border border-slate-300 rounded bg-white p-2 flex flex-col items-center">
-                    <img
+                    <AuthenticatedImage
                       src={url}
                       alt={slot.label}
                       className="w-full h-36 object-cover rounded border border-gray-200"
@@ -594,7 +702,7 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
                 const url = photoState[slot.key] || slot.defaultPlaceholder;
                 return (
                   <div key={slot.key} className="border border-slate-300 rounded bg-white p-2 flex flex-col items-center">
-                    <img
+                    <AuthenticatedImage
                       src={url}
                       alt={slot.label}
                       className="w-full h-36 object-cover rounded border border-gray-200"
@@ -619,6 +727,13 @@ export const RegistroFotograficoCard: React.FC<RegistroFotograficoCardProps> = (
           </div>
         </div>
       </div>
+
+      <WatermarkProposalsModal
+        isOpen={showWatermarkProposals}
+        onClose={() => setShowWatermarkProposals(false)}
+        selectedStyle={watermarkStyle}
+        onSelectStyle={(style) => setWatermarkStyle(style)}
+      />
     </div>
   );
 };
